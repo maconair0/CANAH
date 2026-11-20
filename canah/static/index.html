@@ -3,134 +3,262 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CANAH</title>
-<style>
-  :root { --bg:#f6f7f9; --panel:#fff; --ink:#1d2430; --muted:#667085; --line:#d9dee6; --accent:#2f6fde; --warn:#b5651d; --bad:#c0392b; --ok:#1e8e5a; --code:#f0f2f5; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#14171c; --panel:#1c2027; --ink:#e6e9ee; --muted:#98a2b3; --line:#2e3440; --accent:#6c9cff; --warn:#e0a060; --bad:#ef6b5b; --ok:#4cc38a; --code:#242a33; } }
-  * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
-  header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
-  header h1 { font-size:16px; margin:0; }
-  header .who { margin-left:auto; color:var(--muted); font-size:13px; }
-  main { max-width:900px; margin:0 auto; padding:16px; }
-  .signin { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  input, button, select { font:inherit; }
-  input { padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); }
-  button { padding:7px 12px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--ink); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button:disabled { opacity:.5; cursor:default; }
-  #log { display:flex; flex-direction:column; gap:10px; margin:12px 0 90px; }
-  .msg { padding:10px 12px; border-radius:8px; background:var(--panel); border:1px solid var(--line); white-space:pre-wrap; overflow-wrap:anywhere; }
-  .msg.you { border-left:3px solid var(--accent); }
-  .msg.err { border-left:3px solid var(--bad); }
-  .step { font:12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted); background:var(--code); border-radius:6px; padding:6px 8px; white-space:pre-wrap; overflow-wrap:anywhere; }
-  .pending { border:1px solid var(--warn); border-radius:8px; padding:10px 12px; background:var(--panel); }
-  .pending b { color:var(--warn); }
-  .pending .actions { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
-  form.ask { position:fixed; left:0; right:0; bottom:0; display:flex; gap:8px; padding:12px 16px; background:var(--panel); border-top:1px solid var(--line); }
-  form.ask input { flex:1; min-width:0; }
-  .muted { color:var(--muted); font-size:13px; }
-</style>
+<title>CANAH · Controller Agnostic Network Agent Harness</title>
+<link rel="icon" type="image/png" href="/static/logo-dark.png">
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  // The theme before anything is drawn, so the page never flashes the other one.
+  try { const t = localStorage.getItem("canah.theme"); if (t === "light") document.documentElement.dataset.theme = "light"; } catch (e) {}
+</script>
 </head>
 <body>
-<header>
-  <h1>CANAH</h1>
-  <div class="signin" id="signin">
-    <input id="user" placeholder="admin or root" autocomplete="username" size="12">
-    <input id="pass" type="password" placeholder="password" autocomplete="current-password" size="12">
-    <button id="login">Sign in</button>
-    <span class="muted">or continue as observer</span>
-  </div>
-  <div class="who" id="who">observer</div>
-  <button id="logout" hidden>Sign out</button>
-  <button id="newthread" title="Start a new conversation">New</button>
-</header>
-<main>
-  <div class="muted" id="info"></div>
-  <div id="log"></div>
-</main>
-<form class="ask" id="ask">
-  <input id="text" placeholder="Ask the agent…" autocomplete="off">
-  <button class="primary" id="send">Send</button>
-</form>
-<script>
-const $ = (id) => document.getElementById(id);
-let token = sessionStorage.getItem("canah.token") || "";
-let level = sessionStorage.getItem("canah.level") || "observer";
-let thread = sessionStorage.getItem("canah.thread") || "";
 
-function headers() { return token ? { "Authorization": "Bearer " + token, "Content-Type": "application/json" } : { "Content-Type": "application/json" }; }
-function add(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; $("log").appendChild(d); d.scrollIntoView({ block: "end" }); return d; }
-function showWho(user) {
-  $("who").textContent = token ? `${user} (${level})` : "observer: you can ask anything and change nothing";
-  $("signin").hidden = !!token; $("logout").hidden = !token;
-}
-async function api(path, opts = {}) {
-  const r = await fetch(path, { ...opts, headers: headers() });
-  if (r.status === 401 && token) { token = ""; level = "observer"; sessionStorage.clear(); showWho(); }
-  if (!r.ok) throw new Error((await r.json().catch(() => ({ detail: r.statusText }))).detail || r.statusText);
-  return r;
-}
-async function ensureThread() {
-  if (!thread) { thread = (await (await api("/threads", { method: "POST" })).json()).thread_id; sessionStorage.setItem("canah.thread", thread); }
-  return thread;
-}
-async function streamTo(path, body) {
-  $("send").disabled = true;
-  let bubble = null;
-  try {
-    const r = await api(path, { method: "POST", body: JSON.stringify(body) });
-    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const raw = buf.slice(0, i); buf = buf.slice(i + 2);
-        const type = (raw.match(/^event: (.*)$/m) || [])[1]; const data = JSON.parse((raw.match(/^data: (.*)$/m) || [])[1] || "{}");
-        if (type === "token") { bubble = bubble || add("msg", ""); bubble.textContent += data.text; }
-        else if (type === "tool_call") add("step", `${data.subagent ? "  ↳ " : "· "}${data.name}(${JSON.stringify(data.args).slice(0, 300)})`);
-        else if (type === "tool_result" && data.name === "execute") add("step", "  │ " + data.content.slice(0, 1200).replace(/\n/g, "\n  │ "));
-        else if (type === "reply") { if (!bubble && data.text) add("msg", data.text); else if (bubble && data.text) bubble.textContent = data.text; showPending(data.pending || []); }
-        else if (type === "error") add("msg err", data.error);
-      }
-    }
-  } catch (e) { add("msg err", e.message); }
-  $("send").disabled = false;
-}
-function showPending(items) {
-  if (!items.length) return;
-  const box = document.createElement("div"); box.className = "pending";
-  box.innerHTML = "<b>Waiting for approval</b>";
-  const may = items.every((p) => level === "root" || (level === "admin" && p.needs !== "root"));
-  for (const p of items) { const s = document.createElement("div"); s.className = "step"; s.textContent = `${p.name}(${JSON.stringify(p.args)})   needs ${p.needs}`; box.appendChild(s); }
-  const act = document.createElement("div"); act.className = "actions";
-  const go = (decisions) => { act.querySelectorAll("button").forEach((b) => b.disabled = true); streamTo(`/threads/${thread}/decide`, { decisions, stream: true }); };
-  const ok = document.createElement("button"); ok.className = "primary"; ok.textContent = "Approve"; ok.disabled = !may;
-  ok.onclick = () => go(items.map(() => ({ type: "approve" })));
-  const no = document.createElement("button"); no.textContent = "Reject";
-  no.onclick = () => { const why = prompt("Why? (optional)") || "The operator rejected this change."; go(items.map(() => ({ type: "reject", message: why }))); };
-  act.append(ok, no);
-  if (!may) { const m = document.createElement("span"); m.className = "muted"; m.textContent = "sign in with the level shown to approve"; act.append(m); }
-  box.appendChild(act); $("log").appendChild(box); box.scrollIntoView({ block: "end" });
-}
-$("ask").onsubmit = async (e) => {
-  e.preventDefault(); const text = $("text").value.trim(); if (!text) return;
-  $("text").value = ""; add("msg you", text);
-  await streamTo(`/threads/${await ensureThread()}/stream`, { text });
-};
-$("login").onclick = async () => {
-  try {
-    const r = await (await fetch("/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: $("user").value, password: $("pass").value }) })).json();
-    if (!r.token) throw new Error(r.detail || "sign-in refused");
-    token = r.token; level = r.level; sessionStorage.setItem("canah.token", token); sessionStorage.setItem("canah.level", level);
-    $("pass").value = ""; thread = ""; sessionStorage.removeItem("canah.thread"); showWho(r.user);
-  } catch (e) { add("msg err", e.message); }
-};
-$("logout").onclick = async () => { try { await api("/session", { method: "DELETE" }); } catch (e) {} token = ""; level = "observer"; sessionStorage.clear(); thread = ""; showWho(); };
-$("newthread").onclick = () => { thread = ""; sessionStorage.removeItem("canah.thread"); $("log").innerHTML = ""; };
-fetch("/info").then((r) => r.json()).then((i) => { $("info").textContent = `${i.model?.model || ""} · ${i.tools} tools · subagents: ${(i.subagents || []).join(", ")} · sandbox: ${i.sandbox || "none"}`; });
-api("/session").then((r) => r.json()).then((s) => { level = s.level; showWho(s.user); }).catch(() => showWho());
-</script>
+<!-- ================= Sign-in ================= -->
+<div class="login" id="login" hidden>
+  <section class="login-hero">
+    <img class="mark for-light" src="/static/logo-light.png" alt="CANAH">
+    <img class="mark for-dark" src="/static/logo-dark.png" alt="CANAH">
+    <h1><span class="acr">CANAH</span>Controller Agnostic<br>Network Agent Harness</h1>
+    <p class="lead">One agent for every network you run. CANAH reaches each SDN controller through the agentic MCP,
+      reads before it answers, and changes nothing without an operator's approval, whichever controller or domain it is.</p>
+    <div class="login-feats">
+      <div class="login-feat"><i class="shape ring"></i><div><b>Controller agnostic</b><span>ONOS, Ryu, TeraFlowSDN, TransportPCE, or yours, behind one contract.</span></div></div>
+      <div class="login-feat"><i class="shape sq"></i><div><b>Grounded answers</b><span>Every figure comes from a tool result, checked before it reaches you.</span></div></div>
+      <div class="login-feat"><i class="shape hex"></i><div><b>Approval first</b><span>A change waits for a human of the right level; root for the destructive ones.</span></div></div>
+      <div class="login-feat"><i class="shape tri"></i><div><b>Across domains</b><span>Packet, optical, data centre: subagents per controller, one conversation.</span></div></div>
+    </div>
+  </section>
+  <section class="login-side">
+    <button class="btn sm ghost theme-corner" data-act="theme" title="Light or dark">◐</button>
+    <form class="login-card" id="login-form" autocomplete="on">
+      <div class="brandline">
+        <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
+        <div><b>CANAH</b><small>Controller Agnostic Network Agent Harness</small></div>
+      </div>
+      <h2>Sign in</h2>
+      <p class="hint">Admin and root may approve changes. Anyone may look and ask, as an observer.</p>
+      <label class="field">Username<input id="li-user" name="username" autocomplete="username" required></label>
+      <label class="field">Password<input id="li-pass" name="password" type="password" autocomplete="current-password" required></label>
+      <div class="login-err" id="li-err"></div>
+      <button class="btn primary" type="submit" id="li-go">Sign in</button>
+      <div class="or">or</div>
+      <button class="btn" type="button" id="li-observer">Continue as observer (read only)</button>
+      <div class="login-foot" id="li-foot">Accounts are set with <span class="kbd">python -m canah user</span>.</div>
+    </form>
+  </section>
+</div>
+
+<!-- ================= Console ================= -->
+<div class="shell" id="shell" hidden>
+  <header class="topbar">
+    <button class="btn sm ghost" id="nav-toggle" title="Hide or show the menu ( [ )">☰</button>
+    <div class="brand">
+      <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
+      <div class="names"><b>CANAH</b><small>Controller Agnostic Network Agent Harness</small></div>
+    </div>
+    <span class="pill" id="st-service" title="The CANAH service"><span class="dot"></span>service</span>
+    <span class="pill" id="st-model" title="The model the agent runs on"><span class="dot"></span><span>model</span></span>
+    <span class="pill click" id="st-ctl" title="Controllers the agentic MCP holds, and how many could be read"><span class="dot"></span><span>controllers</span></span>
+    <span class="pill" id="st-busy" hidden><span class="dot busy"></span><span>agent working</span></span>
+    <div class="spacer"></div>
+    <span class="pill click" id="st-who" title="Your profile"><span class="dot"></span><span id="st-who-text">observer</span></span>
+    <span class="pill mono" id="st-clock">–</span>
+    <button class="btn sm ghost" id="side-toggle" title="Hide or show the right panel ( ] )"><svg width="15" height="13" viewBox="0 0 15 13" fill="none" stroke="currentColor" stroke-width="1.5"><rect x=".75" y=".75" width="13.5" height="11.5" rx="2"/><line x1="9.5" y1="1" x2="9.5" y2="12"/></svg></button>
+    <button class="btn sm ghost" data-act="theme" title="Light or dark">◐</button>
+    <button class="btn sm" id="signout" title="Sign out">Sign out</button>
+  </header>
+
+  <nav class="nav" id="nav">
+    <div class="section">Monitor</div>
+    <button data-view="topology"><span class="ico">◎</span>Topology</button>
+    <button data-view="controllers"><span class="ico">⬡</span>SDN controllers</button>
+    <div class="section">Operate</div>
+    <button data-view="chat"><span class="ico">✦</span>Chat</button>
+    <button data-view="ops"><span class="ico">✔</span>Approvals &amp; audit<span class="badge warn" id="pending-badge" hidden>0</span></button>
+    <div class="section">Knowledge</div>
+    <button data-view="knowledge"><span class="ico">❏</span>Documents &amp; memory</button>
+    <div class="section">Account</div>
+    <button data-view="identity"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="4.5" r="2.7"/><path d="M1.8 13c.6-2.9 2.7-4.4 5.2-4.4s4.6 1.5 5.2 4.4"/></svg></span>Profile &amp; access</button>
+    <button data-view="about"><span class="ico">?</span>About &amp; shortcuts</button>
+    <div class="navfoot">
+      <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
+      <div>CANAH<br>Controller Agnostic Network Agent Harness</div>
+    </div>
+  </nav>
+
+  <main class="main">
+    <!-- Topology -->
+    <section class="view" id="view-topology">
+      <div class="kpis" id="kpis"></div>
+      <div class="topo-wrap">
+        <div class="topo-canvas">
+          <svg id="topo"></svg>
+          <div class="topo-tools">
+            <button class="btn sm" id="topo-in" title="Zoom in (+)">+</button>
+            <span class="pill mono" id="topo-zoom">100%</span>
+            <button class="btn sm" id="topo-out" title="Zoom out (−)">−</button>
+            <button class="btn sm" id="topo-fit" title="Fit everything (0, or double-click the background)">Fit</button>
+            <button class="btn sm" id="topo-all" title="Open or fold every controller (e)">Open all</button>
+            <button class="btn sm" id="topo-reset" title="Forget dragged positions">Reset layout</button>
+            <button class="btn sm" id="topo-refresh" title="Read the controllers again now">Refresh</button>
+            <label class="pill"><input type="checkbox" id="topo-labels" checked> labels</label>
+            <label class="pill"><input type="checkbox" id="topo-live" checked> live</label>
+          </div>
+          <div class="topo-hint faint">click a controller to open what it holds · click anything for its details · scroll to zoom · drag the background to pan · drag nodes to arrange · double-click to fit</div>
+          <div class="legend">
+            <span><i style="border-color:var(--accent)"></i>CANAH to its controllers (through the agentic MCP)</span>
+            <span><i style="border-color:var(--ok)"></i>link up (animated)</span>
+            <span><i style="border-color:var(--bad)"></i>down, or unreadable</span>
+            <span><i style="border-color:var(--brand-orange);border-top-style:solid;border-top-width:3px"></i>across domains (relations)</span>
+            <span><span class="dshape packet"></span>packet</span><span><span class="dshape optical"></span>optical</span>
+            <span><span class="dshape dc"></span>data centre</span><span><span class="dshape other"></span>other</span>
+            <span class="faint" id="topo-updated"></span>
+          </div>
+        </div>
+        <div class="card detail" id="topo-detail">
+          <header><h3 id="detail-title">Details</h3></header>
+          <div class="body muted" id="detail-body">Click CANAH, a controller or a device to see its state. A controller marked <b>▸</b> holds devices folded inside it; click it to open them.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Controllers -->
+    <section class="view" id="view-controllers">
+      <div class="row"><h2>SDN controllers</h2><div class="spacer" style="flex:1"></div>
+        <span class="faint" id="ctl-src" style="font-size:12px"></span><button class="btn sm" id="ctl-refresh">Refresh</button></div>
+      <div id="ctl-banner"></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) 420px;align-items:start">
+        <div style="display:grid;gap:14px;min-width:0">
+        <div class="card"><header><h3>Held by the agentic MCP</h3><div class="spacer"></div>
+          <button class="btn sm" id="ctl-reload" title="Rebuild the agent so every controller held now has its subagent (admin)">Reload CANAH</button></header>
+          <div class="body" style="padding:0;overflow:auto" id="ctl-table"></div></div>
+        <div class="card" id="onboard-card"><header><h3>Onboard a controller</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+          <div class="body">
+            <p class="muted" style="margin:0 0 10px;font-size:12.5px">The agentic MCP learns the controller (its API description, or the manifest of its kind), checks it against the common contract and seats it. Then reload CANAH, and the controller gets its own subagent.</p>
+            <form id="onboard-form" class="form-grid" autocomplete="off">
+              <label>Key<input id="ob-key" placeholder="onos2" required pattern="[a-z][a-z0-9_]{1,31}" title="lower-case letters, digits, _"></label>
+              <label>Label<input id="ob-label" placeholder="ONOS (site B)"></label>
+              <label class="wide">Base URL<input id="ob-url" placeholder="http://10.0.0.5:8181/onos/v1" required></label>
+              <label>Kind<select id="ob-kind"><option value="">recognise it from its API</option></select></label>
+              <label>API document URL<input id="ob-spec" placeholder="optional: an OpenAPI / Swagger URL"></label>
+              <label>User variable<input id="ob-user" placeholder="ONOS2_USER" pattern="[A-Z_][A-Z0-9_]*"></label>
+              <label>Password variable<input id="ob-pass" placeholder="ONOS2_PASSWORD" pattern="[A-Z_][A-Z0-9_]*"></label>
+              <p class="faint wide" style="margin:0;font-size:11.5px">Credentials are the <b>names</b> of environment variables set on the agentic MCP's host, never the secrets: they are not sent through this page.</p>
+              <div class="wide row"><button class="btn primary" type="submit" id="ob-go">Onboard</button><span id="ob-msg" class="muted" style="font-size:12.5px"></span></div>
+            </form>
+            <details style="margin-top:12px"><summary class="muted" style="cursor:pointer">A controller of a kind the agentic MCP does not know yet</summary>
+              <div class="row" style="margin-top:10px">
+                <label class="btn sm">Upload a manifest (YAML or JSON)<input type="file" id="ob-manifest" hidden accept=".yaml,.yml,.json"></label>
+                <span class="faint">or</span>
+                <input id="ob-guide-kind" placeholder="kind, e.g. opendaylight" style="width:200px">
+                <label class="btn sm">Upload its user guide or API document<input type="file" id="ob-guide" hidden></label>
+              </div></details>
+          </div></div>
+        </div>
+        <div class="card"><header><h3 id="ctl-detail-title">The common contract</h3></header><div class="body" id="ctl-detail">
+          <span class="muted">Pick a controller to see which contract verbs it serves, with which of its own tools, and what it lacks.</span></div></div>
+      </div>
+    </section>
+
+    <!-- Chat: in the style of LangGraph's agent chat UI -->
+    <section class="view fill" id="view-chat">
+      <div class="lg" id="lg">
+        <aside class="lg-threads">
+          <div class="lg-threads-head"><b>Thread history</b><div style="flex:1"></div>
+            <button class="btn sm" id="thread-new" title="A new thread (n)">+ New</button></div>
+          <div class="lg-thread-list" id="thread-list"></div>
+        </aside>
+        <div class="lg-main">
+          <div class="lg-head">
+            <button class="btn sm ghost" id="threads-toggle" title="Hide or show the thread history">☰</button>
+            <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
+            <b>CANAH</b><span class="faint" id="lg-title">new thread</span>
+            <div class="agents-strip" id="agents-strip"></div>
+          </div>
+          <div class="lg-scroll" id="lg-scroll"><div class="lg-col" id="messages"></div></div>
+          <div class="lg-bottom">
+            <div class="suggest" id="suggest"></div>
+            <form class="lg-composer" id="composer-form">
+              <div class="lg-files" id="files"></div>
+              <textarea id="composer" rows="1" placeholder="Type your message… (Enter to send, Shift+Enter for a new line)"></textarea>
+              <div class="lg-bar">
+                <label class="switch" title="Show only the conversation"><input type="checkbox" id="hide-tools"><span class="track"><i></i></span>Hide tool calls</label>
+                <label class="btn sm ghost lg-attach" title="Attach files: text, PDF, documents (up to 25 MB each)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.4 11.1l-9.2 9.2a6 6 0 01-8.5-8.5l9.2-9.2a4 4 0 015.7 5.7l-9.2 9.2a2 2 0 01-2.8-2.8l8.5-8.5"/></svg><span>Upload</span><input type="file" id="attach" multiple hidden></label>
+                <div style="flex:1"></div>
+                <button class="btn primary lg-send" id="send" type="submit" title="Send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg><span>Send</span></button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Approvals & audit -->
+    <section class="view" id="view-ops">
+      <div class="row"><h2>Approvals &amp; audit</h2><div style="flex:1"></div><button class="btn sm" id="ops-refresh">Refresh</button></div>
+      <div class="kpis" id="ops-kpis"></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr);gap:14px">
+        <div class="card"><header><h3>Waiting for approval</h3><div class="spacer"></div><span class="faint" style="font-size:12px">changes in your conversations</span></header>
+          <div class="body" id="ops-pending"></div></div>
+        <div class="card"><header><h3>Audit log</h3><div class="spacer"></div><span class="faint" style="font-size:12px" id="audit-note">admin</span></header>
+          <div class="body" style="padding:0;max-height:520px;overflow:auto" id="ops-audit"></div></div>
+      </div>
+    </section>
+
+    <!-- Knowledge -->
+    <section class="view" id="view-knowledge">
+      <div class="row"><h2>Documents &amp; memory</h2></div>
+      <div class="card" style="margin-bottom:14px"><header><h3>Second brain · how the knowledge connects</h3><div class="spacer"></div>
+        <span class="faint mono" id="mesh-cost" style="font-size:11.5px"></span>
+        <button class="btn sm" id="mesh-rebuild" title="Recompute from the embeddings (no embedding calls)">Rebuild</button></header>
+        <div class="body"><div class="mesh-wrap">
+          <div class="mesh-canvas"><svg id="mesh"></svg>
+            <div class="mesh-tools"><button class="btn sm" id="mesh-in">+</button><span class="pill mono" id="mesh-zoom">100%</span>
+              <button class="btn sm" id="mesh-out">−</button><button class="btn sm" id="mesh-fit">Fit</button></div>
+            <div class="mesh-hint faint">scroll to zoom · drag to pan · click a document</div></div>
+          <div class="mesh-side" id="mesh-detail"><span class="muted">A node per document, sized by how much of it was indexed and coloured by cluster; an edge joins documents about similar things.</span></div>
+        </div><p class="faint" style="font-size:11.5px;margin:8px 0 0" id="mesh-means"></p></div></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start">
+        <div class="card"><header><h3>Documents the agent cites</h3><div class="spacer"></div><span class="faint" id="doc-folder" style="font-size:11px"></span></header>
+          <div class="body"><div id="doc-list"></div>
+            <div class="dropzone" id="doc-drop" style="margin-top:12px">Drop a document here, or click to choose one (admin)</div>
+            <input type="file" id="doc-file" hidden></div></div>
+        <div class="card"><header><h3>Long-term memories</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+          <div class="body" style="padding:0" id="mem-list"></div></div>
+      </div>
+    </section>
+
+    <!-- Profile -->
+    <section class="view" id="view-identity">
+      <div class="row"><h2>Profile &amp; access</h2></div>
+      <div class="grid" style="grid-template-columns:380px minmax(0,1fr);align-items:start">
+        <div class="card"><header><h3>You are</h3></header><div class="body"><div class="kv" id="id-current"></div>
+          <div class="row" style="margin-top:14px"><button class="btn" id="id-switch">Sign in as someone else</button><button class="btn danger" id="id-out">Sign out</button></div></div></div>
+        <div class="card"><header><h3>What each profile may do</h3></header><div class="body" id="id-levels"></div></div>
+      </div>
+    </section>
+
+    <!-- About -->
+    <section class="view" id="view-about">
+      <div class="row"><h2>About &amp; shortcuts</h2></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start">
+        <div class="card"><header><h3>CANAH</h3></header><div class="body" id="about-body"></div></div>
+        <div class="card"><header><h3>Keyboard</h3></header><div class="body"><div class="kv">
+          <div><span class="kbd">g</span> then <span class="kbd">t c h a k</span></div><div>topology, controllers, chat, approvals, knowledge</div>
+          <div><span class="kbd">[</span> <span class="kbd">]</span></div><div>hide or show the menu, the right panel</div>
+          <div><span class="kbd">+</span> <span class="kbd">−</span> <span class="kbd">0</span></div><div>zoom the topology in, out, fit</div>
+          <div><span class="kbd">e</span></div><div>open or fold every controller</div>
+          <div><span class="kbd">n</span></div><div>a new conversation</div>
+          <div><span class="kbd">/</span></div><div>go to the chat box</div>
+          <div><span class="kbd">Esc</span></div><div>clear the selection</div>
+        </div></div></div>
+      </div>
+    </section>
+  </main>
+  <footer class="credit"><span>CANAH · Controller Agnostic Network Agent Harness</span><span>·</span><span id="credit-info"></span></footer>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="/static/app.js"></script>
 </body>
 </html>

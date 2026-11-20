@@ -53,13 +53,28 @@ The tests are listed in the README.
   approve or reject a waiting change (approve offered only at the level it needs).
 - [x] Tests: 11 (sign-in, streaming, approvals, 403 above your level, per-user threads, bad input).
 - [x] Live: the demo network through the server. A read, a change paused, approved over HTTP, then run.
-- [ ] The web page hasn't been tried in a browser yet.
+- [x] The web page in a real browser (`tests_canah/browser_check.py`, headless Chromium): it loads as observer, a
+  question streams its tool calls and answer, admin sign-in works, and a change waits, is approved in the page and its
+  result comes back. Passed 2026-11-19.
 
-**Phase 5: testing across domains.**
-- [ ] A test bed of network domains, each a set of fake or emulated controllers behind an agentic MCP, with its own
-  manifests and skills. For example, a packet domain, an optical domain and a wireless or data-centre domain.
-- [ ] Per domain: checked live cases (read, change with approval, refusal as observer, large results, documents).
-- [ ] Across domains: connections that span two or more domains, where the main agent combines subagents' answers.
-- [ ] A score per domain and for cross-domain work, kept with the model and the harness version.
+**Phase 5: testing across domains. Done** (`testbed/`).
+- [x] A test bed of network domains (packet, optical, data-centre fabric) behind an agentic-MCP-compatible emulator
+  (`testbed/emulator.py`), with its own `AGENTS.md`, skills and design rules.
+- [x] Per domain: checked live cases (read, large read, change with approval, observer refusal, state with rules).
+- [x] Across domains: chains, impact of a fault, a tenant's path out, a build under a cross-domain rule,
+  `follow_relations`.
+- [x] A score per domain and in total, kept with the model and the harness commit (`testbed/results/`). Last:
+  packet 9/10, optical 8/10, fabric 4/6, cross 4/10, 25/36 (qwen3 30B, local). The misses are the model's
+  planning: unrequested extra changes, cross-domain chains left half-followed, a time budget run out.
+
+**Phase 5b: live controllers, with a digital twin.**
+- [x] netwins (a separate project) plugs in as a provider and middleware: a twin mirrored from each packet
+  controller, every write tried in it first, `TwinGate` holding what the twin does not support. Checked end to end
+  on netwins' SDN lab (see netwins' README).
+- [ ] The live controllers (ONOS, Ryu, TeraFlowSDN, TransportPCE) through the agentic MCP on :8400: blocked, because
+  `AGENTIC_MCP_TOKEN` is empty in `.env`. The service lists controllers and tools without it, but every call needs
+  it. With it set: `~/netwins/integrations/live_controllers.py` (read-only mirror of each), then
+  `~/netwins/integrations/canah_live_controllers.py` (CANAH with the twin; every write is checked and then rejected
+  at approval, so nothing changes on the lab).
 
 **Later:** a page in an existing console; pushing CANAH to a remote, when wanted.

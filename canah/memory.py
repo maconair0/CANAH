@@ -59,6 +59,11 @@ def namespace(user: str = "default") -> tuple:
     return ("canah", "memories", user)
 
 
+def uploads_namespace(user: str = "default") -> tuple:
+    """Where one user's chat attachments live in the store (read as /uploads/<thread>/<file>)."""
+    return ("canah", "uploads", user)
+
+
 def user_of(runtime: Any) -> str:
     """The user a run is for: `configurable.user_id` of the running request, else "default".
 

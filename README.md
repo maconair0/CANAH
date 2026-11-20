@@ -4,7 +4,7 @@
 - models, memory, skills and subagents;
 - sign-in, with approval for every change, and an audit log of every decision;
 - a sandbox to compute in;
-- an HTTP service with a web page;
+- an HTTP service with a web console;
 - checks that keep the agent to what its tools returned.
 
 ## Start and stop
@@ -17,10 +17,27 @@ cp .env.example .env     # AGENTIC_MCP_URL / AGENTIC_MCP_TOKEN, CANAH_ADMIN_PASS
 ./teardown.sh            # stop it all; --purge also deletes the state in canah_data (asks first)
 ```
 
-Open the printed address in a browser for the web page:
-- sign in, or continue as observer;
-- ask anything, and the answer streams with each tool call shown;
-- a change waits with Approve and Reject buttons.
+Open the printed address in a browser for the console (light and dark, in the style of edgeLM's central
+console):
+- **Sign-in page.** Sign in as admin or root, or continue as an observer (read only).
+- **Topology.** CANAH with every controller the agentic MCP holds. Click a controller to open its devices and
+  links, read through the common contract's verbs; click CANAH to open its subagents, which light up while they
+  work (`/activity`), each joined to the controller it drives. Arcs show relations across domains; a controller
+  that cannot be read is drawn red, with why. Zoom, pan, drag, fit, open or fold all; it refreshes live.
+- **SDN controllers.** Each controller's domain, contract verdict and gaps, and which of its own tools serve each
+  contract verb. **Onboard** a new one through the agentic MCP (admin): its URL and kind, an API document, and the
+  *names* of the variables holding its credentials on the agentic MCP's host (never the secrets). A kind it does
+  not know can be added from a manifest or drafted from a user guide. **Reload CANAH** gives every controller held
+  now its subagent; **Remove** (root) unseats one.
+- **Chat**, in the style of LangGraph's agent chat UI: thread history on the left; every tool call (subagents'
+  included) as a card of its arguments with its result beneath; a change as an interrupt to **accept, edit** (the
+  arguments as JSON) **or reject**, offered at the level it needs; a switch to hide tool calls. **Attach files**
+  (button, drag and drop, or paste; up to 25 MB): kept per user, read by the agent as `/uploads/<thread>/<file>`,
+  with PDFs read to text, and copied into the sandbox when there is one.
+- **Approvals & audit.** What waits in your conversations; the audit log and 24-hour metrics (admin).
+- **Documents & memory.** The **second brain**: the documents the agent cites as a graph (a node per document,
+  edges by meaning, named clusters), as in edgeLM; the corpus with upload (admin); long-term memories (admin).
+- **Profile & access.** What each level may do. **About & shortcuts.** Keys: `g` then `t c h a k`, `[` `]`, `/`, `n`.
 
 **`start.sh`**
 - creates `.venv` and installs `requirements.txt` on first use;
@@ -75,7 +92,8 @@ There are three roles: `model` (the main agent), `strong_model` (for a subagent 
 | `canah/safety.py` | per request: token counting and budget, screening tool output, recording and re-reading changes, guarding memory writes |
 | `canah/large_results.py` | a large tool result is kept whole; the model gets a preview, the path, and a summary of its label fields |
 | `canah/ops.py` | the audit log and request metrics (`canah_data/ops.sqlite`) |
-| `canah/service.py` | the HTTP API and the web page (`canah/static/index.html`) |
+| `canah/service.py`, `canah/static/` | the HTTP API and the web console (`index.html`, `app.js`, `app.css`, logos, fonts) |
+| `canah/topology.py` | each controller's devices and links, read through the contract's verbs, for the console |
 | `canah/subagents.py` | subagents from code or YAML; tools by name or pattern |
 | `canah/mcp.py` | minor extra tools over MCP (`mcp.json`): read-only unless allowed, and writes then need approval |
 | `canah/skills/` | `approvals`, `incident-triage`, `research` (SKILL.md, loaded on demand) |
@@ -147,7 +165,13 @@ Each container is labelled with the process that owns it, and one left behind by
 | `GET /audit`, `GET /metrics` | the audit log; request metrics (admin) |
 | `GET /memories`, `DELETE /memories/{user}?path=` | long-term memories (admin) |
 | `GET /documents`, `POST /documents` | the corpus; add a document (admin) |
-| `GET /info`, `GET /health`, `GET /` | what the agent is built from; liveness; the web page |
+| `GET /threads/{id}/history` | the conversation so far, for reloading it |
+| `GET /network`, `GET /topology[?refresh=1]` | the controllers and their health; their devices, links and cross-domain relations |
+| `POST /threads/{id}/files` | attach a file to a conversation (`{"name", "content_base64"}`) |
+| `GET /activity`, `GET /knowledge/mesh` | what runs now and which subagents are at work; the documents as a graph |
+| `GET /network/kinds`, `POST /network/controllers`, `DELETE /network/controllers/{key}` | onboard (admin) or remove (root) a controller through the agentic MCP |
+| `POST /network/manifests`, `POST /network/guides`, `POST /admin/reload` | add a controller kind (admin); rebuild the agent so new controllers get subagents (admin) |
+| `GET /info`, `GET /health`, `GET /` | what the agent is built from; liveness; the web console |
 
 No token means an observer. Threads belong to the user who made them, and a busy thread gets 409. Use `--tls-cert/--tls-key` when serving beyond localhost.
 

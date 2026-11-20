@@ -52,6 +52,8 @@ def build(settings: Settings, sandbox: BackendProtocol | None = None) -> Tuple[B
         routes["/results/"] = FilesystemBackend(root_dir=results, virtual_mode=True)
     if settings.long_term_memory:
         routes["/memories/"] = StoreBackend(namespace=lambda rt: mem.namespace(mem.user_of(rt)))
+    # Files the user attached in the chat: their own, per user, read with the file tools (service.py writes them).
+    routes["/uploads/"] = StoreBackend(namespace=lambda rt: mem.uploads_namespace(mem.user_of(rt)))
     default: BackendProtocol = sandbox if sandbox is not None else StateBackend()
     # deepagents keeps its own offloaded results under the artifacts root; in the sandbox only
     # /workspace can be written.
@@ -70,7 +72,7 @@ def permissions(settings: Settings, sandbox: BackendProtocol | None = None) -> L
     """Read-only rules for the routed folders. Only for paths routed away from a sandbox: deepagents
     cannot enforce a file rule against `execute`, and refuses one on a path the sandbox would serve."""
     skills, memories = _mounts(settings)
-    ro = [r + "**" for r in (*skills, *memories)] + (["/results/**"] if sandbox is None else [])
+    ro = [r + "**" for r in (*skills, *memories)] + ["/uploads/**"] + (["/results/**"] if sandbox is None else [])
     rules = [FilesystemPermission(operations=["write"], paths=ro, mode="deny")] if ro else []
     if settings.approve_file_writes:
         rules.append(FilesystemPermission(operations=["write"], paths=["/**"], mode="interrupt"))

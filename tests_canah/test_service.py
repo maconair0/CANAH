@@ -38,6 +38,51 @@ def events(text):
     return out
 
 
+class FakeMCP:
+    """Two controllers behind an agentic MCP: one with ONOS's shapes, one that cannot be read."""
+    url = "http://fake"
+
+    def controllers(self):
+        return [{"key": "onos", "label": "ONOS", "domain": "packet", "tools": 2,
+                 "conformance": {"verdict": "accepted", "domains": [{"features": {"read_devices": "tool get_devices",
+                                                                                  "read_links": "tool get_links"}}]}},
+                {"key": "tpce", "label": "TransportPCE", "domain": "optical", "tools": 1, "conformance": {}}]
+
+    def tools(self, key):
+        return [{"name": "get_devices"}, {"name": "get_links"}] if key == "onos" else [{"name": "list_nodes"}]
+
+    def call(self, key, tool, args):
+        if key == "tpce":
+            return {"text": "this needs the agentic MCP's token", "is_error": True}
+        if tool == "get_devices":
+            return {"text": json.dumps({"devices": [{"id": "of:01", "available": True}, {"id": "of:02", "available": False}]})}
+        return {"text": json.dumps({"links": [{"src": {"device": "of:01", "port": "1"}, "dst": {"device": "of:02", "port": "2"}, "state": "ACTIVE"},
+                                              {"src": {"device": "of:02", "port": "2"}, "dst": {"device": "of:01", "port": "1"}, "state": "ACTIVE"}]})}
+
+    def get(self, path, timeout=None):
+        return {"sessions": []}
+
+    # what onboarding sends, recorded (the agentic MCP's own HTTP surface)
+    sent = []
+
+    def _headers(self):
+        return {}
+
+    class _Http:
+        def request(self, method, url, **kw):
+            FakeMCP.sent.append((method, url, kw.get("json"), kw.get("params")))
+
+            class R:
+                status_code = 200
+                text = "{}"
+
+                def json(self):
+                    return {"key": (kw.get("json") or {}).get("key"), "conformance": {"verdict": "accepted"}}
+            return R()
+
+    http = _Http()
+
+
 class Service(unittest.TestCase):
     def setUp(self):
         DONE.clear()
@@ -54,7 +99,17 @@ class Service(unittest.TestCase):
         self.agent = build_agent(load_settings(path="/x", home=self.home, sandbox="none", root_tools=["*root_only*"]),
                                  [p], model=self.model, memory=open_memory(in_memory=True))
         self.addCleanup(self.agent.close)
-        self.client = TestClient(create_app(self.agent, Accounts()))
+        from canah.topology import Topology
+        FakeMCP.sent.clear()
+        self.rebuilt = []
+
+        def rebuild():
+            a = build_agent(load_settings(path="/x", home=self.home, sandbox="none"), [p], model=self.model,
+                            memory=open_memory(in_memory=True))
+            self.rebuilt.append(a)
+            self.addCleanup(a.close)
+            return a
+        self.client = TestClient(create_app(self.agent, Accounts(), topology=Topology(FakeMCP()), rebuild=rebuild))
 
     def script(self, *turns):
         self.model.script[:] = list(turns)
@@ -67,7 +122,93 @@ class Service(unittest.TestCase):
     def test_health_info_and_page(self):
         self.assertTrue(self.client.get("/health").json()["ok"])
         self.assertEqual(self.client.get("/info").json()["tools"], 2)
-        self.assertIn("<title>CANAH</title>", self.client.get("/").text)
+        page = self.client.get("/").text
+        self.assertIn("Controller Agnostic Network Agent Harness", page)
+        self.assertIn('id="login"', page)
+        for f in ("app.js", "app.css", "logo-light.png", "logo-dark.png", "fonts/montserrat-latin.woff2"):
+            self.assertEqual(self.client.get(f"/static/{f}").status_code, 200, f)
+
+    def test_topology_reads_every_controller_and_says_which_cannot_be_read(self):
+        t = self.client.get("/topology").json()
+        by = {c["key"]: c for c in t["controllers"]}
+        self.assertEqual([d["id"] for d in by["onos"]["devices"]], ["of:01", "of:02"])
+        self.assertEqual(by["onos"]["devices"][1]["status"], "down")
+        self.assertEqual(len(by["onos"]["links"]), 1)                     # both directions, one link
+        self.assertFalse(by["tpce"]["ok"])
+        self.assertIn("token", by["tpce"]["error"])
+        n = self.client.get("/network").json()
+        self.assertEqual([c["key"] for c in n["controllers"]], ["onos", "tpce"])
+
+    def test_an_attached_file_is_read_by_the_agent_and_is_its_owners_only(self):
+        import base64
+        h = self.sign_in()
+        got = self.client.post("/threads/f1/files", headers=h, json={
+            "name": "notes.txt", "content_base64": base64.b64encode(b"vlan 300 is reserved for acme").decode()}).json()
+        self.assertEqual(got["path"], "/uploads/f1/notes.txt")
+        self.assertIn("vlan 300", got["preview"])
+        self.script(call("read_file", file_path="/uploads/f1/notes.txt"), say("vlan 300 is reserved"))
+        r = self.client.post("/threads/f1/messages", headers=h, json={"text": "what does my file say?"}).json()
+        self.assertIn("vlan 300 is reserved for acme", r["tool_calls"][0]["result"])
+        # another user (root) reading the same path finds nothing
+        self.script(call("read_file", file_path="/uploads/f1/notes.txt"), say("nothing"))
+        r = self.client.post("/threads/f2/messages", headers=self.sign_in("root", "r00t"), json={"text": "read it"}).json()
+        self.assertNotIn("acme", r["tool_calls"][0]["result"])
+
+    def test_activity_says_what_runs(self):
+        a = self.client.get("/activity").json()
+        self.assertFalse(a["busy"])
+        self.script(call("list_items"), say("a, b"))
+        self.client.post("/threads/a1/stream", json={"text": "what is there?"})
+        a = self.client.get("/activity").json()
+        self.assertEqual(a["used"]["main"]["calls"], 1)
+        self.assertEqual(a["recent"][-1]["tool"], "list_items")
+
+    def test_onboarding_goes_to_the_agentic_mcp_and_needs_the_right_level(self):
+        body = {"key": "onos2", "url": "http://10.0.0.5:8181/onos/v1", "label": "ONOS 2", "user_env": "ONOS2_USER"}
+        self.assertEqual(self.client.post("/network/controllers", json=body).status_code, 403)
+        h = self.sign_in()
+        bad = self.client.post("/network/controllers", headers=h, json={**body, "password_env": "s3cret!"})
+        self.assertEqual(bad.status_code, 400)                                   # a secret, not a variable name
+        r = self.client.post("/network/controllers", headers=h, json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["reload_needed"])
+        method, url, sent, _ = FakeMCP.sent[-1]
+        self.assertEqual((method, url.endswith("/controllers"), sent["key"], sent["user_env"]),
+                         ("POST", True, "onos2", "ONOS2_USER"))
+        self.assertEqual(self.client.delete("/network/controllers/onos2", headers=h).status_code, 403)   # root only
+        self.assertEqual(self.client.delete("/network/controllers/onos2", headers=self.sign_in("root", "r00t")).status_code, 200)
+
+    def test_reload_swaps_the_agent(self):
+        self.assertEqual(self.client.post("/admin/reload").status_code, 403)
+        r = self.client.post("/admin/reload", headers=self.sign_in())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(self.rebuilt), 1)
+        self.script(say("still here"))
+        self.assertEqual(self.client.post("/threads/r1/messages", json={"text": "hi"}).json()["text"], "still here")
+
+    def test_an_edit_as_documented_runs_with_the_edited_arguments(self):
+        h = self.sign_in()
+        self.script(call("drop_item", name="a"), say("dropping"))
+        r = self.client.post("/threads/e1/messages", headers=h, json={"text": "drop a"}).json()
+        self.assertEqual(r["pending"][0]["name"], "drop_item")
+        self.script(say("dropped b"))
+        bad = self.client.post("/threads/e1/decide", headers=h, json={"decisions": [{"type": "edit", "name": "drop_item"}]})
+        self.assertEqual(bad.status_code, 400)
+        ok = self.client.post("/threads/e1/decide", headers=h, json={"decisions": [{"type": "edit", "name": "drop_item", "args": {"name": "b"}}]})
+        self.assertEqual(ok.status_code, 200, ok.text)
+        self.assertEqual(DONE, ["b"])
+
+    def test_history_gives_back_the_conversation(self):
+        self.script(say("hello there"))
+        self.client.post("/threads/h1/messages", json={"text": "hi"})
+        h = self.client.get("/threads/h1/history").json()["messages"]
+        self.assertEqual([m["role"] for m in h], ["user", "agent"])
+        self.assertEqual(h[1]["text"], "hello there")
+        self.script(call("list_items"), say("a and b"))
+        self.client.post("/threads/h1/messages", json={"text": "what is there?"})
+        h = self.client.get("/threads/h1/history").json()["messages"]
+        self.assertEqual([m["role"] for m in h][-3:], ["user", "tool", "agent"])
+        self.assertEqual((h[-2]["name"], h[-2]["result"]), ("list_items", "a, b"))
 
     def test_sign_in_and_out(self):
         self.assertEqual(self.client.get("/session").json()["level"], "observer")

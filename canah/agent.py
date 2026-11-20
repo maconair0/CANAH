@@ -382,7 +382,10 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
         name=settings.name,
         debug=settings.debug,
     )
+    detail = [{"name": sp["name"], "description": str(sp.get("description") or "")[:400],
+               "tools": len(sp["tools"]) if sp.get("tools") is not None else None} for sp in specs]
     info = {"model": models.describe() if model is None else {"model": type(model).__name__},
+            "subagent_detail": detail,
             "tools": len(tools), "main_agent_tools": len(main_tools), "writes": writes, "subagents": [s["name"] for s in specs],
             "skills": skill_paths, "memory": memory_paths, "mcp": mcp_info, "state": memory.where,
             "sandbox": (sandbox.runtime.describe() if sandbox is not None and hasattr(sandbox, "runtime") else
