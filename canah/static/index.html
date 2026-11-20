@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CANAH</title>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --ink:#1d2430; --muted:#667085; --line:#d9dee6; --accent:#2f6fde; --warn:#b5651d; --bad:#c0392b; --ok:#1e8e5a; --code:#f0f2f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171c; --panel:#1c2027; --ink:#e6e9ee; --muted:#98a2b3; --line:#2e3440; --accent:#6c9cff; --warn:#e0a060; --bad:#ef6b5b; --ok:#4cc38a; --code:#242a33; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header .who { margin-left:auto; color:var(--muted); font-size:13px; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  .signin { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, button, select { font:inherit; }
+  input { padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); }
+  button { padding:7px 12px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  #log { display:flex; flex-direction:column; gap:10px; margin:12px 0 90px; }
+  .msg { padding:10px 12px; border-radius:8px; background:var(--panel); border:1px solid var(--line); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.you { border-left:3px solid var(--accent); }
+  .msg.err { border-left:3px solid var(--bad); }
+  .step { font:12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted); background:var(--code); border-radius:6px; padding:6px 8px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .pending { border:1px solid var(--warn); border-radius:8px; padding:10px 12px; background:var(--panel); }
+  .pending b { color:var(--warn); }
+  .pending .actions { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  form.ask { position:fixed; left:0; right:0; bottom:0; display:flex; gap:8px; padding:12px 16px; background:var(--panel); border-top:1px solid var(--line); }
+  form.ask input { flex:1; min-width:0; }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CANAH</h1>
+  <div class="signin" id="signin">
+    <input id="user" placeholder="admin or root" autocomplete="username" size="12">
+    <input id="pass" type="password" placeholder="password" autocomplete="current-password" size="12">
+    <button id="login">Sign in</button>
+    <span class="muted">or continue as observer</span>
+  </div>
+  <div class="who" id="who">observer</div>
+  <button id="logout" hidden>Sign out</button>
+  <button id="newthread" title="Start a new conversation">New</button>
+</header>
+<main>
+  <div class="muted" id="info"></div>
+  <div id="log"></div>
+</main>
+<form class="ask" id="ask">
+  <input id="text" placeholder="Ask the agent…" autocomplete="off">
+  <button class="primary" id="send">Send</button>
+</form>
+<script>
+const $ = (id) => document.getElementById(id);
+let token = sessionStorage.getItem("canah.token") || "";
+let level = sessionStorage.getItem("canah.level") || "observer";
+let thread = sessionStorage.getItem("canah.thread") || "";
+
+function headers() { return token ? { "Authorization": "Bearer " + token, "Content-Type": "application/json" } : { "Content-Type": "application/json" }; }
+function add(cls, text) { const d = document.createElement("div"); d.className = cls; d.textContent = text; $("log").appendChild(d); d.scrollIntoView({ block: "end" }); return d; }
+function showWho(user) {
+  $("who").textContent = token ? `${user} (${level})` : "observer: you can ask anything and change nothing";
+  $("signin").hidden = !!token; $("logout").hidden = !token;
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: headers() });
+  if (r.status === 401 && token) { token = ""; level = "observer"; sessionStorage.clear(); showWho(); }
+  if (!r.ok) throw new Error((await r.json().catch(() => ({ detail: r.statusText }))).detail || r.statusText);
+  return r;
+}
+async function ensureThread() {
+  if (!thread) { thread = (await (await api("/threads", { method: "POST" })).json()).thread_id; sessionStorage.setItem("canah.thread", thread); }
+  return thread;
+}
+async function streamTo(path, body) {
+  $("send").disabled = true;
+  let bubble = null;
+  try {
+    const r = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+        const type = (raw.match(/^event: (.*)$/m) || [])[1]; const data = JSON.parse((raw.match(/^data: (.*)$/m) || [])[1] || "{}");
+        if (type === "token") { bubble = bubble || add("msg", ""); bubble.textContent += data.text; }
+        else if (type === "tool_call") add("step", `${data.subagent ? "  ↳ " : "· "}${data.name}(${JSON.stringify(data.args).slice(0, 300)})`);
+        else if (type === "tool_result" && data.name === "execute") add("step", "  │ " + data.content.slice(0, 1200).replace(/\n/g, "\n  │ "));
+        else if (type === "reply") { if (!bubble && data.text) add("msg", data.text); else if (bubble && data.text) bubble.textContent = data.text; showPending(data.pending || []); }
+        else if (type === "error") add("msg err", data.error);
+      }
+    }
+  } catch (e) { add("msg err", e.message); }
+  $("send").disabled = false;
+}
+function showPending(items) {
+  if (!items.length) return;
+  const box = document.createElement("div"); box.className = "pending";
+  box.innerHTML = "<b>Waiting for approval</b>";
+  const may = items.every((p) => level === "root" || (level === "admin" && p.needs !== "root"));
+  for (const p of items) { const s = document.createElement("div"); s.className = "step"; s.textContent = `${p.name}(${JSON.stringify(p.args)})   needs ${p.needs}`; box.appendChild(s); }
+  const act = document.createElement("div"); act.className = "actions";
+  const go = (decisions) => { act.querySelectorAll("button").forEach((b) => b.disabled = true); streamTo(`/threads/${thread}/decide`, { decisions, stream: true }); };
+  const ok = document.createElement("button"); ok.className = "primary"; ok.textContent = "Approve"; ok.disabled = !may;
+  ok.onclick = () => go(items.map(() => ({ type: "approve" })));
+  const no = document.createElement("button"); no.textContent = "Reject";
+  no.onclick = () => { const why = prompt("Why? (optional)") || "The operator rejected this change."; go(items.map(() => ({ type: "reject", message: why }))); };
+  act.append(ok, no);
+  if (!may) { const m = document.createElement("span"); m.className = "muted"; m.textContent = "sign in with the level shown to approve"; act.append(m); }
+  box.appendChild(act); $("log").appendChild(box); box.scrollIntoView({ block: "end" });
+}
+$("ask").onsubmit = async (e) => {
+  e.preventDefault(); const text = $("text").value.trim(); if (!text) return;
+  $("text").value = ""; add("msg you", text);
+  await streamTo(`/threads/${await ensureThread()}/stream`, { text });
+};
+$("login").onclick = async () => {
+  try {
+    const r = await (await fetch("/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: $("user").value, password: $("pass").value }) })).json();
+    if (!r.token) throw new Error(r.detail || "sign-in refused");
+    token = r.token; level = r.level; sessionStorage.setItem("canah.token", token); sessionStorage.setItem("canah.level", level);
+    $("pass").value = ""; thread = ""; sessionStorage.removeItem("canah.thread"); showWho(r.user);
+  } catch (e) { add("msg err", e.message); }
+};
+$("logout").onclick = async () => { try { await api("/session", { method: "DELETE" }); } catch (e) {} token = ""; level = "observer"; sessionStorage.clear(); thread = ""; showWho(); };
+$("newthread").onclick = () => { thread = ""; sessionStorage.removeItem("canah.thread"); $("log").innerHTML = ""; };
+fetch("/info").then((r) => r.json()).then((i) => { $("info").textContent = `${i.model?.model || ""} · ${i.tools} tools · subagents: ${(i.subagents || []).join(", ")} · sandbox: ${i.sandbox || "none"}`; });
+api("/session").then((r) => r.json()).then((s) => { level = s.level; showWho(s.user); }).catch(() => showWho());
+</script>
+</body>
+</html>

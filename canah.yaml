@@ -1,0 +1,21 @@
+# CANAH settings. Everything a deployment changes is here (or in the environment, or .env).
+name: canah
+providers:
+  - canah.network:provider        # the networks, through an agentic MCP service (AGENTIC_MCP_URL, AGENTIC_MCP_TOKEN)
+  - canah.knowledge:provider      # documents, from the corpus indexed under CANAH_HOME/knowledge
+# Minor extra tools over MCP (langchain-mcp-adapters), if any:
+# mcp_config: mcp.json
+# The agent's sandbox for `execute`: a Docker container started with the agent (or none)
+sandbox: docker
+# Writes only root may approve (every other write needs admin), by what a tool does:
+root_tools:
+  - "*delete*"
+  - "*remove*"
+  - "*reboot*"
+  - "*restart*"
+# More tool calls that pause for an operator, beyond every write:
+# interrupt_on:
+#   "*export*": true
+# Extra middleware for the main agent and every subagent:
+# middleware:
+#   - mypackage.middleware:AuditLog

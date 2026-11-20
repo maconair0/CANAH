@@ -1,0 +1,28 @@
+# CANAH core: the central agent on LangChain Deep Agents.
+# Install: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+deepagents==0.7.40
+langchain>=1.5,<2
+langchain-core>=1.8,<2
+langgraph>=1.2,<2
+langgraph-checkpoint-sqlite>=3.0
+langchain-mcp-adapters>=0.3,<0.4
+langchain-ollama>=1.1
+langchain-openai>=1.0
+langchain-anthropic>=1.0
+python-dotenv>=1.0
+# The HTTP service (python -m canah serve)
+fastapi>=0.124,<1
+uvicorn>=0.30
+# Documents (canah.knowledge)
+chromadb==1.5.9
+rank-bm25==0.2.2
+ollama==0.6.3
+pymupdf==1.28.2
+sentence-transformers==6.0.1
+pyyaml>=6.0
+# Optional providers (see canah/models.py):
+#   langchain-google-genai   google_genai:...
+#   langchain-aws            bedrock_converse:...
+#   langchain-groq           groq:...
+# The browser check (tests_canah/browser_check.py), optional
+# playwright

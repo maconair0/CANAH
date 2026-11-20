@@ -1,0 +1,11 @@
+.venv/
+.venvs/
+__pycache__/
+*.pyc
+*:Zone.Identifier
+controllers.env
+.env
+canah_data/
+*.sqlite
+*.sqlite-*
+testbed/results/
