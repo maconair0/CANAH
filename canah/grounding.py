@@ -144,7 +144,7 @@ class GroundingGuard(AgentMiddleware):
 
 
 _ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me|i(?:'ll| will) (?:now |first |next )?(?:check|look|run|query|fetch|get|"
-                       r"examine|inspect|count|search|read|try|call|ask|process|verify|create|make|apply|connect|"
+                       r"examine|inspect|count|search|read|try|call|ask|process|verify|create|make|apply|connect|execute|send|perform|implement|submit|carry out|shut|delete|remove|configure|"
                        r"attach|delegate|proceed)|next,? i(?:'ll| will)|now i(?:'ll| will)|"
                        r"(?:i now|now i) have (?:all )?(?:the )?(?:necessary |required )?information|here(?:'s| is) the plan|"
                        r"i (?:don't|do not) have (?:the |access to the )?(?:current |live |latest )?(?:\w+ ){0,3}"
