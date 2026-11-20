@@ -24,7 +24,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 from . import approval, backends, identity, mcp, models, subagents as sub
-from .grounding import FollowThrough, GroundingGuard, LookFirst, TimeBudget
+from . import window
+from .grounding import FollowThrough, GroundingGuard, KeepAnswer, LookFirst, TimeBudget
 from .identity import OBSERVER, Identity
 from . import memory as mem
 from .config import Settings, load
@@ -39,6 +40,7 @@ class Reply:
     thread_id: str
     pending: List[Dict[str, Any]] = field(default_factory=list)   # writes waiting for a human
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # what it called on the way
+    usage: Dict[str, Any] = field(default_factory=dict)  # context window filled, KV cache (canah.window)
 
     @property
     def waiting(self) -> bool:
@@ -115,6 +117,15 @@ class CanahAgent:
         import time
         c = cfg["configurable"]
         run = c.get("run") or {}
+        win = (self.info.get("context") or {}).get("window")
+        reply.usage = window.usage(run, win)
+        try:
+            ev = self.graph.get_state(cfg).values.get("_summarization_event") or {}
+            if ev.get("cutoff_message_id") and ev.get("cutoff_message_id") != run.get("summary_at_start"):
+                # deepagents summarised the older part of the conversation during this turn
+                reply.usage["compacted"] = True
+        except Exception:  # noqa: BLE001
+            pass
         if self.ops is not None:
             try:
                 msgs = self.graph.get_state(cfg).values.get("messages", [])
@@ -128,6 +139,8 @@ class CanahAgent:
                              model_calls=run.get("model_calls", 0), tokens_in=run.get("tokens_in", 0),
                              tokens_out=run.get("tokens_out", 0), tool_calls=run.get("tool_calls", 0),
                              sent_back={k: v for k, v in sent.items() if v},
+                             cache_prompt=run.get("cache_prompt"), cache_hit=run.get("cache_hit"),
+                             context_used=run.get("context_tokens"), context_window=win,
                              ended=ended or run.get("ended") or ("waiting" if reply.pending else "answered"))
             for p in reply.pending:
                 if self.ops.pending_since(c.get("thread_id"), p["name"]) is None:
@@ -169,9 +182,14 @@ class CanahAgent:
 
     def _seen(self, cfg: Dict[str, Any]) -> int:
         try:
-            return len(self.graph.get_state(cfg).values.get("messages", []))
+            values = self.graph.get_state(cfg).values
         except Exception:  # noqa: BLE001
             return 0
+        run = cfg["configurable"].get("run")
+        if isinstance(run, dict):
+            # where the last compaction cut the conversation, to tell at the end whether this turn compacted it
+            run["summary_at_start"] = (values.get("_summarization_event") or {}).get("cutoff_message_id")
+        return len(values.get("messages", []))
 
     def _invoke(self, payload: Any, cfg: Dict[str, Any], start: int) -> Reply:
         """Run, and when the run hits its step limit, answer saying so instead of raising."""
@@ -239,7 +257,7 @@ class CanahAgent:
         state = self.graph.get_state(cfg)
         reply = self._finish(cfg, self._reply(state.values, cfg, start))
         yield {"type": "reply", "text": reply.text, "pending": reply.pending, "tool_calls": reply.tool_calls,
-               "thread_id": thread_id}
+               "thread_id": thread_id, "usage": reply.usage}
 
     def _events(self, payload: Any, cfg: Dict[str, Any]) -> Iterator[Tuple[str, Dict[str, Any]]]:
         from .grounding import KEEP
@@ -273,7 +291,7 @@ class CanahAgent:
                                              "subagent": bool(ns)}
                     elif isinstance(m, ToolMessage):
                         yield mode, {"type": "tool_result", "name": m.name, "content": str(m.content)[:2000],
-                                     "subagent": bool(ns)}
+                                     "subagent": bool(ns), "ms": (m.additional_kwargs or {}).get("ms")}
 
     def _check_decisions(self, waiting, decisions, who, thread_id) -> None:
         if not waiting:
@@ -321,6 +339,11 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                    always pause; their config may be reshaped here, never switched off.
     Both add to what the settings name (settings.middleware, settings.interrupt_on)."""
     settings = settings or load()
+    # The agentic MCP's address and token as set on the web page, when they were.
+    from .network import load_connection
+    load_connection(settings.home_path)
+    # The model chosen on the web page, and the providers' keys kept there.
+    models.load_page_choice(settings.home_path)
     sandbox_note = ""
     if sandbox is None and settings.sandbox == "docker":
         from .sandbox import open_sandbox
@@ -336,7 +359,9 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     twins = Registry(settings.home_path, settings.twins, settings.twin_active)
     twin_checks = Checks()
     twin_provider = [TwinsProvider(twins, settings.home_path, twin_checks)] if twins.entries() else []
-    all_providers = list(providers) + load_providers(settings.providers) + twin_provider
+    from .diagrams import DiagramProvider
+    diagram_provider = [DiagramProvider(settings.home_path)] if settings.diagrams else []
+    all_providers = list(providers) + load_providers(settings.providers) + twin_provider + diagram_provider
     got = merge(all_providers)
     tools = list(got["tools"]) + list(extra_tools)
     writes = list(got["writes"]) + list(extra_writes) + list(settings.approve_tools)
@@ -377,26 +402,35 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     if twin_provider and settings.twin_gate:
         from .twins.provider import make_gate
         approvals_set = set(approvals)
-        extra_mw.append(make_gate(twins, twin_checks, lambda: approvals_set))
+        resolvers = [pv.write_target for pv in all_providers if hasattr(pv, "write_target")]
+
+        def resolve(name, args):
+            for r in resolvers:
+                got = r(name, args)
+                if got is not None:
+                    return got
+            return None
+        extra_mw.append(make_gate(twins, twin_checks, lambda: approvals_set, resolve))
     if not any(s["name"] == "general-purpose" for s in specs):
         specs.append({"name": "general-purpose",
                       "description": ("A general-purpose agent for a self-contained piece of work that needs several "
                                       "steps: research, computing in the sandbox, drafting. It has only the main "
                                       "agent's own tools: it cannot read or change a controller; delegate those to "
-                                      "the controller's subagent."),
+                                      "the main agent, which works the controllers through the agentic MCP."),
                       "system_prompt": ("You do one self-contained piece of work for the main agent and report the "
                                         "result briefly. Read before you conclude; a change is paused for approval.")})
     shared = [t for t in tools if t.name in set(got.get("shared") or [])]
     budget = TimeBudget()
     from .ops import Ops
-    from .safety import GuardMemory, RecordWrites, RunTracker, ScreenOutput
+    from .safety import GuardMemory, RecordWrites, RepeatGuard, RunTracker, ScreenOutput
     ops = Ops(settings.home_path / "ops.sqlite") if settings.audit else None
     tracker, screen, record = RunTracker(settings.max_tokens_per_request), ScreenOutput(), RecordWrites(approvals, ops)
+    repeat = RepeatGuard()
     guard_mem = GuardMemory(ops)
     for spec in specs:
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
-        spec["middleware"] = [budget, tracker, roles, screen, record, large, GroundingGuard(), FollowThrough(),
+        spec["middleware"] = [budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
                               *list(spec.get("middleware") or []),
                               *extra_mw]
         if spec.get("tools") is not None and shared:
@@ -426,26 +460,51 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
 
     hidden = set(got.get("subagent_only") or [])
     main_tools = [t for t in tools if t.name not in hidden]
-    graph = create_deep_agent(
-        model=(main_model := model or models.get("model")),
-        tools=main_tools,
-        system_prompt=prompt,
-        middleware=[budget, tracker, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                    *_fallback(),
-                    *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw],
-        subagents=specs or None,
-        skills=skill_paths or None,
-        memory=memory_paths or None,
-        permissions=backends.permissions(settings, sandbox) or None,
-        backend=backend,
-        interrupt_on=interrupts or None,
-        checkpointer=memory.checkpointer,
-        store=memory.store,
-        name=settings.name,
-        debug=settings.debug,
-    )
+    main_model = model or models.get("model")
+    # The window in the model's profile, so compaction happens at compact_at of the real window.
+    ctx_window = window.give_profile(main_model, settings.context_window)
+    for sp in specs:
+        if isinstance(sp.get("model"), BaseChatModel):
+            window.give_profile(sp["model"], settings.context_window)
+    compact_mw = []
+    with window.compaction(settings.compact_at, settings.compact_keep):
+        if settings.compact_tool and isinstance(main_model, BaseChatModel):
+            from deepagents.middleware.summarization import create_summarization_tool_middleware
+            compact_mw = [create_summarization_tool_middleware(main_model, backend, system_prompt=(
+                "When the operator asks to compact the conversation (or says /compact), call compact_conversation."))]
+        graph = create_deep_agent(
+            model=main_model,
+            tools=main_tools,
+            system_prompt=prompt,
+            middleware=[budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
+                        KeepAnswer(), *_fallback(),
+                        *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
+                        *compact_mw],
+            subagents=specs or None,
+            skills=skill_paths or None,
+            memory=memory_paths or None,
+            permissions=backends.permissions(settings, sandbox) or None,
+            backend=backend,
+            interrupt_on=interrupts or None,
+            checkpointer=memory.checkpointer,
+            store=memory.store,
+            name=settings.name,
+            debug=settings.debug,
+        )
+    # What each subagent is: the librarian, a general one, or a provider's own (agent_roles). The controllers
+    # are not subagents: the agentic MCP holds them and the main agent works them through it.
+    roles: Dict[str, Dict[str, Any]] = {}
+    for prov in all_providers:
+        if hasattr(prov, "agent_roles"):
+            try:
+                roles.update(prov.agent_roles() or {})
+            except Exception:  # noqa: BLE001
+                pass
+    known = {"librarian": "knowledge", "general-purpose": "general"}
     detail = [{"name": sp["name"], "description": str(sp.get("description") or "")[:400],
-               "tools": len(sp["tools"]) if sp.get("tools") is not None else None} for sp in specs]
+               "tools": len(sp["tools"]) if sp.get("tools") is not None else None,
+               "kind": (roles.get(sp["name"]) or {}).get("kind") or known.get(sp["name"], "custom"),
+               **{k: v for k, v in (roles.get(sp["name"]) or {}).items() if k != "kind"}} for sp in specs]
     info = {"model": models.describe() if model is None else {"model": type(model).__name__},
             "subagent_detail": detail,
             "tools": len(tools), "main_agent_tools": len(main_tools), "writes": writes, "subagents": [s["name"] for s in specs],
@@ -456,6 +515,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                 info["subagents"] or "none")
     info["interrupt_on"] = sorted(interrupts)
     info["middleware"] = [type(m).__name__ for m in extra_mw]
+    info["context"] = {"window": ctx_window, "compact_at": settings.compact_at, "compact_keep": settings.compact_keep,
+                       "compact_tool": bool(compact_mw)}
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
                       interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
                       providers=all_providers, model=main_model)

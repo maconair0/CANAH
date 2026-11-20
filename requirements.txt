@@ -1,28 +1,42 @@
-# CANAH core: the central agent on LangChain Deep Agents.
+# CANAH: the central agent on LangChain Deep Agents.
 # Install: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# ./start.sh does this on first use, and also:
+#   - puts in the CUDA build of torch when there is an NVIDIA GPU (the re-ranker and embedder run there);
+#   - fetches mermaid.js into canah/static/vendor (diagrams on the page and from draw_diagram);
+#   - installs Playwright's headless Chromium (draw_diagram renders with it).
+
+# The agent
 deepagents==0.7.40
 langchain>=1.5,<2
 langchain-core>=1.8,<2
 langgraph>=1.2,<2
 langgraph-checkpoint-sqlite>=3.0
 langchain-mcp-adapters>=0.3,<0.4
-langchain-ollama>=1.1
-langchain-openai>=1.0
-langchain-anthropic>=1.0
 python-dotenv>=1.0
-# The HTTP service (python -m canah serve)
+pydantic>=2.10,<3
+requests>=2.32
+
+# Model providers (choose one on the Model page, or in canah/models.py)
+langchain-ollama>=1.1
+langchain-openai>=1.0          # OpenAI, and any OpenAI-compatible server (vLLM, LM Studio, ...)
+langchain-anthropic>=1.0
+# Optional, install to use them:
+#   langchain-google-genai     Google Gemini
+#   langchain-groq             Groq
+#   langchain-aws              AWS Bedrock
+
+# The HTTP service and web console (python -m canah serve)
 fastapi>=0.124,<1
 uvicorn>=0.30
-# Documents (canah.knowledge)
+
+# Documents (canah.knowledge): hybrid retrieval, re-ranking on the GPU when there is one
 chromadb==1.5.9
 rank-bm25==0.2.2
 ollama==0.6.3
 pymupdf==1.28.2
 sentence-transformers==6.0.1
+torch==2.15.0                  # start.sh swaps in the CUDA build of the same version on an NVIDIA GPU
 pyyaml>=6.0
-# Optional providers (see canah/models.py):
-#   langchain-google-genai   google_genai:...
-#   langchain-aws            bedrock_converse:...
-#   langchain-groq           groq:...
-# The browser check (tests_canah/browser_check.py), optional
-# playwright
+
+# Diagrams (canah.diagrams: draw_diagram renders Mermaid to SVG and PNG), and the browser check
+playwright==1.65.2

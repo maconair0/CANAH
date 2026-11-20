@@ -77,6 +77,7 @@
     <button data-view="chat"><span class="ico">✦</span>Chat</button>
     <button data-view="ops"><span class="ico">✔</span>Approvals &amp; audit<span class="badge warn" id="pending-badge" hidden>0</span></button>
     <button data-view="twins"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="3" width="7" height="7" rx="1.5"/><rect x="6" y="1" width="7" height="7" rx="1.5" stroke-dasharray="2 1.5"/></svg></span>Digital twins</button>
+    <button data-view="model"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="9" height="9" rx="2"/><path d="M5 0.8v1.7M9 0.8v1.7M5 11.5v1.7M9 11.5v1.7M0.8 5h1.7M0.8 9h1.7M11.5 5h1.7M11.5 9h1.7"/><rect x="5" y="5" width="4" height="4" rx=".8"/></svg></span>Model &amp; providers</button>
     <div class="section">Knowledge</div>
     <button data-view="knowledge"><span class="ico">❏</span>Documents &amp; memory</button>
     <div class="section">Account</div>
@@ -108,7 +109,7 @@
           </div>
           <div class="topo-hint faint">click a controller to open what it holds · click anything for its details · scroll to zoom · drag the background to pan · drag nodes to arrange · double-click to fit</div>
           <div class="legend">
-            <span><i style="border-color:var(--accent)"></i>CANAH to its controllers (through the agentic MCP)</span>
+            <span><i style="border-color:var(--accent)"></i>CANAH to the agentic MCP</span><span><i style="border-color:#2fd3c1;border-style:dashed"></i>CANAH to its digital twin (NetTwin)</span><span><i style="border-color:var(--accent2);border-style:dashed"></i>the agentic MCP to the controllers it holds</span>
             <span><i style="border-color:var(--ok)"></i>link up (animated)</span>
             <span><i style="border-color:var(--bad)"></i>down, or unreadable</span>
             <span><i style="border-color:var(--brand-orange);border-top-style:solid;border-top-width:3px"></i>across domains (relations)</span>
@@ -128,37 +129,108 @@
     <section class="view" id="view-controllers">
       <div class="row"><h2>SDN controllers</h2><div class="spacer" style="flex:1"></div>
         <span class="faint" id="ctl-src" style="font-size:12px"></span><button class="btn sm" id="ctl-refresh">Refresh</button></div>
+      <p class="muted page-lead">CANAH does not hold the SDN controllers: the <b>agentic MCP</b> does. It learns each controller, checks it
+        against the common contract and serves its tools. CANAH works every controller through it, with the same tools for each: one per
+        contract verb (<span class="mono">net_read_devices</span>, <span class="mono">net_provision</span>, …), the controller named as an argument.</p>
       <div id="ctl-banner"></div>
-      <div class="grid" style="grid-template-columns:minmax(0,1fr) 420px;align-items:start">
-        <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:14px;min-width:0">
-        <div class="card"><header><h3>Held by the agentic MCP</h3><div class="spacer"></div>
-          <button class="btn sm" id="ctl-reload" title="Rebuild the agent so every controller held now has its subagent (admin)">Reload CANAH</button></header>
-          <div class="body" style="padding:0;overflow:auto" id="ctl-table"></div></div>
-        <div class="card" id="onboard-card"><header><h3>Onboard a controller</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
-          <div class="body">
-            <p class="muted" style="margin:0 0 10px;font-size:12.5px">The agentic MCP learns the controller (its API description, or the manifest of its kind), checks it against the common contract and seats it. Then reload CANAH, and the controller gets its own subagent.</p>
-            <form id="onboard-form" class="form-grid" autocomplete="off">
-              <label>Key<input id="ob-key" placeholder="onos2" required pattern="[a-z][a-z0-9_]{1,31}" title="lower-case letters, digits, _"></label>
-              <label>Label<input id="ob-label" placeholder="ONOS (site B)"></label>
-              <label class="wide">Base URL<input id="ob-url" placeholder="http://10.0.0.5:8181/onos/v1" required pattern="https?://.+" title="starts with http:// or https://"></label>
-              <label>Kind<select id="ob-kind"><option value="">recognise it from its API</option></select></label>
-              <label>API document URL<input id="ob-spec" placeholder="optional: an OpenAPI / Swagger URL"></label>
-              <label>User variable<input id="ob-user" placeholder="ONOS2_USER" pattern="[A-Z_][A-Z0-9_]*"></label>
-              <label>Password variable<input id="ob-pass" placeholder="ONOS2_PASSWORD" pattern="[A-Z_][A-Z0-9_]*"></label>
-              <p class="faint wide" style="margin:0;font-size:11.5px">Credentials are the <b>names</b> of environment variables set on the agentic MCP's host, never the secrets: they are not sent through this page.</p>
-              <div class="wide row"><button class="btn primary" type="submit" id="ob-go">Onboard</button><span id="ob-msg" class="muted" style="font-size:12.5px"></span></div>
-            </form>
-            <details style="margin-top:12px"><summary class="muted" style="cursor:pointer">A controller of a kind the agentic MCP does not know yet</summary>
-              <div class="row" style="margin-top:10px">
-                <label class="btn sm">Upload a manifest (YAML or JSON)<input type="file" id="ob-manifest" hidden accept=".yaml,.yml,.json"></label>
-                <span class="faint">or</span>
-                <input id="ob-guide-kind" placeholder="kind, e.g. opendaylight" style="width:200px">
-                <label class="btn sm">Upload its user guide or API document<input type="file" id="ob-guide" hidden></label>
-              </div></details>
-          </div></div>
+
+      <div class="card mcp-card" id="mcp-card">
+        <header class="mcp-head"><img class="mcp-logo for-light" src="/static/agentic-mcp-logo-light.png" alt="Agentic MCP: one contract, every controller">
+          <img class="mcp-logo for-dark" src="/static/agentic-mcp-logo-dark.png" alt="Agentic MCP: one contract, every controller">
+          <div class="spacer"></div><span class="faint" style="font-size:12px">root to change</span></header>
+        <div class="body mcp-body">
+          <div class="mcp-stats" id="mcp-stats"></div>
+          <form id="mcp-form" class="mcp-form" autocomplete="off">
+            <label>Address<input id="mcp-url" placeholder="http://127.0.0.1:8400" pattern="https?://.+" title="starts with http:// or https://"></label>
+            <label>Token<input id="mcp-token" type="password" placeholder="the agentic MCP's AGENTIC_MCP_TOKEN" autocomplete="new-password"></label>
+            <div class="row mcp-actions"><button class="btn primary" type="submit" id="mcp-save">Save and connect</button>
+              <button class="btn" type="button" id="mcp-clear">Remove the token</button><button class="btn ghost" type="button" id="mcp-test">Test</button>
+              <span id="mcp-msg" class="muted" style="font-size:12.5px"></span></div>
+            <p class="faint" style="margin:0;font-size:11.5px">The token is kept on CANAH's host, readable by CANAH's user only, and never shown again. CANAH uses it from the next call on; reload CANAH to give newly readable controllers their agents.</p>
+          </form>
         </div>
-        <div class="card"><header><h3 id="ctl-detail-title">The common contract</h3></header><div class="body" id="ctl-detail">
-          <span class="muted">Pick a controller to see which contract verbs it serves, with which of its own tools, and what it lacks.</span></div></div>
+      </div>
+
+      <div class="tabs" id="ctl-tabs" role="tablist">
+        <button class="tab active" data-tab="held" role="tab">Controllers <span class="count" id="ctl-count"></span></button>
+        <button class="tab" data-tab="add" role="tab">Add controllers</button>
+        <button class="tab" data-tab="contract" role="tab">Common contract <span class="count" id="contract-ver"></span></button>
+      </div>
+
+      <div class="ctl-pane" data-pane="held">
+        <div class="grid ctl-grid">
+          <div class="card"><header><h3>Held by the agentic MCP</h3><div class="spacer"></div>
+            <button class="btn sm" id="ctl-reload" title="Rebuild the agent so every controller held now has its agent (admin)">Reload CANAH</button></header>
+            <div class="body" style="padding:0;overflow-x:auto" id="ctl-table"></div></div>
+          <div class="card"><header><h3 id="ctl-detail-title">A controller</h3></header><div class="body" id="ctl-detail">
+            <span class="muted">Pick a controller to see which contract verbs it serves, with which of its own tools, and what it lacks.</span></div></div>
+        </div>
+      </div>
+
+      <div class="ctl-pane" data-pane="add" hidden>
+        <div class="add-grid" id="onboard-card">
+          <div class="card"><header><h3>Onboard one by its address</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+            <div class="body">
+              <p class="muted" style="margin:0 0 10px;font-size:12.5px">The agentic MCP learns the controller (its API description, or the manifest of its kind), checks it against the common contract and seats it. Then reload CANAH to give it its agent.</p>
+              <form id="onboard-form" class="form-grid" autocomplete="off">
+                <label>Key<input id="ob-key" placeholder="onos2" required pattern="[a-z][a-z0-9_]{1,31}" title="lower-case letters, digits, _"></label>
+                <label>Label<input id="ob-label" placeholder="ONOS (site B)"></label>
+                <label class="wide">Base URL<input id="ob-url" placeholder="http://10.0.0.5:8181/onos/v1" required pattern="https?://.+" title="starts with http:// or https://"></label>
+                <label>Kind<select id="ob-kind"><option value="">recognise it from its API</option></select></label>
+                <label>API document URL<input id="ob-spec" placeholder="optional: an OpenAPI / Swagger URL"></label>
+                <label>User variable<input id="ob-user" placeholder="ONOS2_USER" pattern="[A-Z_][A-Z0-9_]*"></label>
+                <label>Password variable<input id="ob-pass" placeholder="ONOS2_PASSWORD" pattern="[A-Z_][A-Z0-9_]*"></label>
+                <p class="faint wide" style="margin:0;font-size:11.5px">Credentials are the <b>names</b> of environment variables set on the agentic MCP's host, never the secrets: they are not sent through this page.</p>
+                <div class="wide row"><button class="btn primary" type="submit" id="ob-go">Onboard</button><span id="ob-msg" class="muted" style="font-size:12.5px"></span></div>
+              </form>
+            </div></div>
+          <div class="card"><header><h3>Upload several</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+            <div class="body">
+              <p class="muted" style="margin:0 0 8px;font-size:12.5px">A JSON or YAML file listing controllers, each with the same fields as the form. Each is onboarded on its own; one failing does not stop the rest.</p>
+              <pre class="sample">controllers:
+  - key: onos2
+    label: ONOS (site B)
+    url: http://10.0.0.5:8181/onos/v1
+    kind: onos
+    user_env: ONOS2_USER
+    password_env: ONOS2_PASSWORD
+  - key: odl1
+    url: http://10.0.0.9:8181</pre>
+              <div class="row"><label class="btn primary drop" id="ob-batch-drop">Choose a controllers file<input type="file" id="ob-batch" hidden accept=".yaml,.yml,.json"></label>
+                <button class="btn sm ghost" type="button" id="ob-sample">Download this example</button></div>
+              <div id="ob-batch-out" style="margin-top:10px"></div>
+            </div></div>
+          <div class="card"><header><h3>A new kind of controller</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+            <div class="body">
+              <p class="muted" style="margin:0 0 10px;font-size:12.5px">For a controller the agentic MCP does not know yet: install its manifest, or let the agentic MCP draft one from the controller's user guide or API document (text, Markdown, HTML, OpenAPI or PDF). Then onboard it with that kind.</p>
+              <div class="kind-rows">
+                <div class="kind-row"><div><b>Manifest</b><div class="faint">YAML or JSON, in the agentic MCP's manifest format</div></div>
+                  <label class="btn sm">Upload a manifest<input type="file" id="ob-manifest" hidden accept=".yaml,.yml,.json"></label></div>
+                <div class="kind-row"><div><b>User guide or API document</b><div class="faint">a manifest is drafted from it, for this kind:</div>
+                  <input id="ob-guide-kind" placeholder="kind, e.g. opendaylight" style="margin-top:6px;width:100%"></div>
+                  <label class="btn sm">Upload a document<input type="file" id="ob-guide" hidden></label></div>
+              </div>
+              <div id="ob-kinds" class="chips" style="margin-top:12px"></div>
+            </div></div>
+        </div>
+      </div>
+
+      <div class="ctl-pane" data-pane="contract" hidden>
+        <div class="grid contract-grid">
+          <div class="card"><header><h3>The common contract</h3><div class="spacer"></div><span class="faint" id="contract-file" style="font-size:11.5px"></span></header>
+            <div class="body" id="contract-view"><span class="muted">Loading…</span></div></div>
+          <div class="card"><header><h3>Change it</h3><div class="spacer"></div><span class="faint" style="font-size:12px">root to apply</span></header>
+            <div class="body">
+              <p class="muted" style="margin:0 0 8px;font-size:12.5px">Every controller is checked against this contract. Edit it here, or load a file. <b>Check</b> shows what each controller's verdict would become, without changing anything; <b>Apply</b> makes it the contract (the agentic MCP keeps the previous one as a backup).</p>
+              <textarea id="contract-edit" class="code-edit" spellcheck="false"></textarea>
+              <div class="row" style="margin-top:8px"><button class="btn" id="contract-check" type="button">Check</button>
+                <button class="btn primary" id="contract-apply" type="button">Apply</button>
+                <label class="btn ghost">Load a file<input type="file" id="contract-file-in" hidden accept=".json"></label>
+                <button class="btn ghost" id="contract-reset" type="button">Undo my edits</button>
+                <button class="btn ghost" id="contract-download" type="button">Download</button></div>
+              <div id="contract-out" style="margin-top:10px"></div>
+            </div></div>
+        </div>
       </div>
     </section>
 
@@ -187,6 +259,7 @@
                 <label class="switch" title="Show only the conversation"><input type="checkbox" id="hide-tools"><span class="track"><i></i></span>Hide tool calls</label>
                 <label class="btn sm ghost lg-attach" title="Attach files: text, PDF, documents (up to 25 MB each)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.4 11.1l-9.2 9.2a6 6 0 01-8.5-8.5l9.2-9.2a4 4 0 015.7 5.7l-9.2 9.2a2 2 0 01-2.8-2.8l8.5-8.5"/></svg><span>Upload</span><input type="file" id="attach" multiple hidden></label>
                 <div style="flex:1"></div>
+                <span class="ctx-meter" id="ctx-meter" hidden></span>
                 <button class="btn primary lg-send" id="send" type="submit" title="Send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg><span>Send</span></button>
               </div>
             </form>
@@ -204,9 +277,13 @@
     <section class="view" id="view-twins">
       <div class="row"><h2>Digital twins</h2><div style="flex:1"></div><span class="faint" id="tw-contract" style="font-size:12px"></span>
         <button class="btn sm" id="tw-refresh">Refresh</button></div>
-      <p class="muted" style="margin:0 0 14px;font-size:13px;max-width:900px">A digital twin predicts what a change or a failure does to a network before the network sees it. CANAH asks the twin in use through one contract, so any twin that speaks it can be used: netwins, or your own. Changing the twin takes effect at the next question; the agent's tools stay the same.</p>
-      <div id="tw-cards" class="tw-cards"></div>
-      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;margin-top:14px">
+      <p class="muted page-lead">A digital twin predicts what a change or a failure does to a network before the network sees it. CANAH asks the twin in use through one contract, so any twin that speaks it can be used: netwins, or your own. Changing the twin takes effect at the next question; the agent's tools stay the same.</p>
+      <div id="tw-active"></div>
+      <div class="section-h"><h3>Domains it covers</h3><span class="faint" id="tw-dom-of"></span></div>
+      <div id="tw-domains" class="tw-domains"></div>
+      <div class="section-h"><h3>Twins available</h3><span class="faint">choose the one CANAH asks (admin)</span></div>
+      <div id="tw-cards" class="tw-list"></div>
+      <div class="grid tw-bottom">
         <div class="card"><header><h3>Add a custom twin</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
           <div class="body">
             <form id="tw-form" class="form-grid" autocomplete="off">
@@ -231,6 +308,38 @@
               <tr><td class="mono">POST /twin/extra</td><td>optional: the twin's own read-only helpers, listed by describe</td></tr>
             </tbody></table>
             <p class="faint" style="margin:8px 0 0;font-size:11.5px">The full text: docs/TWIN_CONTRACT.md. A minimal twin to start from: examples/custom_twin.py.</p>
+          </div></div>
+      </div>
+    </section>
+
+    <!-- The model the agent runs on -->
+    <section class="view" id="view-model">
+      <div class="row"><h2>Model &amp; providers</h2><div style="flex:1"></div><span class="faint" style="font-size:12px">root to change</span>
+        <button class="btn sm" id="md-refresh">Refresh</button></div>
+      <p class="muted page-lead">The model CANAH runs on. Pick one of the models Ollama has on this machine (nothing leaves it), or a hosted
+        provider with its API key. A new model is tried with one short question first; CANAH switches to it only if it answers.</p>
+      <div id="md-banner"></div>
+      <div class="card md-current" id="md-current"></div>
+      <div class="grid md-grid">
+        <div class="card"><header><h3>Ollama on this machine</h3><div class="spacer"></div><span class="faint mono" id="md-ollama-url" style="font-size:11.5px"></span></header>
+          <div class="body" style="padding:0">
+            <div id="md-ollama"></div>
+            <div class="md-ctx"><label>Context window (num_ctx)<select id="md-ctx">
+              <option value="8192">8,192</option><option value="16384">16,384</option><option value="32768" selected>32,768</option><option value="65536">65,536</option><option value="131072">131,072</option></select></label>
+              <span class="faint" style="font-size:11.5px">The larger, the longer a conversation before it is compacted, and the more GPU memory.</span></div>
+          </div></div>
+        <div class="card"><header><h3>Another provider</h3></header>
+          <div class="body">
+            <form id="md-form" class="form-grid" autocomplete="off">
+              <label class="wide">Provider<select id="md-provider"></select></label>
+              <label class="wide">Model<input id="md-model" list="md-examples" placeholder="e.g. claude-sonnet-5-5" required><datalist id="md-examples"></datalist></label>
+              <label class="wide md-base" hidden>Base URL<input id="md-base" placeholder="http://10.0.0.5:8000/v1"></label>
+              <label class="wide">API key<input id="md-key" type="password" autocomplete="new-password" placeholder="paste the key"></label>
+              <p class="faint wide" id="md-key-note" style="margin:0;font-size:11.5px"></p>
+              <div class="wide row"><button class="btn primary" type="submit" id="md-go">Test and use</button>
+                <button class="btn ghost" type="button" id="md-key-drop">Remove the stored key</button>
+                <span id="md-msg" class="muted" style="font-size:12.5px"></span></div>
+            </form>
           </div></div>
       </div>
     </section>

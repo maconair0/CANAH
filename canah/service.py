@@ -138,9 +138,11 @@ def _as_text(name: str, data: bytes):
 
 class Activity:
     """What is running now, for the console: each request's subagents at work and its last steps.
-    A subagent is at work while its `task` runs, or while one of its controller tools (<key>__<tool>) runs."""
+    A subagent is at work while its `task` runs; a controller's agent also while one of that controller's tools
+    (<key>__<tool>, through the agentic MCP) runs. `agent_of(key)` names the agent working a controller."""
 
-    def __init__(self, keep: int = 60):
+    def __init__(self, keep: int = 60, agent_of: Any = None):
+        self.agent_of = agent_of or (lambda key: key)
         self._lock = threading.Lock()
         self.running: Dict[str, Dict[str, Any]] = {}
         self.recent: List[Dict[str, Any]] = []
@@ -167,7 +169,7 @@ class Activity:
         if name == "task" and isinstance(ev.get("args"), dict):
             who = str(ev["args"].get("subagent_type") or "general-purpose")
         elif "__" in name:
-            who = name.split("__", 1)[0]
+            who = self.agent_of(name.split("__", 1)[0])
         now = time.time()
         with self._lock:
             run = self.running.get(key)
@@ -205,14 +207,15 @@ def _status(e: Exception) -> tuple:
 
 
 def _reply_json(r: Reply) -> Dict[str, Any]:
-    return {"thread_id": r.thread_id, "text": r.text, "pending": r.pending, "tool_calls": r.tool_calls}
+    return {"thread_id": r.thread_id, "text": r.text, "pending": r.pending, "tool_calls": r.tool_calls,
+            "usage": r.usage}
 
 
 def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology: Any = None,
                rebuild: Optional[Any] = None) -> FastAPI:
     """`topology`: what /network and /topology read (a canah.topology.Topology); by default one over the
     agentic MCP the settings name. `rebuild`: makes a new agent from the settings, for /admin/reload (a
-    controller onboarded since the start gets its subagent); without it, reload is refused."""
+    controller onboarded since the start gets its agent); without it, reload is refused."""
     ref = {"agent": agent}
 
     def A() -> CanahAgent:
@@ -261,7 +264,12 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         finally:
             lock.release()
 
-    activity = Activity()
+    def agent_of(key: str) -> str:
+        for d in A().info.get("subagent_detail") or []:
+            if d.get("controller") == key:
+                return d["name"]
+        return key
+    activity = Activity(agent_of=agent_of)
 
     def sse(key: str, events: Iterator[Dict[str, Any]], public_id: str) -> StreamingResponse:
         events = activity.watch(key, events)
@@ -301,7 +309,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
     @app.get("/info")
     def info():
         keep = ("model", "tools", "main_agent_tools", "subagents", "subagent_detail", "skills", "memory", "sandbox",
-                "interrupt_on", "middleware")
+                "interrupt_on", "middleware", "context")
         return {k: A().info.get(k) for k in keep}
 
     @app.post("/session")
@@ -365,8 +373,18 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                 for t in (getattr(m, "tool_calls", None) or []):
                     r = results.get(t.get("id"))
                     out.append({"role": "tool", "name": t.get("name"), "args": t.get("args") or {},
-                                "result": (str(r.content)[:4000] if r is not None else None)})
-        return {"thread_id": thread_id, "messages": out[-200:]}
+                                "result": (str(r.content)[:4000] if r is not None else None),
+                                "ms": ((r.additional_kwargs or {}).get("ms") if r is not None else None)})
+        # How full the window is now: the last model call's prompt and answer (the next call starts there).
+        context = None
+        win = (A().info.get("context") or {}).get("window")
+        for m in reversed(msgs):
+            u = getattr(m, "usage_metadata", None) if m.type == "ai" else None
+            if u and u.get("input_tokens"):
+                used = int(u["input_tokens"]) + int(u.get("output_tokens") or 0)
+                context = {"used": used, "window": win, "percent": round(100 * used / win, 1) if win else None}
+                break
+        return {"thread_id": thread_id, "messages": out[-200:], "context": context}
 
     @app.get("/threads/{thread_id}/pending")
     def pending(thread_id: str, c=Depends(caller)):
@@ -477,6 +495,18 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             sessions_ = {}
         return {"ok": True, "url": topology.service.url, "controllers": rows, "sessions": sessions_}
 
+    @app.get("/diagrams/{name}")
+    def diagram(name: str):
+        """A picture draw_diagram made. Its name is random (16 hex digits), which is what keeps it private: an <img>
+        on the page cannot send the bearer token."""
+        from fastapi.responses import FileResponse
+        from .diagrams import NAME
+        f = A().settings.home_path / "diagrams" / name
+        if not NAME.match(name) or not f.is_file():
+            raise HTTPException(404, "no such diagram")
+        return FileResponse(str(f), media_type="image/svg+xml" if name.endswith(".svg") else "image/png",
+                            headers={"Cache-Control": "private, max-age=86400"})
+
     @app.get("/topology")
     def topo(refresh: int = 0, c=Depends(caller)):
         return topology.read(bool(refresh))
@@ -568,6 +598,75 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             A().ops.audit(what, who.user, who.level, "", "agentic-mcp", args)
         topology.read(refresh=True)
 
+    # ----- the agentic MCP itself: where it is, its token, its contract -----
+
+    def mcp_check_token() -> Dict[str, Any]:
+        """Whether the agentic MCP answers, and whether it takes CANAH's token for what is not a read."""
+        svc = topology.service
+        out: Dict[str, Any] = {"url": svc.url, "token_set": bool(svc.token)}
+        try:
+            r = svc.http.get(svc.url + "/controllers", headers=svc._headers(), timeout=8)
+            out["reachable"] = r.status_code < 500
+            out["controllers"] = len((r.json() or {}).get("controllers", [])) if r.ok else None
+        except Exception as e:  # noqa: BLE001
+            out.update(reachable=False, error=f"{type(e).__name__}: {str(e)[:160]}")
+            return out
+        try:
+            # A request that changes nothing but needs the token when the agentic MCP has one.
+            r = svc.http.post(svc.url + "/contract/check", json={"contract": {}}, headers=svc._headers(), timeout=8)
+            out["token_accepted"] = None if r.status_code == 404 else r.status_code != 401
+            out["contract_api"] = r.status_code != 404
+        except Exception:  # noqa: BLE001
+            out["token_accepted"] = None
+        return out
+
+    @app.get("/network/connection")
+    def connection(c=Depends(caller)):
+        from .network import CONNECTION_FILE
+        got = mcp_check_token()
+        got["set_on_page"] = (A().settings.home_path / CONNECTION_FILE).exists()
+        return got
+
+    @app.put("/network/connection")
+    def set_connection(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """The agentic MCP's address and/or token (root). The token is kept readable by CANAH's user only,
+        used from the next call on, and never sent back."""
+        if not c["who"].can("root"):
+            raise HTTPException(403, "changing the agentic MCP's address or token needs root")
+        from .network import save_connection
+        url = body.get("url")
+        if url is not None and not str(url).startswith(("http://", "https://")):
+            raise HTTPException(400, "the agentic MCP's address starts with http:// or https://")
+        token = body.get("token")
+        if body.get("clear_token"):
+            token = ""
+        if token is not None and (len(str(token)) > 4096 or any(ch.isspace() for ch in str(token))):
+            raise HTTPException(400, "a token is one word, without spaces")
+        saved = save_connection(A().settings.home_path, url=url, token=None if token is None else str(token))
+        if A().ops:
+            A().ops.audit("agentic MCP connection changed", c["who"].user, c["who"].level, "", "agentic-mcp",
+                          {"url": saved["url"], "token": "set" if saved["token_set"] else "none"})
+        topology.read(refresh=True)
+        return {**mcp_check_token(), "saved": True, "reload_needed": True}
+
+    @app.get("/network/contract")
+    def get_contract(c=Depends(caller)):
+        return mcp_send("GET", "/contract", timeout=20)
+
+    @app.post("/network/contract/check")
+    def check_contract(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        admin(c)
+        return mcp_send("POST", "/contract/check", json_body={"contract": body.get("contract", body)}, timeout=60)
+
+    @app.put("/network/contract")
+    def put_contract(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        if not c["who"].can("root"):
+            raise HTTPException(403, "changing the common contract needs root")
+        got = mcp_send("PUT", "/contract", json_body={"contract": body.get("contract", body)}, timeout=60)
+        changed(c["who"], "contract changed", {"version": got.get("version"), "added": got.get("added"),
+                                                "removed": got.get("removed")})
+        return got
+
     @app.get("/network/kinds")
     def kinds(c=Depends(caller)):
         try:
@@ -591,6 +690,37 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         got = mcp_send("POST", "/controllers", json_body={k2: v for k2, v in sent.items() if v})
         changed(who, "controller onboarded", sent)
         return {"onboarded": got, "reload_needed": True}
+
+    @app.post("/network/controllers/batch")
+    def onboard_many(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """Several controllers from one file (JSON or YAML): a list of {key, url, label, kind, spec, user_env,
+        password_env}, or {"controllers": [...]}. Each is onboarded on its own; one failing does not stop the rest."""
+        import base64
+        import yaml
+        admin(c)
+        items = body.get("controllers")
+        if items is None and body.get("content_base64"):
+            try:
+                parsed = yaml.safe_load(base64.b64decode(str(body["content_base64"])).decode("utf-8", "replace"))
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(400, f"the file is not JSON or YAML: {e}")
+            items = parsed.get("controllers") if isinstance(parsed, dict) else parsed
+        if not isinstance(items, list) or not items:
+            raise HTTPException(400, 'a list of controllers: [{"key", "url", ...}] or {"controllers": [...]}')
+        if len(items) > 50:
+            raise HTTPException(400, "at most 50 controllers in one file")
+        out = []
+        for it in items:
+            key = str((it or {}).get("key") or "?") if isinstance(it, dict) else "?"
+            try:
+                if not isinstance(it, dict):
+                    raise HTTPException(400, "each controller is an object")
+                got = onboard(it, c)
+                conf = ((got.get("onboarded") or {}).get("conformance") or {})
+                out.append({"key": key, "ok": True, "verdict": conf.get("verdict"), "gaps": len(conf.get("gaps") or [])})
+            except HTTPException as e:
+                out.append({"key": key, "ok": False, "error": str(e.detail)[:300]})
+        return {"results": out, "onboarded": sum(r["ok"] for r in out), "reload_needed": any(r["ok"] for r in out)}
 
     @app.delete("/network/controllers/{key}")
     def remove_controller(key: str, c=Depends(caller)):
@@ -688,17 +818,96 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         return {"ok": True, "name": d.name, "version": d.version, "contract": d.contract,
                 "domains": [x.domain for x in d.domains], "capabilities": d.capabilities}
 
-    @app.post("/admin/reload")
-    def reload(c=Depends(caller)):
-        """A new agent from the settings: the controllers the agentic MCP holds now, each with its subagent.
-        Refused while a request runs, so nothing is cut off."""
-        who = admin(c)
+    # ----- the model: which one the agent runs on, from the page (root) -----
+
+    def ollama_host() -> str:
+        h = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        return h if h.startswith("http") else "http://" + h
+
+    @app.get("/admin/model")
+    def model_info(c=Depends(caller)):
+        from . import models as M
+        import requests as rq
+        home = A().settings.home_path
+        keys = M.keys_set(home)
+        out = {"current": M.describe(), "choice": M._page.get("choice"), "env_override": os.getenv("CANAH_MODEL") or None,
+               "context": A().info.get("context"),
+               "providers": [{"id": k, "title": v["title"], "installed": M.installed(k), "pip": v["pip"],
+                              "key_env": v["key_env"], "key_set": bool(keys.get(k) or (v["key_env"] and os.getenv(v["key_env"]))),
+                              "key_on_page": bool(keys.get(k)), "examples": v.get("examples", []), "base_url": bool(v.get("base_url"))}
+                             for k, v in M.PROVIDERS.items()],
+               "ollama": {"url": ollama_host(), "models": [], "loaded": []}}
+        try:
+            tags = rq.get(ollama_host() + "/api/tags", timeout=4).json().get("models") or []
+            ps = {m.get("name"): m for m in (rq.get(ollama_host() + "/api/ps", timeout=4).json().get("models") or [])}
+            out["ollama"]["models"] = [{"name": m.get("name"), "size_gb": round((m.get("size") or 0) / 1e9, 1),
+                                        "family": (m.get("details") or {}).get("family"),
+                                        "params": (m.get("details") or {}).get("parameter_size"),
+                                        "quant": (m.get("details") or {}).get("quantization_level"),
+                                        "loaded": m.get("name") in ps, "embedding": "embed" in str(m.get("name"))}
+                                       for m in tags]
+        except Exception as e:  # noqa: BLE001
+            out["ollama"]["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    @app.put("/admin/model")
+    def set_model(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """Use another model (root): it is tried with one short question first, and the agent is rebuilt on it
+        only if it answers. An API key given here is kept readable by CANAH's user only and never sent back."""
+        from . import models as M
+        if not c["who"].can("root"):
+            raise HTTPException(403, "changing the model needs root")
+        home = A().settings.home_path
+        prov = str(body.get("provider") or "")
+        if body.get("reset"):
+            M.save_page_choice(home, clear=True)
+            return {**do_reload(c["who"]), "current": M.describe(), "reset": True}
+        if prov not in M.PROVIDERS:
+            raise HTTPException(400, f"provider: one of {', '.join(M.PROVIDERS)}")
+        key = body.get("api_key")
+        if key is not None and (len(str(key)) > 4096 or any(ch.isspace() for ch in str(key))):
+            raise HTTPException(400, "an API key is one word, without spaces")
+        choice = {"provider": prov, "model": str(body.get("model") or "").strip(), "base_url": str(body.get("base_url") or "").strip(),
+                  "num_ctx": int(body.get("num_ctx") or 0) or None}
+        env = M.PROVIDERS[prov]["key_env"]
+        before_key = os.environ.get(env) if env else None
+        if key and env:
+            os.environ[env] = str(key)          # tried with it first; kept only if the model answers
+        try:
+            m = M.build_choice(choice)
+            import time as _t
+            t0 = _t.time()
+            reply = m.invoke("Reply with the single word OK.")
+            took = round(_t.time() - t0, 2)
+        except Exception as e:  # noqa: BLE001 - nothing is changed
+            if env:
+                if before_key is None:
+                    os.environ.pop(env, None)
+                else:
+                    os.environ[env] = before_key
+            raise HTTPException(400, f"{prov}:{choice['model']} did not answer, so nothing was changed: {type(e).__name__}: {str(e)[:300]}")
+        M.save_page_choice(home, choice=choice, key=str(key) if key else None, provider=prov if key else None)
+        got = do_reload(c["who"])
+        if A().ops:
+            A().ops.audit("model changed", c["who"].user, c["who"].level, "", "model",
+                          {"provider": prov, "model": choice["model"], "key": "set" if key else "unchanged"})
+        return {**got, "current": M.describe(), "test": {"seconds": took, "reply": str(getattr(reply, "content", ""))[:80]}}
+
+    @app.delete("/admin/keys/{provider}")
+    def drop_key(provider: str, c=Depends(caller)):
+        from . import models as M
+        if not c["who"].can("root"):
+            raise HTTPException(403, "removing a key needs root")
+        M.save_page_choice(A().settings.home_path, key="", provider=provider)
+        return {"removed": provider}
+
+    def do_reload(who: Identity) -> Dict[str, Any]:
         if rebuild is None:
             raise HTTPException(409, "this service cannot rebuild its agent (it was started without a builder)")
         with busy_guard:
             held = [k for k, lk in busy.items() if lk.locked()]
         if held:
-            raise HTTPException(409, f"{len(held)} request(s) are running; reload when they are done")
+            raise HTTPException(409, f"{len(held)} request(s) are running; try again when they are done")
         old = ref["agent"]
         new = rebuild()
         ref["agent"] = new
@@ -709,6 +918,12 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         if new.ops:
             new.ops.audit("agent reloaded", who.user, who.level, "", "reload", {"subagents": new.info.get("subagents")})
         return {"reloaded": True, "subagents": new.info.get("subagents"), "tools": new.info.get("tools")}
+
+    @app.post("/admin/reload")
+    def reload(c=Depends(caller)):
+        """A new agent from the settings: the controllers the agentic MCP holds now, the model chosen.
+        Refused while a request runs, so nothing is cut off."""
+        return do_reload(admin(c))
 
     if STATIC.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")

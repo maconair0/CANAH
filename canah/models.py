@@ -138,7 +138,7 @@ def make(spec):
         raise ValueError(f"model {spec!r}: write it as provider:model, e.g. anthropic:claude-sonnet-5-5")
     provider = spec.split(":", 1)[0]
     if provider == "ollama":
-        return init_chat_model(spec, temperature=0, num_ctx=32768, num_predict=4096, keep_alive="30m",
+        return init_chat_model(spec, temperature=0, num_ctx=32768, num_predict=4096, keep_alive="24h",
                                reasoning=False, client_kwargs={"timeout": 300})
     if provider == "openai":
         return init_chat_model(spec, temperature=0, max_tokens=4096, timeout=120, max_retries=2,
@@ -153,13 +153,125 @@ _ENV = {"model": "CANAH_MODEL", "strong_model": "CANAH_STRONG_MODEL", "fast_mode
 _built = {}
 
 
+# ----- the model chosen on the web page (Model page; root) -----
+# CANAH_HOME/model.json   {"provider", "model", "base_url", "num_ctx"}: the page's choice for every role
+# CANAH_HOME/keys.json    provider -> API key, readable by CANAH's user only; put in the environment at start
+PROVIDERS = {
+    "ollama":         {"title": "Ollama (local)", "package": "langchain_ollama", "key_env": "", "pip": "langchain-ollama"},
+    "anthropic":      {"title": "Anthropic (Claude)", "package": "langchain_anthropic", "key_env": "ANTHROPIC_API_KEY", "pip": "langchain-anthropic",
+                       "examples": ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"]},
+    "openai":         {"title": "OpenAI", "package": "langchain_openai", "key_env": "OPENAI_API_KEY", "pip": "langchain-openai",
+                       "examples": ["gpt-5.5", "gpt-5.5-mini"]},
+    "openai_compatible": {"title": "OpenAI-compatible server (vLLM, LM Studio, ...)", "package": "langchain_openai",
+                       "key_env": "OPENAI_COMPATIBLE_API_KEY", "pip": "langchain-openai", "base_url": True},
+    "google_genai":   {"title": "Google Gemini", "package": "langchain_google_genai", "key_env": "GOOGLE_API_KEY", "pip": "langchain-google-genai",
+                       "examples": ["gemini-2.5-pro", "gemini-2.5-flash"]},
+    "groq":           {"title": "Groq", "package": "langchain_groq", "key_env": "GROQ_API_KEY", "pip": "langchain-groq"},
+}
+_page = {"choice": None, "home": None}
+
+
+def installed(provider):
+    import importlib.util
+    spec = PROVIDERS.get(provider) or {}
+    return bool(spec) and importlib.util.find_spec(spec["package"]) is not None
+
+
+def _read(path):
+    import json
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write(path, data):
+    import json
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_page_choice(home):
+    """Read the page's choice and keys (at every agent build): keys go into the environment, the choice is
+    used by get() unless CANAH_MODEL is set."""
+    home = Path(home)
+    for prov, key in _read(home / "keys.json").items():
+        env = (PROVIDERS.get(prov) or {}).get("key_env")
+        if env and key:
+            os.environ[env] = key
+    choice = _read(home / "model.json") or None
+    if choice != _page["choice"]:
+        _built.clear()
+    _page.update(choice=choice, home=home)
+    return choice
+
+
+def build_choice(choice):
+    """A chat model from the page's choice."""
+    prov, name = choice.get("provider"), str(choice.get("model") or "").strip()
+    if prov not in PROVIDERS:
+        raise ValueError(f"unknown provider {prov!r}: one of {', '.join(PROVIDERS)}")
+    if not name:
+        raise ValueError("say which model")
+    if not installed(prov):
+        raise ValueError(f"{PROVIDERS[prov]['title']} is not installed here: .venv/bin/pip install {PROVIDERS[prov]['pip']}")
+    if prov == "ollama":
+        from langchain_ollama import ChatOllama
+        kw = {"base_url": choice["base_url"]} if choice.get("base_url") else {}
+        return ChatOllama(model=name, temperature=0, num_ctx=int(choice.get("num_ctx") or 32768), num_predict=4096,
+                          keep_alive="24h", reasoning=False, client_kwargs={"timeout": 300}, **kw)
+    if prov == "openai_compatible":
+        if not choice.get("base_url"):
+            raise ValueError("an OpenAI-compatible server needs its base URL (http://host:port/v1)")
+        return init_chat_model(f"openai:{name}", base_url=choice["base_url"], temperature=0, max_tokens=4096, timeout=120,
+                               max_retries=2, use_responses_api=False,
+                               api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY") or "not-needed")
+    return make(f"{prov}:{name}")
+
+
+def save_page_choice(home, choice=None, key=None, provider=None, clear=False):
+    """Keep the page's choice (None with clear=True: back to this file's model) and/or a provider's key."""
+    home = Path(home)
+    if key is not None and provider:
+        keys = _read(home / "keys.json")
+        if key:
+            keys[provider] = key
+        else:
+            keys.pop(provider, None)
+            env = (PROVIDERS.get(provider) or {}).get("key_env")
+            if env:
+                os.environ.pop(env, None)
+        _write(home / "keys.json", keys)
+    if clear:
+        try:
+            (home / "model.json").unlink()
+        except FileNotFoundError:
+            pass
+    elif choice is not None:
+        _write(home / "model.json", {k: v for k, v in choice.items() if k in ("provider", "model", "base_url", "num_ctx") and v})
+    return load_page_choice(home)
+
+
+def keys_set(home):
+    return {p: bool(k) for p, k in _read(Path(home) / "keys.json").items()}
+
+
 def get(role="model"):
-    """The model for a role: the environment override if set, else this file's line."""
+    """The model for a role: the environment override if set, else the page's choice, else this file's line."""
     if role not in _ROLES:
         raise ValueError(f"a model role is one of {_ROLES}, not {role!r}")
     if role not in _built:
         spec = os.getenv(_ENV[role]) or (os.getenv("CANAH_MODEL") if role != "model" else "")
-        _built[role] = make(spec) if spec else globals()[role]
+        if spec:
+            _built[role] = make(spec)
+        elif _page["choice"]:
+            _built[role] = _built.get("model") if role != "model" and "model" in _built else build_choice(_page["choice"])
+        else:
+            _built[role] = globals()[role]
     return _built[role]
 
 

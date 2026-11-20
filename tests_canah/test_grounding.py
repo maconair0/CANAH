@@ -205,3 +205,41 @@ class Derived(unittest.TestCase):
         self.assertTrue(_derived("0.25", said))          # 25 % as a fraction
         self.assertFalse(_derived("4.84", said))         # not a rounding of anything returned
         self.assertFalse(_derived("96.1", said))
+
+
+class StaysOnTheQuestion(unittest.TestCase):
+    """What the long conversation of 2026-11-20 showed: an answer sent back by a check came back as a different
+    answer, to an earlier question; and one tool was called 29 times with the same arguments."""
+
+    def test_let_me_know_is_a_courtesy_not_an_announced_step(self):
+        from canah.grounding import _ANNOUNCE
+        self.assertIsNone(_ANNOUNCE.search("Here is the diagram. Let me know if you want it as a PNG."))
+        self.assertIsNotNone(_ANNOUNCE.search("Let me check the links first."))
+
+    def test_a_sent_back_answer_is_told_the_question_of_this_turn_and_may_stand(self):
+        ans = "Mermaid renders it. " * 3 + "I'll check the ports next."
+        a, model = agent(say("Earlier answer about TransportPCE."), say(ans), say("KEEP"))
+        a.ask("is TransportPCE ready?", thread_id="q")
+        r = a.ask("can we use mermaid locally?", thread_id="q")
+        nudge = str(model.seen[2][-1].content)
+        self.assertIn("[follow-through check]", nudge)
+        self.assertIn("can we use mermaid locally?", nudge)          # anchored to this turn's question
+        self.assertNotIn("TransportPCE", nudge)
+        self.assertEqual(r.text, ans)                                 # KEEP: the answer stands, not rewritten
+        msgs = a.graph.get_state(a.config("q")).values["messages"]
+        self.assertFalse(any("check]" in str(m.content) for m in msgs))
+
+    def test_the_same_call_a_third_time_is_not_run(self):
+        calls = []
+        p = FunctionProvider()
+
+        def inspect_it(network: str) -> str:
+            """Inspect a network."""
+            calls.append(network)
+            return "empty"
+        p.add(inspect_it)
+        model = ScriptedModel(script=[call("inspect_it", network="x") for _ in range(4)] + [say("It is empty.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        self.assertEqual(a.ask("what is in x?").text, "It is empty.")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Not run again", model.tool_results(-1)[-1])

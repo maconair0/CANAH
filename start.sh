@@ -116,6 +116,21 @@ if [ -z "${CANAH_NO_GPU:-}" ] && [ -n "$GPU" ] && [[ "$TORCH" == *+cu* ]]; then
 fi
 ok "python environment (deepagents $(pkg deepagents))"
 
+# ----- diagrams: mermaid.js for the page and draw_diagram, Chromium to render with -----
+MERMAID_VERSION=11.4.1
+MERMAID_JS="$HERE/canah/static/vendor/mermaid.min.js"
+if [ ! -s "$MERMAID_JS" ]; then
+  mkdir -p "$(dirname "$MERMAID_JS")"
+  echo "  fetching mermaid.js $MERMAID_VERSION (diagrams)"
+  curl -fsSL -m 120 -o "$MERMAID_JS.tmp" "https://cdn.jsdelivr.net/npm/mermaid@$MERMAID_VERSION/dist/mermaid.min.js" \
+    && mv "$MERMAID_JS.tmp" "$MERMAID_JS" || { rm -f "$MERMAID_JS.tmp"; echo "  could not fetch mermaid.js: diagrams are shown as code"; }
+fi
+if [ -n "$(pkg playwright)" ] && ! ls ~/.cache/ms-playwright/chromium*-*/ >/dev/null 2>&1; then
+  echo "  installing Playwright's Chromium (draw_diagram renders with it)"
+  "$PY" -m playwright install chromium >/dev/null 2>&1 || echo "  could not install Chromium: draw_diagram will say so"
+fi
+[ -s "$MERMAID_JS" ] && ok "diagrams (mermaid.js $MERMAID_VERSION$( ls ~/.cache/ms-playwright/chromium*-*/ >/dev/null 2>&1 && echo ", Chromium"))"
+
 # ----- the model -----
 MODEL_DESC="$("$PY" -c 'from canah import models; print(models.describe()["model"])' 2>/dev/null || echo "?")"
 case "$MODEL_DESC" in

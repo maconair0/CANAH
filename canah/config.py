@@ -52,6 +52,8 @@ class Settings:
     interrupt_on: Dict[str, Any] = field(default_factory=dict)
     # Send back, once, a substantial answer given without any lookup in its turn (grounding.LookFirst).
     look_first: bool = True
+    # draw_diagram: Mermaid pictures, rendered and kept under CANAH_HOME/diagrams (canah/diagrams.py).
+    diagrams: bool = True
     # A tool result longer than this is saved whole and the model gets a preview and the path.
     large_result_chars: int = 12000
     # Tools only root may approve (names or glob patterns); every other write needs admin.
@@ -85,6 +87,14 @@ class Settings:
     max_tokens_per_request: int = 0
     # The longest one request may run, in seconds, across the main agent and every subagent (0: no limit).
     max_seconds: int = 600
+    # The model's input window in tokens (0: from the model: its profile, or Ollama's num_ctx less num_predict).
+    context_window: int = 0
+    # Compact the conversation at this share of the window: the older part summarised (and saved under
+    # /conversation_history/), the last compact_keep of the window kept as it is.
+    compact_at: float = 0.85
+    compact_keep: float = 0.10
+    # Give the agent compact_conversation, to compact earlier on request (from half of compact_at).
+    compact_tool: bool = True
     debug: bool = False
 
     @property
@@ -104,7 +114,11 @@ DEFAULT_PROMPT = """You are the central agent of a networked system. You answer 
 their requests through the tools you are given, and you delegate focused work to your subagents.
 
 How you work:
+- Answer the question the operator asked this turn, in the conversation as it stands: an earlier question is
+  context, not something to answer again, and a correction from the operator replaces what you said before.
 - Read the live state with tools before you answer a question about it; never invent device names, values or results.
+  A request for code, an explanation, a design or a diagram is answered directly: look things up only when the
+  answer needs a live fact, and never run code in the sandbox unless the operator asks you to run it.
 - A tool that changes the system is paused by the system itself until an operator approves it. So when a change
   is asked for, call that tool directly with the right arguments: do not ask "shall I?" in text, the pause is the
   question. Never try to reach the same effect another way after a rejection.
@@ -121,7 +135,8 @@ ENV = {
     "CANAH_HOME": "home", "CANAH_MCP_CONFIG": "mcp_config", "CANAH_SUBAGENTS": "subagents_file",
     "CANAH_SYSTEM_PROMPT_FILE": "system_prompt_file", "CANAH_SANDBOX": "sandbox",
     "CANAH_RECURSION_LIMIT": "recursion_limit", "CANAH_MAX_SECONDS": "max_seconds", "CANAH_NOTIFY_URL": "notify_url",
-    "CANAH_APPROVAL_TTL_S": "approval_ttl_s", "CANAH_MAX_TOKENS_PER_REQUEST": "max_tokens_per_request", "CANAH_DEBUG": "debug", "CANAH_PROVIDERS": "providers", "CANAH_TWIN": "twin_active",
+    "CANAH_APPROVAL_TTL_S": "approval_ttl_s", "CANAH_MAX_TOKENS_PER_REQUEST": "max_tokens_per_request", "CANAH_DEBUG": "debug", "CANAH_CONTEXT_WINDOW": "context_window", "CANAH_COMPACT_AT": "compact_at",
+    "CANAH_COMPACT_KEEP": "compact_keep", "CANAH_PROVIDERS": "providers", "CANAH_TWIN": "twin_active",
 }
 
 

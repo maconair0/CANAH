@@ -46,17 +46,16 @@ class Emulator(unittest.TestCase):
     def test_the_agent_changes_a_domain_only_after_approval(self):
         home = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, home, True)
-        model = ScriptedModel(script=[call("task", description="create LP-3", subagent_type="optical"),
-                                      call("optical__create_lightpath", name="LP-3", a="xpdr-c2", z="xpdr-b2",
-                                           rate_gbps=100),
-                                      say("LP-3 created"), say("Done: LP-3 is in service.")])
+        model = ScriptedModel(script=[call("controller_write", controller="optical", tool="create_lightpath",
+                                           arguments={"name": "LP-3", "a": "xpdr-c2", "z": "xpdr-b2", "rate_gbps": 100}),
+                                      say("Done: LP-3 is in service.")])
         agent = build_agent(load_settings(path="/x", home=home, sandbox="none"),
                             [AgenticMCPProvider(service=AgenticMCP(self.emu.url))], model=model,
                             memory=open_memory(in_memory=True))
         self.addCleanup(agent.close)
         admin = Identity("op", "admin")
         r = agent.ask("create LP-3", thread_id="x", who=admin)
-        self.assertEqual(r.pending[0]["name"], "optical__create_lightpath")
+        self.assertEqual(r.pending[0]["name"], "controller_write")
         self.assertNotIn("LP-3", self.emu.domains["optical"].state["lightpaths"])
         agent.decide("x", [approval.decision("approve")], who=admin)
         self.assertIn("LP-3", self.emu.domains["optical"].state["lightpaths"])

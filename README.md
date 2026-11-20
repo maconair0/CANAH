@@ -21,20 +21,44 @@ cp .env.example .env     # AGENTIC_MCP_URL / AGENTIC_MCP_TOKEN, CANAH_ADMIN_PASS
 Open the printed address in a browser for the console (light and dark, in the style of edgeLM's central
 console):
 - **Sign-in page.** Sign in as admin or root, or continue as an observer (read only).
-- **Topology.** CANAH with every controller the agentic MCP holds. Click a controller to open its devices and
-  links, read through the common contract's verbs; click CANAH to open its subagents, which light up while they
-  work (`/activity`), each joined to the controller it drives. Arcs show relations across domains; a controller
-  that cannot be read is drawn red, with why. Zoom, pan, drag, fit, open or fold all; it refreshes live.
-- **SDN controllers.** Each controller's domain, contract verdict and gaps, and which of its own tools serve each
-  contract verb. **Onboard** a new one through the agentic MCP (admin): its URL and kind, an API document, and the
-  *names* of the variables holding its credentials on the agentic MCP's host (never the secrets). A kind it does
-  not know can be added from a manifest or drafted from a user guide. **Reload CANAH** gives every controller held
-  now its subagent; **Remove** (root) unseats one.
+- **Topology.** CANAH, its digital twin (NetTwin), the agentic MCP it reaches the networks through, and every SDN
+  controller the agentic MCP holds. The controllers are the agentic MCP's, not CANAH's. Click a controller to open its devices and links,
+  read through the common contract's verbs. Click CANAH to open its agents (the librarian and a general-purpose
+  agent), which light up while they work (`/activity`). The line from the agentic MCP to a controller lights up
+  while CANAH works that controller.
+
+  Arcs show relations across domains, and a controller that cannot be read is drawn red, with why. Zoom, pan,
+  drag, fit, open or fold all; it refreshes live.
+- **SDN controllers.** This page manages the agentic MCP and the controllers it holds.
+  - **Connection:** the agentic MCP's address and token. The token is set here (root), kept readable only by
+    CANAH's user and never shown again. CANAH reconnects at once.
+  - **Common contract:** read the contract every controller is checked against. Edit it, preview every
+    controller's verdict under the edit, and apply it (root). The agentic MCP keeps the previous version as a
+    backup.
+  - **Controllers:** each one's domain, contract verdict and gaps, and which of its own tools serve each contract
+    verb.
+  - **Adding controllers (admin):** onboard one by its URL. Or upload a list of controllers (JSON or YAML), a
+    manifest for a new kind, or an API document or user guide to draft one from. Credentials are always the
+    *names* of variables on the agentic MCP's host, never the secrets.
+  - **Reload CANAH** gives every controller held now its agent. **Remove** (root) unseats one.
 - **Chat**, in the style of LangGraph's agent chat UI, with the agent's call flow on the right (as edgeLM's console has it: who took each step, the tool, its arguments, what came back, how long it took; click any answer for its flow): thread history on the left; every tool call (subagents'
   included) as a card of its arguments with its result beneath; a change as an interrupt to **accept, edit** (the
   arguments as JSON) **or reject**, offered at the level it needs; a switch to hide tool calls. **Attach files**
   (button, drag and drop, or paste; up to 25 MB): kept per user, read by the agent as `/uploads/<thread>/<file>`,
   with PDFs read to text, and copied into the sandbox when there is one.
+  - **One view:** drag the borders of the thread list and of the call flow to resize them (double-click resets);
+    nothing scrolls sideways.
+  - **While it works:** a live status says what CANAH is doing ("Searching the documents", "Read devices on onos,
+    through the agentic MCP"), each tool card counts its time, and the answer ends with its total time, time to
+    first words and tool calls. You can scroll up while it writes; **Jump to latest** brings you back.
+  - **Code and pictures:** every code block has **Copy**. A ```` ```mermaid ```` block is drawn as a diagram, with
+    SVG and PNG downloads. CANAH draws pictures itself with `draw_diagram`; they appear in the answer, and
+    **Images** in the header opens every picture of the conversation. **Suggest a change** on any picture asks
+    CANAH to redraw it: it reads the diagram back (`get_diagram`), edits it and draws it again.
+- **Model & providers** (root to change). Pick any chat model Ollama has on this machine, and its context window,
+  or a hosted provider (Anthropic, OpenAI, an OpenAI-compatible server, Gemini, Groq) with its API key. A new
+  model is tried with one short question first, and CANAH switches only if it answers. Keys are kept readable by
+  CANAH's user only and never shown again. `CANAH_MODEL` in the environment still wins.
 - **Approvals & audit.** What waits in your conversations; the audit log and 24-hour metrics (admin).
 - **Documents & memory.** The **second brain**: the documents the agent cites as a graph (a node per document,
   edges by meaning, named clusters), as in edgeLM; the corpus with upload (admin); long-term memories (admin).
@@ -82,7 +106,7 @@ There are three roles: `model` (the main agent), `strong_model` (for a subagent 
 | `canah/config.py` | settings: `canah.yaml`, then the environment (see Settings below) |
 | `canah/agent.py` | `build_agent()`: the pieces into `create_deep_agent`; `CanahAgent.ask / stream / pending / decide`. Takes `middleware` and `interrupt_on` directly too |
 | `canah/tools.py` | the `ToolProvider` contract: `tools()`, `writes()`, and optionally `subagents()`, `main_tools()`, `shared_tools()`, `middleware()`, `instructions()` |
-| `canah/network.py` | networks through an agentic MCP service: `network_controllers` and `network_health` on the main agent; one subagent per controller, holding that controller's tools; `follow_relations`, which follows dependency chains across domains in code, for any controller that publishes `list_relations` |
+| `canah/network.py` | networks through an agentic MCP service: `network_controllers` and `network_health` on the main agent; one `net_<verb>` tool per verb of the common contract that any controller serves (the controller is an argument; a read without one asks every controller), `network_tools` to find a controller's own tools beyond the contract and `controller_read` / `controller_write` to call them. No agent per controller: the contract makes every controller's verbs the same; `follow_relations`, which follows dependency chains across domains in code, for any controller that publishes `list_relations` |
 | `canah/knowledge/` | documents: a quick cited search (any subagent may use it), a `librarian` subagent, passages marked with the question's names they don't mention, a citation check; production retrieval in `rag/` (see [Retrieval](#retrieval)) |
 | `canah/identity.py` | observer / admin / root: accounts (environment, or `users.json` with PBKDF2 hashes), sign-in with lockout; the model is offered only the tools the caller may use |
 | `canah/approval.py` | every write pauses for a decision: approve, edit or reject |
@@ -155,6 +179,41 @@ What makes it fast:
 - **No answer written twice.** When the look-first check asks whether an answer needed a lookup, the model can reply with the single word `KEEP` rather than writing the whole answer out again. That made "what can you do?" 2.5 s instead of 6.1 s.
 - **Little repeated work.** The model stays loaded for 24 hours (`keep_alive` in `canah/models.py`), and Ollama still unloads it when another model needs the memory. Question embeddings are cached. The corrective pass embeds and searches its rewrites in one batch.
 
+## Context window and KV cache
+
+Every reply reports two figures, shown under the chat box and totalled on the Operations page:
+
+- **Context:** how much of the model's input window the conversation now fills. It shows as a bar with a mark at the compaction point.
+- **KV cache:** how much of this turn's prompts the model reused rather than read again.
+
+**Context window.** The window comes from the model's LangChain profile (`max_input_tokens`).
+- **Ollama:** `ChatOllama` has no profile, so CANAH sets one from the model itself: `num_ctx` less `num_predict`, which is 28,672 tokens for the default model. Without that, deepagents would compact only at 170,000 tokens, which a 32k Ollama window never reaches. Ollama would then silently drop the start of the prompt, system prompt first.
+- **Automatic compaction:** deepagents' summarization compacts at `compact_at` of the window (default 0.85). The older part of the conversation is summarised, and the most recent `compact_keep` (default 0.10) is kept word for word. What was summarised is saved under `/conversation_history/`, where the agent can read it back. The trigger is the token count the model itself reports, so it is exact.
+- **Compacting on request:** the agent has `compact_conversation` (deepagents' `SummarizationToolMiddleware`). Asking it to compact, or typing `/compact`, compacts sooner, once the conversation is at half the compaction point.
+- **Settings:** `context_window` overrides the window; `compact_at`, `compact_keep` and `compact_tool` set the rest (`CANAH_CONTEXT_WINDOW`, `CANAH_COMPACT_AT`, `CANAH_COMPACT_KEEP`).
+- **Measured:** with a 9,000-token window, the third long message pushed the conversation past 85%. The next turn compacted it from 104.6% down to 86.9%.
+
+**KV cache.** A model keeps the keys and values it computed for a prompt. A next prompt that begins the same way reuses them and reads only what is new. CANAH keeps its prompts append-only so that each turn begins exactly as the last one did:
+- the system prompt and tool list stay fixed for the whole session;
+- every check adds its message at the end, never in the middle;
+- the warm-up at start puts the system prompt in the cache before the first question.
+
+How the cache is measured depends on the model:
+- **Hosted models:** LangChain reports the cache exactly (`usage_metadata.input_token_details.cache_read` and `cache_creation`). deepagents adds the prompt-caching middleware for Anthropic, Bedrock and Fireworks itself.
+- **Ollama:** it reuses the longest common prefix with the last prompt in a slot, but reports only the prompt's length and how long reading it took. CANAH estimates the cached share from that time against the cold reading speed measured in the same process, and marks it as an estimate (≈).
+- **Measured:** about 96% of prompt tokens come from cache on every turn after the first. A cached 7,200-token prompt is read in 0.04–0.13 s, against 2.4 s cold.
+
+**One Ollama slot.** Ollama keeps one cache per parallel slot, and the default is one. Any other request to the same model (a subagent with its own system prompt, another application) replaces CANAH's cached prompt, and the next turn reads it all again. More slots fit in the same GPU memory when the KV cache is stored in 8-bit:
+
+```bash
+sudo systemctl edit ollama      # then add:
+# [Service]
+# Environment="OLLAMA_FLASH_ATTENTION=1" "OLLAMA_KV_CACHE_TYPE=q8_0" "OLLAMA_NUM_PARALLEL=2"
+sudo systemctl restart ollama
+```
+
+For qwen3 30B-A3B at 32k tokens, one slot at 16-bit takes about 3.2 GB, and two slots at 8-bit take the same. Ollama sends each request to the slot whose cache matches it best.
+
 ## Who may do what
 
 | Signed in as | Sees write tools | May approve |
@@ -197,6 +256,22 @@ A digital twin predicts what a change or a failure will do to a network before t
 - **One set of tools for the agent,** whichever twin is in use: `twin_list`, `twin_schema`, `twin_validate`, `twin_predict`, `twin_check_write`, `twin_override`, `twin_extra`.
 - **A gate on controller writes:** when the twin in use can check writes, a write goes ahead only if the twin supports it or an operator overrides its check, with their reason; the override is itself approved and audited.
 - **Chosen on the web page:** **Digital twins** lists the twins, tests them, adds a custom one (an HTTP URL, or a Python `module:factory`) and switches the one in use, with no restart.
+
+**NetTwin is CANAH's digital-twin environment by default.** [NetTwin](https://github.com/maconair0/NetTwin) (the
+`netwins` package) has four twins behind this contract:
+- **IP / packet:** ns-3;
+- **Optical (WDM):** GNPy, calibrated against the lab's physical layer;
+- **Wi-Fi:** ns-3;
+- **Non-terrestrial (satellite and HAPS):** orbits, rain fade and adaptive coding.
+
+CANAH turns to it when a question or a change calls for it:
+- a what-if ("if this link fails…", "if it rains on the terminal…") is rehearsed there and answered with its
+  decision, probability and trust tier;
+- before a write reaches a controller, the gate checks it in NetTwin first;
+- NetTwin mirrors the live packet networks through the agentic MCP, so its picture of them is current.
+
+The topology draws NetTwin beside CANAH (the dashed teal line), lit while CANAH is asking it. The chat says when a
+change is being rehearsed in NetTwin. Any other twin that speaks the contract can replace it.
 
 ```yaml
 # canah.yaml

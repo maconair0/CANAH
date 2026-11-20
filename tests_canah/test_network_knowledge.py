@@ -27,21 +27,29 @@ class FakeAgenticMCP:
 
     def tools(self, key):
         if key == "alpha":
-            return [{"name": "get_nodes", "description": "List the nodes.", "write": False,
+            return [{"name": "get_nodes", "description": "List the nodes.", "write": False, "verb": "read_devices",
                      "schema": {"type": "object", "properties": {}}},
-                    {"name": "create_service", "description": "Create a service.", "write": True,
+                    {"name": "create_service", "description": "Create a service.", "write": True, "verb": "provision",
                      "schema": {"type": "object", "properties": {"a": {"type": "string"}, "z": {"type": "string"}},
                                 "required": ["a", "z"]}}]
-        return [{"name": "list_items", "description": "List items.", "write": False,
-                 "schema": {"type": "object", "properties": {}}}]
+        return [{"name": "list_items", "description": "List items.", "write": False, "verb": "read_devices",
+                 "schema": {"type": "object", "properties": {}}},
+                {"name": "set_meter", "description": "Set a meter on a port.", "write": True, "verb": "",
+                 "schema": {"type": "object", "properties": {"port": {"type": "string"}}, "required": ["port"]}}]
 
     def call(self, key, tool, arguments, approved_by=""):
         self.calls.append((key, tool, dict(arguments), approved_by))
         if tool == "get_nodes":
             return {"text": '["node-1", "node-2"]', "is_error": False}
+        if tool == "list_items":
+            return {"text": '["item-1"]', "is_error": False}
         return {"text": f"{tool} done", "is_error": False}
 
     def get(self, path, timeout=None):
+        if path == "/contract":
+            return {"contract": {"version": 1, "domains": [
+                {"name": "inventory", "verbs": {"read_devices": {"methods": ["GET"], "help": "what is in the network"}}},
+                {"name": "provisioning", "verbs": {"provision": {"methods": ["POST"], "writes": True}}}]}}
         return {"path": path}
 
 
@@ -71,33 +79,61 @@ class Base(unittest.TestCase):
 
 
 class Network(Base):
-    def test_a_subagent_per_controller_and_their_tools_stay_off_the_main_agent(self):
+    def test_the_main_agent_works_every_controller_through_the_contract_verbs(self):
         a = self.agent(say("ok"))
-        self.assertIn("alpha", a.info["subagents"])
-        self.assertIn("beta", a.info["subagents"])
+        self.assertNotIn("alpha", a.info["subagents"])            # the controllers are the agentic MCP's
+        self.assertFalse([n for n in a.info["subagents"] if n.endswith("-agent")])   # and there is no agent per controller
         a.ask("hi", who=ADMIN)
         main = self.model.offered[-1]
-        self.assertIn("network_controllers", main)
+        for t in ("network_controllers", "net_read_devices", "net_provision", "network_tools", "controller_read", "controller_write"):
+            self.assertIn(t, main)
         self.assertNotIn("alpha__get_nodes", main)
-        self.assertEqual(a.writes, ["alpha__create_service"])
+        self.assertEqual(sorted(a.writes), ["controller_write", "net_provision"])
 
-    def test_a_read_goes_through_the_controllers_subagent(self):
-        a = self.agent(call("task", description="list the nodes", subagent_type="alpha"),
-                       call("alpha__get_nodes"), say("node-1 and node-2"), say("Two nodes."))
-        r = a.ask("which nodes are there?", who=ADMIN)
-        self.assertEqual(r.text, "Two nodes.")
-        self.assertEqual(self.service.calls, [("alpha", "get_nodes", {}, "")])
+    def test_a_read_without_a_controller_asks_every_one_that_serves_the_verb(self):
+        a = self.agent(call("net_read_devices"), say("Alpha has two nodes, beta one item."))
+        a.ask("what is in the network?", who=ADMIN)
+        self.assertEqual(sorted(c[:2] for c in self.service.calls), [("alpha", "get_nodes"), ("beta", "list_items")])
+        got = self.model.tool_results()[-1]
+        self.assertIn('"alpha"', got)
+        self.assertIn("node-2", got)
+
+    def test_a_verb_names_who_serves_it(self):
+        a = self.agent(call("net_provision", controller="beta", arguments={"a": "x"}), say("Beta cannot."))
+        a.ask("provision on beta", thread_id="v", who=ADMIN)
+        self.assertEqual(self.service.calls, [])
+        # beta does not serve provision: the schema's enum already keeps it out, and the tool says so if asked
 
     def test_a_write_waits_and_carries_the_approvers_name(self):
-        a = self.agent(call("task", description="create a service a1 to z1", subagent_type="alpha"),
-                       call("alpha__create_service", a="a1", z="z1"), say("created"), say("Service created."))
+        a = self.agent(call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}), say("Service created."))
         r = a.ask("create a service from a1 to z1", thread_id="w", who=ADMIN)
         self.assertTrue(r.waiting, r)
-        self.assertEqual(r.pending[0]["name"], "alpha__create_service")
+        self.assertEqual(r.pending[0]["name"], "net_provision")
         self.assertEqual(self.service.calls, [])
         a.decide("w", [approval.decision("approve")], who=ADMIN)
         self.assertEqual(self.service.calls, [("alpha", "create_service", {"a": "a1", "z": "z1"},
                                                "ana (approved in canah)")])
+
+    def test_a_tool_beyond_the_contract_is_found_then_called(self):
+        a = self.agent(call("network_tools", query="meter"), call("controller_read", controller="beta", tool="set_meter",
+                                                                  arguments={"port": "1"}),
+                       call("controller_write", controller="beta", tool="set_meter", arguments={"port": "1"}), say("Meter set."))
+        r = a.ask("put a meter on beta port 1", thread_id="m", who=ADMIN)
+        found, refused = self.model.tool_results(2)[-2], self.model.tool_results(2)[-1]
+        self.assertIn("set_meter", found)
+        self.assertIn("controller_write", refused)                 # a write is not slipped through the read tool
+        self.assertEqual(r.pending[0]["name"], "controller_write")
+        a.decide("m", [approval.decision("approve")], who=ADMIN)
+        self.assertEqual(self.service.calls[-1][:3], ("beta", "set_meter", {"port": "1"}))
+
+    def test_the_twin_gate_sees_the_controller_and_tool_behind_a_write(self):
+        from canah.network import AgenticMCPProvider as P
+        prov = P(service=self.service)
+        self.assertEqual(prov.write_target("net_provision", {"controller": "alpha", "arguments": {"a": "1"}}),
+                         ("alpha", "create_service", {"a": "1"}))
+        self.assertEqual(prov.write_target("controller_write", {"controller": "beta", "tool": "set_meter", "arguments": {}}),
+                         ("beta", "set_meter", {}))
+        self.assertIsNone(prov.write_target("net_read_devices", {}))
 
     def test_an_unreachable_agentic_mcp_still_lets_the_agent_start(self):
         class Down(FakeAgenticMCP):

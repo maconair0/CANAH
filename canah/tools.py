@@ -11,7 +11,7 @@ A `ToolProvider` gives:
   middleware() optional: LangChain middleware for the main agent (a check on
                its answers, say)
   shared_tools() optional: names of its tools every subagent should also have
-               (a document search a controller's subagent can use for a rule)
+               (a document search a controller's agent can use for a rule)
   main_tools() optional: the names the main agent holds itself; the rest are
                only for the provider's subagents (a large system keeps its
                hundreds of tools out of the main agent's choice this way)

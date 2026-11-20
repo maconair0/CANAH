@@ -6,8 +6,9 @@ description: How to propose a change to the system so an operator can approve it
 # Proposing a change
 
 1. Read the current state first, with the read tools, so the proposal names real objects.
-2. Make the change with the tool that does it, with the real arguments. If that tool belongs to a subagent (a
-   controller's tools are its subagent's), delegate the exact change to that subagent: its call is what pauses.
+2. Make the change with the tool that does it, with the real arguments: a controller's change is the contract verb
+   (`net_provision`, `net_teardown`, ...) with the controller named, or `controller_write` for a tool beyond the
+   contract (found with `network_tools`). That call is what pauses.
    There is no separate "approvals" step or subagent, and do not ask for permission in text first: the system
    pauses the call and shows it to the operator, and that pause is the request for approval.
 3. While it waits, do not call it again or try another way. Several changes that depend on each other are made in

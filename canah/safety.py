@@ -15,7 +15,9 @@ same request's numbers.
 """
 from __future__ import annotations
 
+import json
 import re
+import time
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
@@ -58,6 +60,10 @@ class RunTracker(AgentMiddleware):
         if run is None or not msgs or not isinstance(msgs[-1], AIMessage):
             return None
         usage = getattr(msgs[-1], "usage_metadata", None) or {}
+        from . import window
+        # The main agent's calls set how full its window is; a subagent's have their own window. A subagent
+        # runs inside a tool call, so its namespace has a parent: "tools:<id>|<node>:<id>".
+        window.record(run, msgs[-1], main="|" not in str(_cfg().get("checkpoint_ns") or ""))
         run["model_calls"] = run.get("model_calls", 0) + 1
         run["tokens_in"] = run.get("tokens_in", 0) + int(usage.get("input_tokens") or 0)
         run["tokens_out"] = run.get("tokens_out", 0) + int(usage.get("output_tokens") or 0)
@@ -67,13 +73,61 @@ class RunTracker(AgentMiddleware):
         run = _run()
         if run is not None:
             run["tool_calls"] = run.get("tool_calls", 0) + 1
-        return handler(request)
+        t0 = time.monotonic()
+        return _stamp(handler(request), t0)
 
     async def awrap_tool_call(self, request, handler: Callable):
         run = _run()
         if run is not None:
             run["tool_calls"] = run.get("tool_calls", 0) + 1
-        return await handler(request)
+        t0 = time.monotonic()
+        return _stamp(await handler(request), t0)
+
+
+class RepeatGuard(AgentMiddleware):
+    """The same tool with the same arguments, a third time in one request, is not run: it answers the same.
+    The model is told to use what it has (a model on a loop otherwise spends the whole request there)."""
+
+    def __init__(self, limit: int = 2):
+        super().__init__()
+        self.limit = limit
+
+    def _seen(self, request) -> Optional[ToolMessage]:
+        run = _run()
+        if run is None:
+            return None
+        call = request.tool_call
+        key = f"{call.get('name')}:{json.dumps(call.get('args') or {}, sort_keys=True, default=str)}"
+        seen = run.setdefault("calls_seen", {})
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= self.limit:
+            return None
+        return ToolMessage(tool_call_id=call["id"], name=call.get("name"), status="error", content=(
+            f"Not run again: {call.get('name')} was already called {seen[key] - 1} times with exactly these arguments "
+            f"in this request, and it answers the same each time. Use what it returned, try something different, or "
+            f"answer the operator now with what you have (saying what is missing)."))
+
+    def wrap_tool_call(self, request, handler: Callable):
+        return self._seen(request) or handler(request)
+
+    async def awrap_tool_call(self, request, handler: Callable):
+        return self._seen(request) or await handler(request)
+
+
+def _stamp(result: Any, t0: float) -> Any:
+    """How long the tool took, in ms, on its result (additional_kwargs["ms"]): the web page shows it on the
+    tool's card, live and when the conversation is opened again. A delegation (`task`) returns a Command
+    whose messages carry the result."""
+    ms = round((time.monotonic() - t0) * 1000)
+    msgs = [result] if isinstance(result, ToolMessage) else \
+        [m for m in ((getattr(result, "update", None) or {}).get("messages") or []) if isinstance(m, ToolMessage)] \
+        if isinstance(getattr(result, "update", None), dict) else []
+    for m in msgs:
+        try:
+            m.additional_kwargs = {**(m.additional_kwargs or {}), "ms": ms}
+        except Exception:  # noqa: BLE001 - timing is extra
+            pass
+    return result
 
 
 _STEER = re.compile(

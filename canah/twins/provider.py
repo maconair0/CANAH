@@ -306,20 +306,29 @@ class TwinsProvider:
                 "what it does not model, as given. Say which twin answered. The decision is the twin's, not yours.")
 
 
-def make_gate(registry: Registry, checks: Checks, writes: Callable[[], Set[str]]):
+def make_gate(registry: Registry, checks: Checks, writes: Callable[[], Set[str]],
+              resolve: Optional[Callable[[str, Dict[str, Any]], Optional[tuple]]] = None):
+    """`resolve(tool name, args)`: (controller, controller's tool, its arguments) for a write tool that is not
+    named <controller>__<tool> (the network provider's net_<verb> writes and controller_write)."""
     from langchain.agents.middleware import AgentMiddleware
     from langchain_core.messages import ToolMessage
 
     class _Gate(AgentMiddleware):
         def _hold(self, request):
             name = str(request.tool_call.get("name") or "")
-            if "__" not in name or name not in writes():
+            if name not in writes():
+                return None, None
+            target = resolve(name, request.tool_call.get("args") or {}) if resolve else None
+            if target is None and "__" not in name:
                 return None, None
             t = registry.active()
             if t is None or not t.can_check_writes():
                 return None, None
-            controller, tool = name.split("__", 1)
-            args = request.tool_call.get("args") or {}
+            if target is not None:
+                controller, tool, args = target
+            else:
+                controller, tool = name.split("__", 1)
+                args = request.tool_call.get("args") or {}
             try:
                 c = t.check_write(controller, tool, args, {})
             except Exception as e:  # noqa: BLE001 - a twin that fails holds the write and says why

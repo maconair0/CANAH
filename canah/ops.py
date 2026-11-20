@@ -37,6 +37,11 @@ class Ops:
         self.path = str(path) if path else ":memory:"
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.executescript(_SCHEMA)
+        have = {r[1] for r in self._db.execute("pragma table_info(requests)")}
+        for col, kind in (("cache_prompt", "integer"), ("cache_hit", "integer"), ("context_used", "integer"),
+                          ("context_window", "integer")):
+            if col not in have:      # a database from before these figures: add them
+                self._db.execute(f"alter table requests add column {col} {kind}")
         self._lock = threading.Lock()
 
     def audit(self, event: str, user: str = "", level: str = "", thread: str = "", tool: str = "",
@@ -49,7 +54,7 @@ class Ops:
 
     def request(self, **row: Any) -> None:
         cols = ("user", "level", "thread", "seconds", "model_calls", "tokens_in", "tokens_out", "tool_calls",
-                "sent_back", "ended")
+                "sent_back", "ended", "cache_prompt", "cache_hit", "context_used", "context_window")
         vals = [row.get(c) for c in cols]
         vals[cols.index("sent_back")] = json.dumps(row.get("sent_back") or {})
         with self._lock:
@@ -86,11 +91,26 @@ class Ops:
                 "p95_seconds": round(secs[int(len(secs) * 0.95) - 1 if len(secs) > 1 else 0], 1),
                 "tokens_in": sum(r["tokens_in"] or 0 for r in rows), "tokens_out": sum(r["tokens_out"] or 0 for r in rows),
                 "model_calls": sum(r["model_calls"] or 0 for r in rows), "tool_calls": sum(r["tool_calls"] or 0 for r in rows),
-                "sent_back": sent, "ended": _count(r["ended"] for r in rows)}
+                "sent_back": sent, "ended": _count(r["ended"] for r in rows),
+                **_cache_and_context(rows)}
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+
+def _cache_and_context(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The share of prompt tokens read from the KV cache, and how full requests left the context window."""
+    out: Dict[str, Any] = {}
+    p = sum(r.get("cache_prompt") or 0 for r in rows)
+    if p:
+        out["kv_cache_percent"] = round(100 * sum(r.get("cache_hit") or 0 for r in rows) / p, 1)
+    pct = sorted(100 * r["context_used"] / r["context_window"] for r in rows
+                 if r.get("context_used") and r.get("context_window"))
+    if pct:
+        out["context_percent_median"] = round(pct[len(pct) // 2], 1)
+        out["context_percent_max"] = round(pct[-1], 1)
+    return out
 
 
 def _count(values) -> Dict[str, int]:

@@ -175,7 +175,7 @@ class GroundingGuard(AgentMiddleware):
             f"otherwise drop the value and say it was not obtained."))]}
 
 
-_ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me|i(?:'ll| will) (?:now |first |next )?(?:check|look|run|query|fetch|get|"
+_ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me(?! know\b)|i(?:'ll| will) (?:now |first |next )?(?:check|look|run|query|fetch|get|"
                        r"examine|inspect|count|search|read|try|call|ask|process|verify|create|make|apply|connect|execute|send|perform|implement|submit|carry out|shut|delete|remove|configure|"
                        r"attach|delegate|proceed)|next,? i(?:'ll| will)|now i(?:'ll| will)|"
                        r"(?:i now|now i) have (?:all )?(?:the )?(?:necessary |required )?information|here(?:'s| is) the plan|"
@@ -183,6 +183,12 @@ _ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me|i(?:'ll| will) (?:now |fi
                        r"(?:measurement|value|data|reading|state|status))\b",
                        re.I)
 _NUDGE = "[follow-through check]"
+_LOOK = "[look-first check]"
+KEEP = "KEEP"
+
+
+def is_keep(content: Any) -> bool:
+    return str(content or "").strip().strip(".!*`\"'").upper() == KEEP
 _LACKS = re.compile(r"\bi (?:don't|do not) have (?:the |access to the )?(?:current |live |latest )?(?:\w+ ){0,3}"
                     r"(?:measurement|value|data|reading|state|status)\b", re.I)
 _ASKS = re.compile(r"\b(?:please confirm|confirm (?:if|that|whether) you|"
@@ -191,6 +197,60 @@ _ASKS = re.compile(r"\b(?:please confirm|confirm (?:if|that|whether) you|"
                    r"(?:shall|should) i (?:proceed|go ahead|continue|delete|create|remove|do|make|apply)|"
                    r"if so,? i(?:'ll| will) (?:need|proceed|go ahead)|i(?:'ll| will) need your (?:approval|confirmation)|"
                    r"before proceeding[^.]{0,60}confirm)", re.I)
+
+
+def current_question(msgs: List[Any]) -> str:
+    """The operator's message this turn: the last human message that is not one of the checks' own."""
+    for m in reversed(msgs):
+        if isinstance(m, HumanMessage) and "check]" not in str(m.content)[:40]:
+            return str(m.content if isinstance(m.content, str) else m.content)
+    return ""
+
+
+def anchored(note: str, msgs: List[Any], keep: bool = True) -> str:
+    """A check's message, tied to the question this turn so the model does not drift to an earlier one, and,
+    when the answer may stand as it is, with the one word that keeps it (KEEP) instead of a rewrite."""
+    q = " ".join(current_question(msgs).split())
+    if len(q) > 400:
+        q = q[:400] + " ..."
+    out = note
+    if q:
+        out += f"\n\nThe operator's question this turn: \u00ab{q}\u00bb. Answer that question, not an earlier one."
+    if keep:
+        out += f" If your answer above already answers it, reply with the single word {KEEP} and it stands as it is."
+    return out
+
+
+def _this_run() -> Optional[Dict[str, Any]]:
+    try:
+        from langgraph.config import get_config
+        run = ((get_config() or {}).get("configurable") or {}).get("run")
+    except Exception:  # noqa: BLE001
+        return None
+    return run if isinstance(run, dict) else None
+
+
+def answer_kept() -> bool:
+    """The model already kept its answer once in this request: no check sends it back again."""
+    run = _this_run()
+    return bool(run and run.get("kept"))
+
+
+class KeepAnswer(AgentMiddleware):
+    """When a check sent an answer back and the model replies KEEP, the check and the KEEP are dropped and the
+    answer stands: one word instead of the whole answer written again (or, worse, a different one)."""
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if (len(msgs) >= 3 and isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls and is_keep(msgs[-1].content)
+                and isinstance(msgs[-2], HumanMessage) and any(t in str(msgs[-2].content) for t in (_LOOK, _NUDGE))
+                and isinstance(msgs[-3], AIMessage) and msgs[-1].id and msgs[-2].id):
+            run = _this_run()
+            if run is not None:
+                run["kept"] = True
+            return {"messages": [RemoveMessage(id=msgs[-2].id), RemoveMessage(id=msgs[-1].id)]}
+        return None
 
 
 class FollowThrough(AgentMiddleware):
@@ -203,6 +263,8 @@ class FollowThrough(AgentMiddleware):
         if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
             return None
         text = str(msgs[-1].content or "")
+        if answer_kept() or is_keep(text):
+            return None
         asks = bool(_ASKS.search(text)) and self._may_change()
         # A stall ("I now have all the information...") sits at the start; an announced step at the end.
         if not (asks or _ANNOUNCE.search(text[-400:]) or _ANNOUNCE.search(text[:200]) or _LACKS.search(text)):
@@ -212,14 +274,13 @@ class FollowThrough(AgentMiddleware):
         if any(isinstance(m, HumanMessage) and _NUDGE in str(m.content) for m in msgs[start:]):
             return None
         if asks:
-            return {"jump_to": "model", "messages": [HumanMessage(content=(
-                f"{_NUDGE} You asked for confirmation in text. If a change was asked for, make it now with the tool "
-                f"(or delegate it to the subagent that has the tool): the system pauses it for the operator, who sees "
-                f"it and can approve or reject it there. That pause is the confirmation. Say any risk you found in "
-                f"one line first."))]}
-        return {"jump_to": "model", "messages": [HumanMessage(content=(
-            f"{_NUDGE} You said what you would do next, or that you lack something your tools or subagents can "
-            f"get, but did not do it. Do it now with your tools, or give your final answer."))]}
+            return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                f"{_NUDGE} You asked for confirmation in text. If a change was asked for, make it now with the tool: "
+                f"the system pauses it for the operator, who sees it and can approve or reject it there. That pause is "
+                f"the confirmation. Say any risk you found in one line first.", msgs, keep=False))]}
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+            f"{_NUDGE} You said what you would do next, or that you lack something your tools can get, but did not "
+            f"do it. If it is needed to answer the question, do it now with your tools.", msgs))]}
 
     @staticmethod
     def _may_change() -> bool:
@@ -231,12 +292,6 @@ class FollowThrough(AgentMiddleware):
         return level in ("admin", "root")
 
 
-_LOOK = "[look-first check]"
-KEEP = "KEEP"
-
-
-def is_keep(content: Any) -> bool:
-    return str(content or "").strip().strip(".!*`\"'").upper() == KEEP
 
 
 class LookFirst(AgentMiddleware):
@@ -254,12 +309,8 @@ class LookFirst(AgentMiddleware):
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
             return None
-        # The model kept its answer: drop the check and the KEEP, and the first answer is the reply. One
-        # word to say so instead of the whole answer written out again, which doubled the wait.
-        if (len(msgs) >= 3 and is_keep(msgs[-1].content) and isinstance(msgs[-2], HumanMessage)
-                and _LOOK in str(msgs[-2].content) and isinstance(msgs[-3], AIMessage)
-                and msgs[-1].id and msgs[-2].id):
-            return {"messages": [RemoveMessage(id=msgs[-2].id), RemoveMessage(id=msgs[-1].id)]}
+        if is_keep(msgs[-1].content) or answer_kept():
+            return None                 # KeepAnswer drops the check and the KEEP; a kept answer is not sent back
         if len(str(msgs[-1].content or "")) < self.min_chars:
             return None
         start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
@@ -269,10 +320,9 @@ class LookFirst(AgentMiddleware):
             return None
         if any(isinstance(m, HumanMessage) and _LOOK in str(m.content) for m in turn):
             return None
-        return {"jump_to": "model", "messages": [HumanMessage(content=(
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
             f"{_LOOK} You answered without looking anything up. If the question is about this system (its live "
-            f"state, its configuration, its documents), read it with your tools or subagents first and answer from "
-            f"that. If it needs no lookup, reply with the single word {KEEP} and your answer above stands."))]}
+            f"state, its configuration, its documents), read it with your tools first and answer from that.", msgs))]}
 
 
 class TimeBudget(AgentMiddleware):

@@ -115,7 +115,7 @@ setInterval(() => { $("#st-clock").textContent = new Date().toLocaleTimeString()
 $("#st-ctl").addEventListener("click", () => go("controllers"));
 
 /* ================= router ================= */
-const VIEWS = ["topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
+const VIEWS = ["model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
 function go(view, first = false) {
   if (!VIEWS.includes(view)) view = "topology";
   state.view = view; store.set("canah.view", view);
@@ -137,6 +137,7 @@ function go(view, first = false) {
   if (view === "knowledge") renderKnowledge();
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
+  if (view === "model") renderModel();
 }
 $$(".nav button[data-view]").forEach((b) => b.addEventListener("click", () => go(b.dataset.view)));
 const setPanel = (which, hidden) => { document.body.classList.toggle(`${which}-hidden`, hidden); store.set(`canah.${which}-hidden`, hidden); if (state.view === "topology") setTimeout(() => fitTopology(false), 30); };
@@ -164,10 +165,40 @@ const topo = { pos: {}, pins: store.get("canah.topo.pins", {}), open: store.get(
 const domainClass = (d) => { d = String(d || "").toLowerCase(); return /packet|ip|l2|l3|sdn/.test(d) ? "packet" : /optic|wdm|photon/.test(d) ? "optical" : /data|dc|fabric|centre|center/.test(d) ? "dc" : "other"; };
 const DOMAIN_COLOR = { packet: "var(--d-packet)", optical: "var(--d-optical)", dc: "var(--d-dc)", other: "var(--d-other)" };
 
+/* CANAH's agents (librarian, general-purpose, one agent per controller) are not the controllers: the agentic MCP
+   holds the controllers, and a controller's agent works it through the agentic MCP. */
+const agentsDetail = () => state.info?.subagent_detail || (state.info?.subagents || []).map((n) => ({ name: n }));
+const agentFor = (ctlKey) => (agentsDetail().find((a) => a.controller === ctlKey) || {}).name;
+const ctlOfAgent = (name) => (agentsDetail().find((a) => a.name === name) || {}).controller;
+const AGENT_KIND = { controller: "controller agent", knowledge: "knowledge", general: "general", custom: "agent" };
+
+// A row that scrolls sideways: arrows when it overflows, faded edges, the wheel scrolls it, nothing hidden.
+function hscroll(el, extra = "") {
+  if (!el || el._hs) return; el._hs = true;
+  const wrap = document.createElement("div"); wrap.className = `hs-wrap ${extra}`.trim();
+  el.parentNode.insertBefore(wrap, el); wrap.append(el); el.classList.add("hs");
+  const mk = (dir) => {
+    const b = document.createElement("button"); b.type = "button"; b.className = `hs-btn ${dir}`;
+    b.setAttribute("aria-label", dir === "l" ? "Scroll left" : "Scroll right"); b.tabIndex = -1;
+    b.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="${dir === "l" ? "M15 18l-6-6 6-6" : "M9 18l6-6-6-6"}"/></svg>`;
+    b.addEventListener("click", () => el.scrollBy({ left: (dir === "l" ? -1 : 1) * Math.max(120, el.clientWidth * 0.7), behavior: "smooth" }));
+    wrap.append(b);
+  };
+  mk("l"); mk("r");
+  const upd = () => { const max = el.scrollWidth - el.clientWidth - 1;
+    wrap.classList.toggle("overflows", max > 0); wrap.classList.toggle("at-start", el.scrollLeft <= 1); wrap.classList.toggle("at-end", el.scrollLeft >= max); };
+  el.addEventListener("scroll", upd, { passive: true });
+  el.addEventListener("wheel", (e) => { if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && el.scrollWidth > el.clientWidth + 1) { e.preventDefault(); el.scrollLeft += e.deltaY; } }, { passive: false });
+  new ResizeObserver(upd).observe(el); new MutationObserver(upd).observe(el, { childList: true, subtree: true });
+  upd();
+}
+hscroll($("#kpis"));
+
 async function loadTopology(refresh = false) {
   try {
     const t = await api(`/topology${refresh ? "?refresh=1" : ""}`);
     state.topology = t; buildGraph(t);
+    if (!state.mcp || Date.now() - (state.mcpAt || 0) > 300000) { state.mcpAt = Date.now(); api("/network/connection").then((m) => { state.mcp = m; }).catch(() => {}); }
     $("#topo-updated").textContent = `read ${new Date(t.at * 1000).toLocaleTimeString()}${t.url ? " from " + t.url : ""}`;
     const ctls = t.controllers || [];
     const okN = ctls.filter((c) => c.ok).length;
@@ -188,13 +219,22 @@ $("#topo-live").addEventListener("change", (e) => { topo.live = e.target.checked
 $("#topo-labels").addEventListener("change", (e) => { topo.labels = e.target.checked; renderTopology(); });
 
 function buildGraph(t) {
-  const nodes = [{ id: "canah", kind: "hub", label: "CANAH", ok: true }];
-  const links = [];
-  for (const c of t.controllers || []) {
+  const ctlsAll = t.controllers || [];
+  const nodes = [{ id: "canah", kind: "hub", label: "CANAH", ok: true },
+                 { id: "mcp", kind: "mcp", label: "Agentic MCP", ok: t.ok !== false, url: t.url, n: ctlsAll.length, okN: ctlsAll.filter((c) => c.ok).length }];
+  const links = [{ kind: "uplink", source: "canah", target: "mcp", ok: t.ok !== false }];
+  // The digital twin CANAH tries changes in first (NetTwin, or another twin chosen on the Digital twins page).
+  if (state.twin) {
+    const w = state.twin;
+    nodes.push({ id: "twin", kind: "twin", label: twinLabel(w), ok: !!w.ok, w });
+    links.push({ kind: "twinlink", source: "canah", target: "twin", ok: !!w.ok });
+    if ((w.extras || []).some((x) => x.name === "mirror")) links.push({ kind: "mirror", source: "twin", target: "mcp", ok: !!w.ok && t.ok !== false });
+  }
+  for (const c of ctlsAll) {
     const cid = `ctl:${c.key}`;
     nodes.push({ id: cid, kind: "controller", label: c.label || c.key, key: c.key, domain: c.domain, ok: c.ok, c,
       sub: `${c.domain || "?"} · ${c.ok ? (c.devices_total > c.devices.length ? `${c.devices.length} of ${c.devices_total} devices` : `${c.devices.length} devices`) : "unreadable"}` });
-    links.push({ kind: "delegation", source: "canah", target: cid, ok: c.ok });
+    links.push({ kind: "held", source: "mcp", target: cid, ok: c.ok });
     for (const d of c.devices || []) nodes.push({ id: `dev:${c.key}:${d.id}`, kind: "device", label: d.label || d.id, parent: cid, domain: c.domain, ok: d.status !== "down", d, ctl: c.key });
     for (const l of c.links || []) links.push({ kind: "link", source: `dev:${c.key}:${l.a}`, target: `dev:${c.key}:${l.z}`, ok: l.state !== "down", l, ctl: c.key });
   }
@@ -208,42 +248,37 @@ function buildGraph(t) {
     if (!cross.has(k)) cross.set(k, { kind: "cross", source: `ctl:${a}`, target: `ctl:${b}`, ok: true, rels: [] });
     cross.get(k).rels.push(r);
   }
-  // The agents CANAH delegates to: shown when CANAH is opened, at work or not.
-  const subs = state.info?.subagent_detail || (state.info?.subagents || []).map((n) => ({ name: n }));
-  for (const sd of subs) {
+  // CANAH's agents: shown when CANAH is opened, at work or not. A controller's agent reaches its controller
+  // through the agentic MCP, never directly.
+  for (const sd of agentsDetail()) {
     const sid = `sub:${sd.name}`;
     nodes.push({ id: sid, kind: "sub", label: sd.name, parent: "canah", ok: true, sd });
     links.push({ kind: "subdeleg", source: "canah", target: sid, ok: true, sub: sd.name });
-    if (keys.has(sd.name)) links.push({ kind: "drives", source: sid, target: `ctl:${sd.name}`, ok: true, sub: sd.name });
+    if (sd.controller && keys.has(sd.controller)) links.push({ kind: "drives", source: sid, target: "mcp", ok: true, sub: sd.name, ctl: sd.controller });
   }
   topo.nodes = nodes; topo.links = [...links, ...cross.values()];
   layout();
 }
 
 function layout() {
+  // The agentic MCP in the middle with its controllers on an arc to the right; CANAH to its left, with its
+  // agents on an arc further left when it is opened.
   const ctls = topo.nodes.filter((n) => n.kind === "controller");
   const devsOf = (cid) => topo.nodes.filter((n) => n.parent === cid);
   const clusterR = (cid) => topo.open[cid] ? 60 * Math.sqrt(Math.max(1, devsOf(cid).length)) + 60 : 0;
   const biggest = Math.max(0, ...ctls.map((c) => clusterR(c.id)));
   const subs = topo.nodes.filter((n) => n.kind === "sub");
-  const rs = Math.max(150, (subs.length * 140) / (2 * Math.PI));
-  let R = Math.max(250, ctls.length > 1 ? (ctls.length * (190 + biggest * 1.1)) / (2 * Math.PI) : 250);
-  if (topo.open.canah) R = Math.max(R, rs + 200);
-  const pos = { canah: { x: 0, y: 0 } };
-  // A controller's subagent sits on the line to its controller; the others in the gaps between.
-  const ctlAngle = {}; ctls.forEach((c, i) => { ctlAngle[c.key] = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, ctls.length); });
-  const others = subs.filter((n) => ctlAngle[n.label] === undefined);
-  const gaps = ctls.length ? ctls.map((c, i) => ctlAngle[c.key] + Math.PI / ctls.length) : [-Math.PI / 2];
-  const perGap = {};
-  others.forEach((n, i) => { const g = i % gaps.length; perGap[g] = (perGap[g] || 0) + 1; n._gap = g; n._nth = perGap[g] - 1; });
-  subs.forEach((n) => {
-    let a;
-    if (ctlAngle[n.label] !== undefined) a = ctlAngle[n.label];
-    else { const cnt = perGap[n._gap], span = (2 * Math.PI / Math.max(1, gaps.length)) * 0.55; a = gaps[n._gap] + (cnt > 1 ? (n._nth / (cnt - 1) - 0.5) * span : 0); }
-    pos[n.id] = { x: Math.cos(a) * rs, y: Math.sin(a) * rs };
+  const span = ctls.length > 1 ? Math.min(Math.PI * 1.25, 0.55 * ctls.length) : 0;
+  const R = Math.max(260, ctls.length > 1 ? (ctls.length * (180 + biggest * 1.1)) / (span || 1) : 260);
+  const rs = Math.max(170, (subs.length * 64) / Math.PI);
+  const D = 300 + (topo.open.canah ? 40 : 0);
+  const pos = { mcp: { x: 0, y: 0 }, canah: { x: -D, y: 0 }, twin: { x: -D / 2, y: -Math.max(230, R * 0.62) } };
+  subs.forEach((n, i) => {
+    const a = Math.PI / 2 + (Math.PI * (i + 0.5)) / Math.max(1, subs.length);    // the left half around CANAH
+    pos[n.id] = { x: -D + Math.cos(a) * rs, y: Math.sin(a) * rs };
   });
   ctls.forEach((c, i) => {
-    const a = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, ctls.length);
+    const a = ctls.length > 1 ? -span / 2 + (span * i) / (ctls.length - 1) : 0;
     pos[c.id] = { x: Math.cos(a) * R, y: Math.sin(a) * R, a };
     if (topo.open[c.id]) {
       const devs = devsOf(c.id), cr = clusterR(c.id);
@@ -291,17 +326,29 @@ function renderTopology() {
     let d, cls;
     if (l.kind === "subdeleg" || l.kind === "drives") {
       const on = activeAgents().has(l.sub);
+      if (l.kind === "drives" && !on) continue;        // drawn only while the agent works its controller
       const p = S("path", { d: `M${a.x},${a.y} L${b.x},${b.y}`, class: `lk ${l.kind}${on ? " on" : ""}` });
-      p.append(S("title", {}, l.kind === "drives" ? `${l.sub} works ${l.target.slice(4)} through its tools` : `CANAH delegates to ${l.sub}`));
+      p.append(S("title", {}, l.kind === "drives" ? `${l.sub} is working ${l.ctl} through the agentic MCP` : `CANAH delegates to ${l.sub}`));
       gl.append(p); continue;
     }
-    if (l.kind === "delegation") { d = `M${a.x},${a.y} L${b.x},${b.y}`; cls = `lk delegation${l.ok ? "" : " bad"}`; }
+    if (l.kind === "twinlink" || l.kind === "mirror") {
+      const on = activeAgents().has("twin");
+      const p2 = S("path", { d: `M${a.x},${a.y} L${b.x},${b.y}`, class: `lk ${l.kind}${l.ok ? "" : " bad"}${on ? " on" : ""}` });
+      p2.append(S("title", {}, l.kind === "twinlink" ? `CANAH tries changes and failures in the digital twin first${on ? " (asking it now)" : ""}` : "the twin mirrors the live networks through the agentic MCP"));
+      gl.append(p2); continue;
+    }
+    if (l.kind === "uplink") { d = `M${a.x},${a.y} L${b.x},${b.y}`; cls = `lk uplink${l.ok ? "" : " bad"}`; }
+    else if (l.kind === "held") {
+      const ag = agentFor(l.target.slice(4)), act = activeAgents(), on = (ag && act.has(ag)) || act.has(l.target) || act.has("mcp");
+      d = `M${a.x},${a.y} L${b.x},${b.y}`; cls = `lk delegation${l.ok ? "" : " bad"}${on ? " on" : ""}`;
+    }
     else {
       const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
       d = `M${a.x},${a.y} Q${mx - dy / len * 14},${my + dx / len * 14} ${b.x},${b.y}`; cls = `lk ${l.ok ? "ok" : "bad"}`;
     }
     const p = S("path", { d, class: cls });
-    p.append(S("title", {}, l.kind === "delegation" ? `CANAH → ${l.target.slice(4)} through the agentic MCP${l.ok ? "" : " (cannot be read)"}` : `${l.l.id}: ${l.l.a} ⇄ ${l.l.z} · ${l.l.state}`));
+    p.append(S("title", {}, l.kind === "uplink" ? `CANAH reaches every network through the agentic MCP${l.ok ? "" : " (not answering)"}`
+      : l.kind === "held" ? `the agentic MCP holds ${l.target.slice(4)}${l.ok ? "" : " (cannot be read)"}` : `${l.l.id}: ${l.l.a} ⇄ ${l.l.z} · ${l.l.state}`));
     gl.append(p);
     if (l.kind === "link" && topo.labels && (state.selected === l.source || state.selected === l.target || fewLinks))
       gl.append(S("text", { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 6, class: "lbl", "text-anchor": "middle" }, l.l.id));
@@ -321,18 +368,36 @@ function renderTopology() {
       g.append(S("text", { y: 30, "text-anchor": "middle", "font-weight": 700, "letter-spacing": "1.5" }, "CANAH"));
       g.append(S("text", { y: 46, "text-anchor": "middle", class: "sub" }, (state.info?.model?.model || "").replace(/^ollama:/, "").split(":")[0]));
       const nsub = topo.nodes.filter((x) => x.kind === "sub").length;
-      if (nsub) g.append(S("text", { y: 80, "text-anchor": "middle", class: "grp" }, topo.open.canah ? `▾ ${nsub} subagents` : `▸ ${nsub} subagents`));
+      if (nsub) g.append(S("text", { y: 80, "text-anchor": "middle", class: "grp" }, topo.open.canah ? `▾ ${nsub} agents` : `▸ ${nsub} agents`));
+    } else if (n.kind === "twin") {
+      const on = activeAgents().has("twin"), col = n.ok ? "#2fd3c1" : "var(--bad)", w = 196, h = 64;
+      g.setAttribute("class", `nd twin ${n.ok ? "alive" : "down"}${state.selected === n.id ? " sel" : ""}${on ? " on" : ""}`);
+      g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 16, class: "beat", fill: "none", stroke: col }));
+      g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 16, fill: "var(--panel)", stroke: col, "stroke-width": 1.6, "stroke-dasharray": on ? "" : "5 3" }));
+      g.append(S("image", { href: "/static/nettwin-icon.png", x: -w / 2 + 10, y: -22, width: 44, height: 44 }));
+      g.append(S("text", { x: 24, y: -3, "text-anchor": "middle", "font-weight": 700 }, n.label));
+      g.append(S("text", { x: 24, y: 15, "text-anchor": "middle", class: "sub" }, on ? "rehearsing a change…" : `digital twin · ${(n.w.domains || []).length} domains`));
+      g.append(S("title", {}, `${n.label}: the digital twin CANAH tries a change or a failure in before the network sees it (${(n.w.domains || []).map((d) => d.title || d.domain).join(", ")}).`));
+    } else if (n.kind === "mcp") {
+      const col = n.ok ? "#22a9b0" : "var(--bad)", w = 188, h = 64, busy = [...activeAgents()].some((x) => x === "mcp" || String(x).startsWith("ctl:"));
+      g.setAttribute("class", `nd mcp ${n.ok ? "alive" : "down"}${state.selected === n.id ? " sel" : ""}${busy ? " on" : ""}`);
+      g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 16, class: "beat", fill: "none", stroke: col }));
+      g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 16, fill: "var(--panel)", stroke: col, "stroke-width": 1.6 }));
+      g.append(S("image", { href: "/static/agentic-mcp-icon.png", x: -w / 2 + 10, y: -22, width: 44, height: 44 }));
+      g.append(S("text", { x: 22, y: -3, "text-anchor": "middle", "font-weight": 700 }, "Agentic MCP"));
+      g.append(S("text", { x: 22, y: 15, "text-anchor": "middle", class: "sub" }, n.ok ? `${n.okN}/${n.n} controllers` : "not answering"));
+      g.append(S("title", {}, `The agentic MCP${n.url ? " at " + n.url : ""}: it holds the SDN controllers and checks each against the common contract. CANAH reaches them only through it.`));
     } else if (n.kind === "sub") {
-      const on = activeAgents().has(n.label), w = 128, h = 30;
-      const col = (state.topology?.controllers || []).some((c) => c.key === n.label)
-        ? DOMAIN_COLOR[domainClass((state.topology.controllers.find((c) => c.key === n.label) || {}).domain)] : "var(--accent2)";
+      const on = activeAgents().has(n.label), w = 136, h = 30;
+      const ctlKey = n.sd?.controller, ctlRow = (state.topology?.controllers || []).find((c) => c.key === ctlKey);
+      const col = ctlRow ? DOMAIN_COLOR[domainClass(ctlRow.domain)] : n.sd?.kind === "knowledge" ? "var(--accent2)" : "var(--faint)";
       g.setAttribute("class", `nd sub${on ? " on" : ""}${state.selected === n.id ? " sel" : ""}`);
       g.append(S("rect", { x: -w / 2 - 4, y: -h / 2 - 4, width: w + 8, height: h + 8, rx: 19, class: "halo" }));
       g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 15, fill: "var(--panel)", stroke: on ? "var(--accent)" : col, class: "body" }));
       g.append(S("circle", { cx: -w / 2 + 13, cy: 0, r: 4, fill: on ? "var(--accent)" : "var(--faint)", class: on ? "led" : "" }));
       const used = state.activity?.used?.[n.label];
-      g.append(S("text", { x: 6, y: 4.5, "text-anchor": "middle" }, `${n.label.length > 14 ? n.label.slice(0, 13) + "…" : n.label}${n.sd?.tools != null ? ` · ${n.sd.tools}` : ""}`));
-      g.append(S("title", {}, `${n.label}: ${on ? "at work now" : "idle"}${used ? ` · ${used.calls} calls, last ${ago(used.last)}` : ""}\n${n.sd?.description || ""}`));
+      g.append(S("text", { x: 6, y: 4.5, "text-anchor": "middle" }, `${n.label.length > 16 ? n.label.slice(0, 15) + "…" : n.label}${n.sd?.tools != null ? ` · ${n.sd.tools}` : ""}`));
+      g.append(S("title", {}, `${n.label} (${AGENT_KIND[n.sd?.kind] || "agent"}): ${on ? "at work now" : "idle"}${used ? ` · ${used.calls} calls, last ${ago(used.last)}` : ""}${ctlKey ? `\nworks ${ctlRow?.label || ctlKey} through the agentic MCP` : ""}\n${n.sd?.description || ""}`));
     } else if (n.kind === "controller") {
       const col = n.ok ? DOMAIN_COLOR[domainClass(n.domain)] : "var(--bad)", w = 178, h = 54;
       g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 10, class: "beat", fill: "none", stroke: col }));
@@ -452,17 +517,22 @@ function renderKpis() {
     k("Devices", devs, "read through the contract"),
     k("Links", links, down ? `${down} down` : "all up", down ? "warn" : links ? "ok" : ""),
     k("Relations", (t.relations || []).length, "across domains"),
-    k("Model", esc((state.info?.model?.model || "–").replace(/^ollama:/, "")), `${state.info?.tools ?? "–"} tools · ${(state.info?.subagents || []).length} subagents`, "ok", true),
+    k("Model", esc((state.info?.model?.model || "–").replace(/^ollama:/, "")), `${state.info?.tools ?? "–"} tools · ${(state.info?.subagents || []).length} agents`, "ok", true),
+    k("Agentic MCP", t.ok === false ? "down" : "up", esc(t.url || "–"), t.ok === false ? "bad" : "ok", true),
   ].join("");
 }
 
 function hubAgents() {
   const act = activeAgents(), used = state.activity?.used || {};
-  const subs = state.info?.subagent_detail || [];
+  const subs = agentsDetail();
   const runs = state.activity?.running || [];
-  return subs.map((sd) => { const on = act.has(sd.name), u = used[sd.name];
+  const row = (sd) => { const on = act.has(sd.name), u = used[sd.name];
+      const ctl = sd.controller ? (state.topology?.controllers || []).find((c) => c.key === sd.controller) : null;
       return `<div class="act-row"><span class="dot ${on ? "busy" : u ? "ok" : ""}"></span><div><b>${esc(sd.name)}</b>${sd.tools != null ? ` <span class="faint">${sd.tools} tools</span>` : ""}
-        <div class="faint">${esc((sd.description || "").slice(0, 110))}</div></div><span class="faint">${on ? "<b style='color:var(--accent)'>at work</b>" : u ? `${u.calls} calls · ${ago(u.last)}` : "idle"}</span></div>`; }).join("")
+        <div class="faint">${ctl || sd.controller ? `works ${esc(ctl?.label || sd.controller)} through the agentic MCP` : esc((sd.description || "").slice(0, 110))}</div></div><span class="faint">${on ? "<b style='color:var(--accent)'>at work</b>" : u ? `${u.calls} calls · ${ago(u.last)}` : "idle"}</span></div>`; };
+  const group = (title, list) => list.length ? `<div class="act-group">${title}</div>` + list.map(row).join("") : "";
+  return group("Knowledge", subs.filter((x) => x.kind === "knowledge"))
+    + group("General", subs.filter((x) => x.kind !== "controller" && x.kind !== "knowledge"))
     + `<h4>Running now</h4>${runs.length ? runs.map((r) => `<div class="act-row"><span class="dot busy"></span><div>${esc(r.user || "a request")} · <span class="mono">${esc(r.step || "thinking")}</span><div class="faint">${esc(r.agents.join(", "))}</div></div><span class="faint">${Math.round(Date.now() / 1000 - r.since)} s</span></div>`).join("") : `<div class="faint" style="font-size:12px">nothing</div>`}`
     + ((state.activity?.recent || []).length ? `<h4>Last steps</h4>${state.activity.recent.slice(-8).reverse().map((e) => `<div class="act-row"><span class="dot"></span><div><span class="mono">${esc(e.tool)}</span> <span class="faint">by ${esc(e.agent)}</span></div><span class="faint">${ago(e.at)}</span></div>`).join("")}` : "");
 }
@@ -489,13 +559,38 @@ function renderDetail(id) {
     const i = state.info || {};
     title.textContent = "CANAH";
     body.innerHTML = `<div class="kv"><div>model</div><div>${esc(i.model?.model || "–")}</div><div>tools</div><div>${i.tools ?? "–"} (${i.main_agent_tools ?? "–"} on the main agent)</div>
-      <div>subagents</div><div>${esc((i.subagents || []).join(", ") || "–")}</div><div>sandbox</div><div>${esc(i.sandbox || "none")}</div>
+      <div>agents</div><div>${esc((i.subagents || []).join(", ") || "none")}</div><div>sandbox</div><div>${esc(i.sandbox || "none")}</div>
       <div>middleware</div><div>${esc((i.middleware || []).join(", ") || "–")}</div><div>approvals</div><div>${(i.interrupt_on || []).length} tools pause for an operator</div>
       <div>agentic MCP</div><div class="mono">${esc(state.topology?.url || "–")}</div></div>
-      <h4>Subagents ${topo.open.canah ? "" : "<span class='faint' style='text-transform:none;letter-spacing:0'>(click CANAH to show them)</span>"}</h4>
+      <h4>CANAH's agents ${topo.open.canah ? "" : "<span class='faint' style='text-transform:none;letter-spacing:0'>(click CANAH to show them)</span>"}</h4>
       <div id="hub-agents">${hubAgents()}</div>
       ${(state.topology?.relations || []).length ? `<h4>Across domains</h4><table class="tbl"><tbody>${state.topology.relations.slice(0, 40).map((r) => `<tr><td class="mono">${esc(r.from)}</td><td>${esc(r.relation)}</td><td class="mono">${esc(r.to)}</td></tr>`).join("")}</tbody></table>` : ""}
       <div class="row" style="margin-top:12px">${ask("Which controllers do you hold, and are they all healthy?")}</div>`;
+  } else if (n.kind === "twin") {
+    const w = n.w || {};
+    title.textContent = `${n.label} · digital twin`;
+    body.innerHTML = `${/nettwin/i.test(n.label) ? `<img class="dt-logo" src="/static/nettwin-logo.png" alt="NetTwin: rehearse the change before you make it">` : ""}
+      ${w.ok ? "" : `<div class="banner bad">The twin does not answer: ${esc(w.error || "")}</div>`}
+      <p class="muted" style="margin:0 0 10px;font-size:12.5px">${esc(w.about || "")}</p>
+      <div class="kv"><div>role</div><div>CANAH tries a change or a failure here first; a write to a controller runs only when its check here lets it (or an operator overrides it)</div>
+      <div>version</div><div>${esc(w.version || "–")}</div><div>checks writes on</div><div>${esc((w.controller_domains || []).join(", ") || "none")}</div>
+      <div>mirrors</div><div>${(w.extras || []).some((x) => x.name === "mirror") ? "the live networks, through the agentic MCP" : "no"}</div></div>
+      <h4>Domains</h4><div class="chips">${(w.domains || []).map((d) => `<span class="chip">${esc(d.title || d.domain)}</span>`).join("")}</div>
+      <div class="row" style="margin-top:12px"><button class="btn sm" id="dt-twins">Digital twins page</button>
+        <button class="btn sm" data-ask="${esc(`What happens if the busiest link fails? Ask ${n.label} before answering.`)}">Ask CANAH</button></div>`;
+    $("#dt-twins").onclick = () => go("twins");
+  } else if (n.kind === "mcp") {
+    const m = state.mcp || {};
+    const ctls = state.topology?.controllers || [];
+    title.textContent = "Agentic MCP";
+    body.innerHTML = `${n.ok ? "" : `<div class="banner bad">The agentic MCP is not answering${state.topology?.error ? ": " + esc(state.topology.error) : ""}.</div>`}
+      <p class="muted" style="margin:0 0 10px;font-size:12.5px">It holds the SDN controllers and checks each against the common contract. CANAH works every controller through it, with one tool per contract verb.</p>
+      <div class="kv"><div>address</div><div class="mono">${esc(n.url || "–")}</div>
+      <div>token</div><div>${m.token_set ? (m.token_accepted === false ? `<span class="tag bad">set, refused</span>` : `<span class="tag ok">set</span>`) : `<span class="tag">none</span>`}</div>
+      <div>controllers</div><div>${n.okN} of ${n.n} readable</div></div>
+      ${ctls.length ? `<h4>Controllers it holds</h4><table class="tbl"><tbody>${ctls.map((c) => `<tr><td><span class="dshape ${domainClass(c.domain)}"></span>${esc(c.label || c.key)}</td><td>${esc(c.verdict || "–")}</td></tr>`).join("")}</tbody></table>` : ""}
+      <div class="row" style="margin-top:12px"><button class="btn sm" id="dt-ctl-page">Manage the agentic MCP</button></div>`;
+    $("#dt-ctl-page").onclick = () => go("controllers");
   } else if (n.kind === "controller") {
     const c = n.c;
     title.textContent = c.label || c.key;
@@ -503,6 +598,7 @@ function renderDetail(id) {
     body.innerHTML = `${c.ok ? "" : `<div class="banner bad">Cannot be read: ${esc(c.error || "unknown")}</div>`}
       <div class="kv"><div>key</div><div class="mono">${esc(c.key)}</div><div>domain</div><div><span class="dshape ${domainClass(c.domain)}"></span>${esc(c.domain || "–")}</div>
       <div>family</div><div>${esc(c.family || "–")}</div><div>tools</div><div>${c.tools ?? "–"}</div><div>contract</div><div>${esc(c.verdict || "–")}</div>
+      <div>held by</div><div>the agentic MCP</div>
       <div>devices</div><div>${c.devices.length}${c.devices_total > c.devices.length ? ` shown of ${c.devices_total} (the map draws at most ${c.devices.length})` : ""}</div><div>links</div><div>${c.links.length} (${c.links.filter((l) => l.state === "down").length} down)</div></div>
       ${(c.gaps || []).length ? `<h4>Gaps</h4><div class="chips">${c.gaps.map((g) => `<span class="chip">${esc(g)}</span>`).join("")}</div>` : ""}
       ${verbs.length ? `<h4>Contract verbs it serves</h4><table class="tbl"><tbody>${verbs.map(([v, t]) => `<tr><td>${esc(v.replace(/_/g, " "))}</td><td class="mono">${esc(t)}</td></tr>`).join("")}</tbody></table>` : ""}
@@ -511,13 +607,13 @@ function renderDetail(id) {
     $("#dt-fold").onclick = () => { topo.open[n.id] = !topo.open[n.id]; store.set("canah.topo.open", topo.open); layout(); renderTopology(); renderDetail(id); fitTopology(); };
   } else if (n.kind === "sub") {
     const sd = n.sd || {}, u = state.activity?.used?.[n.label], on = activeAgents().has(n.label);
-    const ctl = (state.topology?.controllers || []).find((c) => c.key === n.label);
-    title.textContent = `${n.label} (subagent)`;
+    const ctl = sd.controller ? (state.topology?.controllers || []).find((c) => c.key === sd.controller) : null;
+    title.textContent = `${n.label} · ${AGENT_KIND[sd.kind] || "agent"}`;
     body.innerHTML = `<div class="kv"><div>status</div><div>${on ? `<span class="tag info">at work now</span>` : `<span class="tag">idle</span>`}</div>
       <div>tools</div><div>${sd.tools ?? "the main agent's"}</div><div>calls</div><div>${u ? `${u.calls} since the service started, last ${ago(u.last)}` : "none yet"}</div>
-      ${ctl ? `<div>controller</div><div>${esc(ctl.label)} (${esc(ctl.domain)})</div>` : ""}</div>
+      ${sd.controller ? `<div>works</div><div>${esc(ctl?.label || sd.controller)}${ctl ? ` (${esc(ctl.domain)})` : ""}, through the agentic MCP</div>` : ""}</div>
       <h4>What it does</h4><p class="muted" style="margin:0;font-size:12.5px">${esc(sd.description || "–")}</p>
-      <div class="row" style="margin-top:12px"><button class="btn sm" data-ask="${esc(`Ask the ${n.label} subagent: what can you do, and with which tools?`)}">Ask CANAH</button></div>`;
+      <div class="row" style="margin-top:12px"><button class="btn sm" data-ask="${esc(`Ask ${n.label}: what can you do, and with which tools?`)}">Ask CANAH</button></div>`;
   } else {
     const d = n.d, ls = topo.links.filter((l) => l.kind === "link" && (l.source === id || l.target === id));
     title.textContent = d.label || d.id;
@@ -531,21 +627,148 @@ function renderDetail(id) {
 
 /* ================= controllers ================= */
 async function renderControllers(refresh = false) {
-  loadKinds(); onboardAllowed();
+  loadKinds(); onboardAllowed(); renderConnection();
+  if (state.ctlTab === "contract") renderContract();
   try {
     const n = state.network = await api("/network");
     $("#ctl-src").textContent = n.url ? `agentic MCP at ${n.url}` : "";
     $("#ctl-banner").innerHTML = n.ok ? "" : `<div class="banner bad">The agentic MCP did not answer: ${esc(n.error)}</div>`;
     const topoBy = Object.fromEntries((state.topology?.controllers || []).map((c) => [c.key, c]));
     const rows = n.controllers || [];
-    $("#ctl-table").innerHTML = rows.length ? `<table class="tbl"><thead><tr><th>controller</th><th>domain</th><th>family</th><th class="num">tools</th><th>contract</th><th>read</th></tr></thead><tbody>
-      ${rows.map((c) => { const t = topoBy[c.key]; const readable = t ? t.ok : null; return `<tr class="click" data-key="${esc(c.key)}"><td><b>${esc(c.label || c.key)}</b><div class="faint mono" style="font-size:11px">${esc(c.key)}${c.base_url ? " · " + esc(c.base_url) : ""}</div></td>
-        <td><span class="dshape ${domainClass(c.domain)}"></span>${esc(c.domain || "–")}</td><td>${esc(c.family || "–")}</td><td class="num">${c.tools ?? "–"}</td>
-        <td><span class="tag ${/gap/.test(c.conformance?.verdict || "") ? "warn" : c.conformance?.verdict ? "ok" : ""}">${esc(c.conformance?.verdict || "–")}</span></td>
-        <td>${c.error ? `<span class="tag bad">error</span>` : readable === null ? `<span class="tag">–</span>` : readable ? `<span class="tag ok">${t.devices.length} devices</span>` : `<span class="tag bad" title="${esc(t.error || "")}">unreadable</span>`}</td></tr>`; }).join("")}</tbody></table>` : `<div class="empty">No controllers.</div>`;
-    $$("#ctl-table tr.click").forEach((tr) => tr.addEventListener("click", () => controllerDetail(tr.dataset.key)));
+    $("#ctl-count").textContent = rows.length;
+    const verdictTag = (v) => `<span class="tag ${/not/.test(v || "") ? "bad" : /gap/.test(v || "") ? "warn" : v ? "ok" : ""}">${esc(v || "–")}</span>`;
+    $("#ctl-table").innerHTML = rows.length ? `<table class="tbl ctl-tbl"><thead><tr><th>controller</th><th>domain</th><th class="num">tools</th><th>contract</th><th>readable</th></tr></thead><tbody>
+      ${rows.map((c) => { const t = topoBy[c.key]; const readable = t ? t.ok : null; const ag = agentFor(c.key); return `<tr class="click${state.ctlSel === c.key ? " sel" : ""}" data-key="${esc(c.key)}"><td><b>${esc(c.label || c.key)}</b><div class="faint mono cell-sub">${esc(c.key)}${c.base_url ? " · " + esc(c.base_url) : ""}</div></td>
+        <td><span class="dshape ${domainClass(c.domain)}"></span>${esc(c.domain || "–")}<div class="faint cell-sub">${esc(c.family || "")}</div></td><td class="num">${c.tools ?? "–"}</td>
+        <td>${verdictTag(c.conformance?.verdict)}</td>
+        <td>${c.error ? `<span class="tag bad">error</span>` : readable === null ? `<span class="tag">–</span>` : readable ? `<span class="tag ok">${t.devices.length} devices</span>` : `<span class="tag bad" title="${esc(t.error || "")}">unreadable</span>`}</td></tr>`; }).join("")}</tbody></table>` : `<div class="empty">No controllers. Add one under <b>Add controllers</b>.</div>`;
+    $$("#ctl-table tr.click").forEach((tr) => tr.addEventListener("click", () => { state.ctlSel = tr.dataset.key; $$("#ctl-table tr.sel").forEach((x) => x.classList.remove("sel")); tr.classList.add("sel"); controllerDetail(tr.dataset.key); }));
   } catch (e) { $("#ctl-banner").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
 }
+
+/* ---------- tabs ---------- */
+function ctlTab(name) {
+  state.ctlTab = name; store.set("canah.ctlTab", name);
+  $$("#ctl-tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  $$("#view-controllers .ctl-pane").forEach((p) => p.hidden = p.dataset.pane !== name);
+  if (name === "contract") renderContract();
+}
+$$("#ctl-tabs .tab").forEach((b) => b.addEventListener("click", () => ctlTab(b.dataset.tab)));
+ctlTab(store.get("canah.ctlTab", "held"));
+
+/* ---------- the agentic MCP: address, token ---------- */
+async function renderConnection(fresh) {
+  const root = levelRank(state.level) >= 2;
+  $$("#mcp-form input, #mcp-form button").forEach((x) => { if (x.id !== "mcp-test") x.disabled = !root; });
+  try {
+    const m = state.mcp = fresh || await api("/network/connection");
+    if (document.activeElement !== $("#mcp-url")) $("#mcp-url").value = m.url || "";
+    $("#mcp-token").placeholder = m.token_set ? "•••••••••• set: type a new one to replace it" : "the agentic MCP's AGENTIC_MCP_TOKEN";
+    const stat = (label, value, cls = "") => `<div class="mcp-stat"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`;
+    $("#mcp-stats").innerHTML = [
+      stat("Status", m.reachable ? "answering" : "not answering", m.reachable ? "ok" : "bad"),
+      stat("Controllers", m.controllers ?? "–"),
+      stat("Token", !m.token_set ? "none" : m.token_accepted === false ? "refused" : m.token_accepted ? "accepted" : "set",
+           !m.token_set ? "" : m.token_accepted === false ? "bad" : "ok"),
+      stat("Contract API", m.contract_api === false ? "not offered" : m.contract_api ? "yes" : "–", m.contract_api === false ? "warn" : ""),
+    ].join("");
+    $("#mcp-msg").textContent = root ? (m.error ? m.error : "") : "Sign in as root to change the address or token.";
+  } catch (e) { $("#mcp-stats").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+}
+$("#mcp-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {}; const url = $("#mcp-url").value.trim(), token = $("#mcp-token").value.trim();
+  if (url && url !== state.mcp?.url) body.url = url;
+  if (token) body.token = token;
+  if (!Object.keys(body).length) { $("#mcp-msg").textContent = "Nothing changed."; return; }
+  $("#mcp-save").disabled = true; $("#mcp-msg").textContent = "Connecting…";
+  try {
+    const r = await api("/network/connection", { method: "PUT", body });
+    $("#mcp-token").value = ""; await renderConnection(r);
+    $("#mcp-msg").innerHTML = r.token_accepted === false ? `<span class="tag bad">token refused</span> the agentic MCP did not accept it.`
+      : `<span class="tag ok">saved</span> ${r.reachable ? "connected." : "saved, but the agentic MCP is not answering."} <button class="btn sm" type="button" id="mcp-reload">Reload CANAH</button>`;
+    $("#mcp-reload")?.addEventListener("click", reloadAgent);
+    renderControllers(); loadTopology(true);
+  } catch (err) { $("#mcp-msg").innerHTML = `<span class="tag bad">failed</span> ${esc(err.message)}`; }
+  finally { $("#mcp-save").disabled = levelRank(state.level) < 2; }
+});
+$("#mcp-clear").addEventListener("click", async () => {
+  if (!confirm("Remove the agentic MCP token from CANAH? Writes and anything else that needs it will be refused until a token is set again.")) return;
+  try { const r = await api("/network/connection", { method: "PUT", body: { clear_token: true } }); await renderConnection(r); toast("Token removed.", "ok"); }
+  catch (e) { toast(e.message, "bad"); }
+});
+$("#mcp-test").addEventListener("click", async () => { $("#mcp-msg").textContent = "Testing…"; await renderConnection(); if (!$("#mcp-msg").textContent) $("#mcp-msg").innerHTML = `<span class="tag ${state.mcp?.reachable ? "ok" : "bad"}">${state.mcp?.reachable ? "answering" : "not answering"}</span>`; });
+
+/* ---------- the common contract ---------- */
+async function renderContract() {
+  const root = levelRank(state.level) >= 2, adm = levelRank(state.level) >= 1;
+  $("#contract-apply").disabled = !root; $("#contract-check").disabled = !adm;
+  try {
+    const r = await api("/network/contract");
+    const k = state.contract = r.contract || {};
+    $("#contract-ver").textContent = k.version != null ? `v${k.version}` : "";
+    $("#contract-file").textContent = r.file || "";
+    if (!$("#contract-edit").value || !state.contractEdited) $("#contract-edit").value = JSON.stringify(k, null, 1);
+    const doms = k.domains || [];
+    $("#contract-view").innerHTML = `<p class="muted" style="margin:0 0 10px;font-size:12.5px">${esc(k.about || "")}</p>
+      <div class="kv" style="margin-bottom:10px"><div>version</div><div>${esc(String(k.version ?? "–"))}</div><div>accepted when</div><div>${esc(k.accept || "–")}</div></div>
+      <table class="tbl"><thead><tr><th>part of the contract</th><th>required</th><th>verbs</th></tr></thead><tbody>
+      ${doms.map((d) => `<tr><td><b>${esc(d.name)}</b><div class="faint cell-sub">${esc(d.why || "")}</div></td><td>${d.required ? `<span class="tag info">required</span>` : `<span class="tag">optional</span>`}</td>
+        <td style="font-size:12px">${Object.entries(d.verbs || {}).map(([v, rule]) => `<span class="verb" title="${esc(rule.why || "")}">${esc(v.replace(/_/g, " "))}${rule.writes ? " ✎" : ""}</span>`).join(" ")}</td></tr>`).join("")}</tbody></table>
+      ${(r.controllers || []).length ? `<h4>Controllers under it</h4>${verdictTable(r.controllers)}` : ""}`;
+  } catch (e) {
+    $("#contract-view").innerHTML = `<div class="banner warn">The contract could not be read: ${esc(e.message)}. An agentic MCP from before the contract API (GET /contract) cannot show or change it here.</div>`;
+  }
+}
+function verdictTable(rows, before) {
+  const was = Object.fromEntries((before || []).map((x) => [x.key, x.verdict]));
+  return `<table class="tbl"><thead><tr><th>controller</th><th>verdict</th>${before ? "<th>now</th>" : ""}<th>gaps</th></tr></thead><tbody>${rows.map((x) => {
+    const tag = (v) => `<span class="tag ${/not/.test(v || "") ? "bad" : /gap/.test(v || "") ? "warn" : v ? "ok" : ""}">${esc(v || x.error || "–")}</span>`;
+    const moved = before && was[x.key] !== x.verdict;
+    return `<tr${moved ? ' class="moved"' : ""}><td><b>${esc(x.key)}</b></td><td>${tag(x.verdict)}</td>${before ? `<td>${tag(was[x.key])}</td>` : ""}<td class="faint" style="font-size:11.5px">${esc((x.gaps || []).slice(0, 4).join(", "))}${(x.gaps || []).length > 4 ? ` +${x.gaps.length - 4}` : ""}</td></tr>`; }).join("")}</tbody></table>`;
+}
+function editedContract() {
+  try { return JSON.parse($("#contract-edit").value); }
+  catch (e) { $("#contract-out").innerHTML = `<div class="banner bad">Not valid JSON: ${esc(e.message)}</div>`; return null; }
+}
+$("#contract-edit").addEventListener("input", () => { state.contractEdited = true; });
+$("#contract-check").addEventListener("click", async () => {
+  const k = editedContract(); if (!k) return;
+  $("#contract-out").innerHTML = `<span class="muted">Checking…</span>`;
+  try {
+    const [r, cur] = await Promise.all([api("/network/contract/check", { method: "POST", body: { contract: k } }), api("/network/contract")]);
+    $("#contract-out").innerHTML = r.ok ? `<div class="banner ok">The contract is valid. What each controller's verdict would be (current verdict beside it; changes highlighted):</div>${verdictTable(r.controllers, cur.controllers)}`
+      : `<div class="banner bad"><b>${r.problems.length} problem${r.problems.length > 1 ? "s" : ""}</b><ul style="margin:6px 0 0 18px;padding:0">${r.problems.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+  } catch (e) { $("#contract-out").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+});
+$("#contract-apply").addEventListener("click", async () => {
+  const k = editedContract(); if (!k) return;
+  if (!confirm(`Make this the common contract (version ${k.version})? Every controller is checked against it from now on; the agentic MCP keeps the current one as a backup.`)) return;
+  try {
+    const r = await api("/network/contract", { method: "PUT", body: { contract: k } });
+    state.contractEdited = false;
+    $("#contract-out").innerHTML = `<div class="banner ok">Applied: version ${esc(String(r.version))}, ${r.domains} parts, ${r.verbs} verbs${(r.added || []).length ? `; added ${esc(r.added.join(", "))}` : ""}${(r.removed || []).length ? `; removed ${esc(r.removed.join(", "))}` : ""}. Backup: <span class="mono">${esc(r.backup || "")}</span></div>${verdictTable(r.controllers || [])}`;
+    renderContract(); renderControllers(); loadTopology(true);
+  } catch (e) { $("#contract-out").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+});
+$("#contract-reset").addEventListener("click", () => { state.contractEdited = false; $("#contract-edit").value = JSON.stringify(state.contract || {}, null, 1); $("#contract-out").innerHTML = ""; });
+$("#contract-download").addEventListener("click", () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([$("#contract-edit").value], { type: "application/json" })); a.download = "contract.json"; a.click(); });
+$("#contract-file-in").addEventListener("change", async (e) => { const f = e.target.files[0]; if (!f) return; e.target.value = ""; $("#contract-edit").value = await f.text(); state.contractEdited = true; $("#contract-out").innerHTML = `<span class="muted">Loaded ${esc(f.name)}: Check it before you apply it.</span>`; });
+
+/* ---------- several controllers from one file ---------- */
+const SAMPLE = $("#onboard-card .sample")?.textContent || "";
+$("#ob-sample").addEventListener("click", () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([SAMPLE + "\n"], { type: "text/yaml" })); a.download = "controllers.yaml"; a.click(); });
+$("#ob-batch").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) return; e.target.value = "";
+  $("#ob-batch-out").innerHTML = `<span class="working"><span class="bars"><i></i><i></i><i></i></span>onboarding the controllers in ${esc(f.name)}…</span>`;
+  try {
+    const r = await api("/network/controllers/batch", { method: "POST", body: { name: f.name, content_base64: await fileB64(f) } });
+    $("#ob-batch-out").innerHTML = `<table class="tbl"><thead><tr><th>controller</th><th>result</th></tr></thead><tbody>${r.results.map((x) => `<tr><td class="mono">${esc(x.key)}</td><td>${x.ok ? `<span class="tag ok">onboarded</span> ${esc(x.verdict || "")}${x.gaps ? `, ${x.gaps} gaps` : ""}` : `<span class="tag bad">failed</span> <span class="faint">${esc(x.error)}</span>`}</td></tr>`).join("")}</tbody></table>
+      ${r.reload_needed ? `<div class="row" style="margin-top:8px"><button class="btn sm primary" type="button" id="ob-batch-reload">Reload CANAH to give them their agents</button></div>` : ""}`;
+    $("#ob-batch-reload")?.addEventListener("click", reloadAgent);
+    renderControllers(); loadTopology(true);
+  } catch (err) { $("#ob-batch-out").innerHTML = `<div class="banner bad">${esc(err.message)}</div>`; }
+});
 $("#ctl-refresh").addEventListener("click", () => { renderControllers(true); loadTopology(true); });
 
 let kindsAt = 0;
@@ -557,11 +780,13 @@ async function loadKinds() {
     const sel = $("#ob-kind"), cur = sel.value;
     sel.innerHTML = `<option value="">recognise it from its API</option>` + (k.kinds || []).map((x) => `<option value="${esc(x.kind)}" title="${esc(x.about || "")}">${esc(x.title || x.kind)} · ${esc(x.domain || "")}</option>`).join("");
     sel.value = cur;
+    $("#ob-kinds").innerHTML = (k.kinds || []).length ? `<span class="faint" style="font-size:12px;margin-right:4px">Kinds it knows:</span>` + k.kinds.map((x) => `<span class="chip" title="${esc(x.about || "")}">${esc(x.title || x.kind)}</span>`).join("") : "";
   } catch (e) { /* the list stays as it is */ }
 }
 function onboardAllowed() {
   const ok = levelRank(state.level) >= 1;
   $$("#onboard-form input, #onboard-form select, #onboard-form button, #onboard-card label.btn input, #ob-guide-kind").forEach((x) => x.disabled = !ok);
+  $$("#onboard-card label.btn").forEach((x) => x.classList.toggle("disabled", !ok));
   $("#ob-msg").textContent = ok ? "" : "Sign in as admin to onboard.";
   $("#ctl-reload").disabled = !ok;
 }
@@ -575,7 +800,7 @@ $("#onboard-form").addEventListener("submit", async (e) => {
     const m = r.onboarded || {}, conf = m.conformance || {};
     const problem = (m.api || {}).problem || m.kept;
     $("#ob-msg").innerHTML = problem ? `<span class="tag warn">seated, with a problem</span> ${esc(problem)}`
-      : `<span class="tag ok">onboarded</span> ${esc(m.label || body.key)}: contract ${esc(conf.verdict || "checked")}${(conf.gaps || []).length ? `, ${conf.gaps.length} gaps` : ""}. <button class="btn sm primary" type="button" id="ob-reload">Reload CANAH to give it a subagent</button>`;
+      : `<span class="tag ok">onboarded</span> ${esc(m.label || body.key)}: contract ${esc(conf.verdict || "checked")}${(conf.gaps || []).length ? `, ${conf.gaps.length} gaps` : ""}. <button class="btn sm primary" type="button" id="ob-reload">Reload CANAH to give it its agent</button>`;
     $("#ob-reload")?.addEventListener("click", reloadAgent);
     renderControllers(); loadTopology(true);
   } catch (err) { $("#ob-msg").innerHTML = `<span class="tag bad">failed</span> ${esc(err.message)}`; }
@@ -585,7 +810,7 @@ async function reloadAgent() {
   toast("Rebuilding the agent…");
   try {
     const r = await api("/admin/reload", { method: "POST" });
-    toast(`CANAH reloaded: ${r.tools} tools; subagents ${(r.subagents || []).join(", ")}.`, "ok");
+    toast(`CANAH reloaded: ${r.tools} tools; agents ${(r.subagents || []).join(", ")}.`, "ok");
     await refreshStatus(); renderControllers(); loadTopology(true);
   } catch (e) { toast(`Reload refused: ${e.message}`, "bad"); }
 }
@@ -616,7 +841,7 @@ function controllerDetail(key) {
       <div style="flex:1"></div><button class="btn sm danger" id="cd-remove" ${levelRank(state.level) >= 2 ? "" : "disabled title='root only'"}>Remove</button></div>`;
   $("#cd-remove").onclick = async () => {
     if (!confirm(`Remove ${c.label || key} from the agentic MCP? Its manifest and seat go; the controller itself is not touched.`)) return;
-    try { await api(`/network/controllers/${encodeURIComponent(key)}`, { method: "DELETE" }); toast(`${key} removed. Reload CANAH to drop its subagent.`, "ok"); renderControllers(); loadTopology(true); }
+    try { await api(`/network/controllers/${encodeURIComponent(key)}`, { method: "DELETE" }); toast(`${key} removed. Reload CANAH to drop its agent.`, "ok"); renderControllers(); loadTopology(true); }
     catch (e) { toast(e.message, "bad"); }
   };
   $("#cd-topo").onclick = () => { const id = `ctl:${key}`; topo.open[id] = true; store.set("canah.topo.open", topo.open); layout(); state.selected = id; go("topology"); renderDetail(id); fitTopology(); };
@@ -652,6 +877,33 @@ $("#threads-toggle").addEventListener("click", () => {
   $("#lg").classList.toggle("no-threads"); store.set("canah.threads-hidden", $("#lg").classList.contains("no-threads"));
 });
 if (store.get("canah.threads-hidden")) $("#lg").classList.add("no-threads");
+
+// The chat in one view: drag the border of the thread list or of the call flow to widen or narrow it (double-click
+// a border to put it back); the conversation keeps at least 420 px. Widths are remembered.
+(function wireSplits() {
+  const lg = $("#lg"); if (!lg) return;
+  const W = { tw: [180, 480, 260], fw: [260, 760, 380] };
+  const set = (k, v) => { const [lo, hi] = W[k]; v = Math.round(Math.min(hi, Math.max(lo, v))); lg.style.setProperty(`--${k}`, `${v}px`); return v; };
+  for (const k of ["tw", "fw"]) { const v = store.get(`canah.chat.${k}`); if (v) set(k, v); }
+  const mk = (k) => {
+    const h = document.createElement("div"); h.className = `lg-split ${k}`; h.title = "Drag to resize; double-click to reset";
+    h.setAttribute("role", "separator"); h.setAttribute("aria-orientation", "vertical"); lg.append(h);
+    h.addEventListener("dblclick", () => { lg.style.removeProperty(`--${k}`); store.del(`canah.chat.${k}`); });
+    h.addEventListener("pointerdown", (e) => {
+      e.preventDefault(); h.setPointerCapture(e.pointerId); document.body.classList.add("resizing");
+      const r = lg.getBoundingClientRect();
+      const move = (ev) => {
+        const other = parseFloat(getComputedStyle(lg).getPropertyValue(k === "tw" ? "--fw" : "--tw")) || W[k === "tw" ? "fw" : "tw"][2];
+        const room = r.width - 420 - (k === "tw" ? (document.body.classList.contains("side-hidden") ? 0 : other) : (lg.classList.contains("no-threads") ? 0 : other));
+        const want = k === "tw" ? ev.clientX - r.left : r.right - ev.clientX;
+        store.set(`canah.chat.${k}`, set(k, Math.min(want, room)));
+      };
+      const up = () => { h.removeEventListener("pointermove", move); h.removeEventListener("pointerup", up); document.body.classList.remove("resizing"); };
+      h.addEventListener("pointermove", move); h.addEventListener("pointerup", up);
+    });
+  };
+  mk("tw"); mk("fw");
+})();
 $("#hide-tools").addEventListener("change", (e) => { document.body.classList.toggle("hide-tools", e.target.checked); store.set("canah.hide-tools", e.target.checked); });
 if (store.get("canah.hide-tools")) { $("#hide-tools").checked = true; document.body.classList.add("hide-tools"); }
 
@@ -659,7 +911,36 @@ const SUGGEST = ["Which controllers do you hold, and are they healthy?", "Show m
   "What services are provisioned, and where?", "What can each controller do, by the common contract?"];
 const logoSrc = () => document.documentElement.dataset.theme === "light" ? "/static/logo-light.png" : "/static/logo-dark.png";
 const col = () => $("#messages");
-const scrollDown = () => { const s = $("#lg-scroll"); s.scrollTop = s.scrollHeight; };
+// The chat follows the answer as it is written only while the reader is at the bottom: scroll up to read
+// something earlier and it stays there, with a button back to the latest.
+const chatScroll = { stick: true };
+const scrollDown = (force = false) => {
+  const s = $("#lg-scroll"); if (!s) return;
+  if (force) chatScroll.stick = true;
+  if (chatScroll.stick) { s.scrollTop = s.scrollHeight; $("#jump-latest")?.classList.remove("show"); }
+  else $("#jump-latest")?.classList.add("show");
+};
+(function wireChatScroll() {
+  const s = $("#lg-scroll"); if (!s) return;
+  const btn = document.createElement("button"); btn.type = "button"; btn.id = "jump-latest"; btn.className = "jump-latest";
+  btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>Jump to latest`;
+  btn.addEventListener("click", () => scrollDown(true));
+  s.parentElement.append(btn);
+  s.addEventListener("scroll", () => {
+    const near = s.scrollHeight - s.scrollTop - s.clientHeight < 80;
+    chatScroll.stick = near; if (near) btn.classList.remove("show");
+  }, { passive: true });
+  // Copy a code block, or switch a diagram to its code and back (delegated: answers are re-drawn as they stream).
+  $("#messages").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-code-act]"); if (!b) return;
+    const box = b.closest(".code-box"), code = box?.querySelector("code")?.textContent || box?.dataset.src || "";
+    const act = b.dataset.codeAct;
+    if (act === "copy") { try { await navigator.clipboard.writeText(code); } catch (err) { const t = document.createElement("textarea"); t.value = code; document.body.append(t); t.select(); document.execCommand("copy"); t.remove(); }
+      b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1400); }
+    if (act === "toggle") { box.classList.toggle("show-code"); b.textContent = box.classList.contains("show-code") ? (box.classList.contains("folded") ? "Hide code" : "Diagram") : "Code"; }
+    if (act === "svg" || act === "png") downloadDiagram(box, act);
+  });
+})();
 function welcome() {
   return `<div class="welcome"><img src="${logoSrc()}" alt=""><h3>Controller Agnostic Network Agent Harness</h3>
     <p>Ask about any network the agentic MCP holds, attach a file for it to read, or ask for a change: it waits for your approval${state.level === "observer" ? " (sign in as admin or root to approve)" : ""}.</p></div>`;
@@ -672,33 +953,33 @@ async function openThread(id) {
   $("#suggest").innerHTML = SUGGEST.map((s) => `<button type="button">${esc(s)}</button>`).join("");
   $$("#suggest button").forEach((b) => b.addEventListener("click", () => { $("#composer").value = b.textContent; send(); }));
   renderAgentStrip();
-  if (!id) { box.innerHTML = welcome(); return; }
+  if (!id) { box.innerHTML = welcome(); showUsage(null); refreshGalleryButton(); return; }
   try {
     const h = await api(`/threads/${id}/history`);
+    showUsage(h.context ? { context: h.context } : null);
     if (!h.messages.length) box.innerHTML = welcome();
     let turn = null, asked = "";
-    const finish = (t) => { if (!t) return; t.flow.done = true; t.flow.ms = null; t.done(); };
+    const finish = (t) => { if (!t) return; t.flow.done = true; t.flow.ms = null; t.done(false); };
     for (const m of h.messages) {
       if (m.role === "user") { finish(turn); addUser(m.text); asked = String(m.text).split(ATT)[0]; turn = null; continue; }
       turn = turn || addAgent(asked);
       if (m.role === "tool") {
-        const c = turn.tool(m.name, m.args); if (m.result != null) turn.result(c, m.result);
-        const st = flowCall(turn.flow, m.name, m.args || {}); st.ms = null; turn.flow.open.pop(); st.result = m.result;
+        const c = turn.tool(m.name, m.args, false); if (m.result != null) turn.result(c, m.result, m.ms);
+        const st = flowCall(turn.flow, m.name, m.args || {}); st.ms = m.ms ?? null; turn.flow.open.pop(); st.result = m.result;
         if (st.to) turn.flow.delegating.pop();
       } else { turn.text(m.text); turn.flow.reply = m.text; }
     }
     finish(turn);
     if (turn) showFlow(turn);
     const p = await api(`/threads/${id}/pending`);
-    if (p.pending?.length) { const t = turn || addAgent(); showPending(t, p.pending); t.done(); }
+    if (p.pending?.length) { const t = turn || addAgent(); showPending(t, p.pending); t.done(false); }
   } catch (e) { box.innerHTML = welcome(); }
-  scrollDown();
+  scrollDown(true);
 }
 function renderAgentStrip(active = new Set()) {
-  const subs = state.info?.subagents || [];
-  const color = (s) => DOMAIN_COLOR[domainClass((state.topology?.controllers || []).find((c) => c.key === s)?.domain || "other")];
-  $("#agents-strip").innerHTML = [`<span class="agent-chip${active.has("main") ? " active" : ""}" style="--c:var(--accent)"><span class="dot"></span>CANAH</span>`,
-    ...subs.map((s) => `<span class="agent-chip${active.has(s) ? " active" : ""}" style="--c:${color(s)}"><span class="dot"></span>${esc(s)}</span>`)].join("");
+  const subs = agentsDetail();
+  $("#agents-strip").innerHTML = [`<span class="agent-chip${active.has("main") ? " active" : ""}" style="--c:var(--accent)" title="CANAH, the main agent"><span class="dot"></span>CANAH</span>`,
+    ...subs.map((s) => `<span class="agent-chip${active.has(s.name) ? " active" : ""}" style="--c:${agentColor(s.name)}" title="${esc(`${s.name} · ${AGENT_KIND[s.kind] || "agent"}${s.controller ? `: works ${s.label || s.controller} through the agentic MCP` : ""}`)}"><span class="dot"></span>${esc(s.name)}</span>`)].join("");
 }
 
 const ATT = "\n\n[attachments]\n";
@@ -709,7 +990,7 @@ function addUser(text) {
   const m = document.createElement("div"); m.className = "lg-user";
   m.innerHTML = `${files.length ? `<div class="lg-files">${files.map((f) => `<span class="fchip"><span class="nm"><i class="ficon"></i>${esc(f)}</span></span>`).join("")}</div>` : ""}<div class="b"></div>`;
   $(".b", m).textContent = words; if (!words.trim()) $(".b", m).remove();
-  box.append(m); scrollDown();
+  box.append(m); scrollDown(true);
 }
 function kvTable(obj) {
   const rows = Object.entries(obj || {});
@@ -720,8 +1001,9 @@ function kvTable(obj) {
 const AGENT_COLORS = ["#3d8bff", "#9b51c0", "#3dc46b", "#f6a52c", "#ff6b6b", "#89ddff", "#c792ea", "#f78c6c"];
 function agentColor(a) {
   if (a === "CANAH") return "var(--accent)";
-  const ctl = (state.topology?.controllers || []).find((c) => c.key === a);
+  const ck = ctlOfAgent(a), ctl = ck && (state.topology?.controllers || []).find((c) => c.key === ck);
   if (ctl) return DOMAIN_COLOR[domainClass(ctl.domain)];
+  if (ck) return DOMAIN_COLOR[domainClass(agentsDetail().find((x) => x.name === a)?.domain || "other")];
   const subs = state.info?.subagents || [];
   return AGENT_COLORS[(subs.indexOf(a) + 1) % AGENT_COLORS.length];
 }
@@ -729,10 +1011,9 @@ function newFlow(question) { return { question, steps: [], open: [], delegating:
 // Who took a step: a subagent when its tool carries the subagent's prefix (onos__…), or while a delegation to it
 // (task) is still open; CANAH otherwise.
 function flowCall(flow, name, args) {
-  const subs = state.info?.subagents || [];
   const prefix = String(name).split("__")[0];
   let agent = "CANAH";
-  if (String(name).includes("__") && subs.includes(prefix)) agent = prefix;
+  if (String(name).includes("__") && agentFor(prefix)) agent = agentFor(prefix);
   else if (flow.delegating.length && name !== "task") agent = flow.delegating[flow.delegating.length - 1];
   const step = { kind: name === "task" ? "delegate" : "call", agent, name, args, t: performance.now(), ms: null, result: null,
                  to: name === "task" ? (args?.subagent_type || "general-purpose") : null };
@@ -740,11 +1021,11 @@ function flowCall(flow, name, args) {
   flow.steps.push(step); flow.open.push(step);
   return step;
 }
-function flowResult(flow, name, content) {
+function flowResult(flow, name, content, ms) {
   const k = flow.open.findIndex((o) => o.name === name);
   const step = k >= 0 ? flow.open.splice(k, 1)[0] : null;
   if (!step) return;
-  step.ms = performance.now() - step.t; step.result = content;
+  step.ms = ms != null ? ms : performance.now() - step.t; step.result = content;
   if (step.to) { const i = flow.delegating.lastIndexOf(step.to); if (i >= 0) flow.delegating.splice(i, 1); }
 }
 const fmtDur = (ms) => ms == null ? "" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
@@ -778,33 +1059,100 @@ function renderFlow(turn) {
 }
 function showFlow(turn) { state.flowTurn = turn; renderFlow(turn); }
 
+// The context window and the KV cache, after each reply (canah/window.py).
+function showUsage(u) {
+  const el = $("#ctx-meter"); if (!el) return;
+  const c = u?.context, k = u?.kv_cache;
+  if (!c && !k) { el.hidden = true; return; }
+  const ctx = state.info?.context || {}, at = Math.round((ctx.compact_at || 0.85) * 100);
+  const pct = c?.percent;
+  el.hidden = false;
+  el.className = "ctx-meter" + (pct == null ? "" : pct >= at ? " full" : pct >= at * 0.75 ? " warn" : "");
+  const n = (x) => x == null ? "–" : Number(x).toLocaleString();
+  el.innerHTML = (pct != null ? `<span class="ctx-bar"><i style="width:${Math.min(100, pct)}%"></i><b style="left:${at}%"></b></span><span>context ${pct}%</span>` : "")
+    + (k ? `<span class="ctx-sep ctx-kv">·</span><span class="ctx-kv">KV cache ${k.exact ? "" : "≈"}${k.percent}%</span>` : "");
+  el.title = (c ? `Context window: ${n(c.used)} of ${n(c.window)} tokens (${pct}%). At ${at}% the older part of the conversation is summarised automatically; ask to compact (or type /compact) to do it sooner.` : "")
+    + (k ? `\nKV cache this turn: ${n(k.cached_tokens)} of ${n(k.prompt_tokens)} prompt tokens reused rather than read again${k.exact ? "" : " (estimated from Ollama's reading time)"}.` : "");
+  if (u?.compacted) toast("The conversation was compacted: the older part is summarised, the recent part kept as it is.", "info");
+}
+
+// What CANAH is doing, in words, while it works: the tool it is waiting on, or a thought between steps.
+const THINKING = ["Thinking", "Reading the question", "Working out the next step", "Weighing what it found", "Putting the answer together"];
+function doingWhat(name, args) {
+  const n = String(name || ""), sub = n === "task" ? args?.subagent_type : agentFor(n.split("__")[0]);
+  if (n === "task") return `Asking ${sub || "a subagent"}`;
+  if (/^search_knowledge|^research_knowledge/.test(n)) return "Searching the documents";
+  if (/^twin_predict/.test(n)) return `Rehearsing it in ${twinLabel(state.twin) || "the digital twin"}`;
+  if (/^twin_check_write/.test(n)) return `Checking the change in ${twinLabel(state.twin) || "the digital twin"} before it is sent`;
+  if (/^twin_/.test(n)) return `Asking ${twinLabel(state.twin) || "the digital twin"} (digital twin)`;
+  if (/^net_/.test(n)) { const v = n.slice(4).replace(/_/g, " "); return args?.controller ? `${v[0].toUpperCase() + v.slice(1)} on ${args.controller}, through the agentic MCP` : `${v[0].toUpperCase() + v.slice(1)} on every controller that serves it`; }
+  if (n === "controller_read" || n === "controller_write") return `${n === "controller_write" ? "Changing" : "Reading"} ${args?.controller || "a controller"} (${args?.tool || "a tool"}) through the agentic MCP`;
+  if (n === "network_tools") return "Looking up the controllers' tools";
+  if (/^network_|follow_relations/.test(n)) return "Reading the networks through the agentic MCP";
+  if (n.includes("__")) return `${sub || n.split("__")[0]} is working ${n.split("__")[0]} through the agentic MCP`;
+  if (n === "execute") return "Running a command in the sandbox";
+  return `Running ${n}`;
+}
 function addAgent(question = "") {
   const box = col(); $(".welcome", box)?.remove();
   const m = document.createElement("div"); m.className = "lg-ai";
-  m.innerHTML = `<div class="av"><img src="${logoSrc()}" alt=""></div><div class="segs"><div class="working"><span class="bars"><i></i><i></i><i></i></span>reading the network…</div></div>`;
-  box.append(m); scrollDown();
+  m.innerHTML = `<div class="av"><img src="${logoSrc()}" alt=""></div><div class="segs"></div>`;
+  box.append(m);
   const segs = $(".segs", m);
   let last = null;                                     // the text segment the tokens go into
   const working = () => $(".working", segs);
+  const t0 = performance.now();
+  const timing = { t0, first: null, end: null, tools: 0 };
+  const running = new Set();                           // tool cards whose result has not come back
+  let phrase = 0, since = t0, label = "";
+  // One status line at the end: what CANAH is doing and for how long, live.
+  const think = (what) => {
+    working()?.remove();
+    const w = document.createElement("div"); w.className = "working";
+    label = what || ""; since = performance.now(); phrase = 0;
+    w.innerHTML = `<span class="bars"><i></i><i></i><i></i></span><span class="w-what"></span><span class="w-t"></span>`;
+    segs.append(w); paint(); scrollDown();
+  };
+  const paint = () => {
+    const w = working(); const now = performance.now();
+    if (w) {
+      const txt = label || THINKING[Math.floor((now - since) / 2600) % THINKING.length];
+      $(".w-what", w).textContent = `${txt}…`;
+      $(".w-t", w).textContent = fmtDur(now - since);
+    }
+    for (const c of running) { const l = $(".lat", c); if (l) l.textContent = fmtDur(now - c._t0); }
+  };
+  const tick = setInterval(paint, 100);
+  think("");
   const turn = {
-    el: m, segs, raw: "", flow: newFlow(question),
-    token(t) { working()?.remove(); if (!last) { last = document.createElement("div"); last.className = "reply-rich"; last._raw = ""; segs.append(last); } last._raw += t; last.innerHTML = md(last._raw); scrollDown(); },
-    text(t) { if (!t) return; working()?.remove(); last = document.createElement("div"); last.className = "reply-rich"; last._raw = t; last.innerHTML = md(t); segs.append(last); },
+    el: m, segs, raw: "", flow: newFlow(question), timing,
+    token(t) { if (timing.first == null) timing.first = performance.now() - t0; working()?.remove(); if (!last) { last = document.createElement("div"); last.className = "reply-rich"; last._raw = ""; segs.append(last); } last._raw += t; last.innerHTML = md(last._raw); scrollDown(); },
+    text(t) { if (!t) return; working()?.remove(); last = document.createElement("div"); last.className = "reply-rich"; last._raw = t; last.innerHTML = md(t); segs.append(last); drawDiagrams(last); },
     final(t) {     // the reply as the agent ended it: replaces what streamed after the last tool card
       working()?.remove();
       if (!t) return;
       if (last && last.parentNode === segs && segs.lastElementChild === last) { last._raw = t; last.innerHTML = md(t); }
       else turn.text(t);
+      drawDiagrams(segs);
     },
-    tool(name, args) {
+    tool(name, args, live = true) {
       working()?.remove(); last = null;
       const write = (state.info?.interrupt_on || []).includes(name);
       const c = document.createElement("div"); c.className = `lg-tool${write ? " write" : ""}`;
-      c.innerHTML = `<div class="lg-tool-h"><span class="n">${esc(name)}</span><span class="k">${write ? "change" : "tool call"}</span><span class="st"><span class="dot busy"></span></span></div>${kvTable(args)}`;
-      segs.append(c); scrollDown(); return c;
+      const by = name === "task" ? "" : args?.controller ? `on ${args.controller}` : (String(name).includes("__") ? agentFor(String(name).split("__")[0]) : "");
+      c.innerHTML = `<div class="lg-tool-h"><span class="n">${esc(name)}</span><span class="k">${write ? `change${by ? " " + esc(by) : ""}` : name === "task" ? `delegated to ${esc(args?.subagent_type || "an agent")}` : by ? esc(by.startsWith("on ") ? by : `by ${by}`) : "tool call"}</span><span class="lat" title="how long it took"></span><span class="st">${live ? `<span class="dot busy"></span>` : ""}</span></div>${kvTable(args)}`;
+      segs.append(c);
+      if (live) { c._t0 = performance.now(); running.add(c); timing.tools += 1; think(doingWhat(name, args)); }
+      scrollDown(); return c;
     },
-    result(c, content) {
+    result(c, content, ms) {
       if (!c) return;
+      if ($(".n", c)?.textContent === "draw_diagram") {
+        try { const j = JSON.parse(content); if (j.ok && DG_ID.test(j.id)) (turn.diagrams = turn.diagrams || []).push({ id: j.id, title: j.title || "" }); } catch (e) { /* not a picture */ }
+      }
+      if (running.has(c)) { running.delete(c); c._ms = ms != null ? ms : performance.now() - c._t0; }
+      else if (ms != null) c._ms = ms;
+      const lat = $(".lat", c); if (lat) { lat.textContent = c._ms != null ? fmtDur(c._ms) : ""; lat.classList.toggle("slow", (c._ms || 0) > 5000); }
       $(".st", c).innerHTML = /^error/i.test(String(content)) ? `<span class="tag bad">error</span>` : `<span class="tag ok">done</span>`;
       const r = document.createElement("div"); r.className = "lg-res";
       let body; try { const j = JSON.parse(content); body = j && typeof j === "object" && !Array.isArray(j) && Object.keys(j).length <= 14 ? kvTable(j) : `<pre>${esc(JSON.stringify(j, null, 2))}</pre>`; }
@@ -813,12 +1161,21 @@ function addAgent(question = "") {
       r.innerHTML = `<div class="h">tool result${long ? `<button type="button">Expand</button>` : ""}</div>${body}`;
       if (long) $("button", r).addEventListener("click", (e) => { r.classList.toggle("open"); e.target.textContent = r.classList.contains("open") ? "Collapse" : "Expand"; });
       c.append(r);
+      if (c._t0 != null && !running.size) think(`Reading what ${$(".n", c)?.textContent || "the tool"} returned`);
     },
-    done() {
-      working()?.remove();
+    done(live = true) {
+      clearInterval(tick); working()?.remove();
+      const missing = (turn.diagrams || []).filter((d) => !segs.querySelector(`.dg-fig[data-dg="${d.id}"]`));
+      if (missing.length) {
+        const div = document.createElement("div"); div.className = "reply-rich"; div.innerHTML = missing.map((d) => dgFigure(d.id, d.title)).join("");
+        segs.append(div); drawDiagrams(segs);
+      }
+      refreshGalleryButton();
+      if (live && timing.end == null) timing.end = performance.now() - t0;
       if (!$(".acts", segs)) {
         const a = document.createElement("div"); a.className = "acts";
-        a.innerHTML = `<button type="button" title="Copy the answer">Copy</button>`;
+        const lat = live && timing.end != null ? `<span class="lat-final" title="from your message to the end of the answer">answered in ${fmtDur(timing.end)}${timing.first != null ? ` · first words after ${fmtDur(timing.first)}` : ""}${timing.tools ? ` · ${timing.tools} tool call${timing.tools > 1 ? "s" : ""}` : ""}</span>` : "";
+        a.innerHTML = `<button type="button" title="Copy the answer">Copy</button>${lat}`;
         $("button", a).addEventListener("click", () => { navigator.clipboard?.writeText($$(".reply-rich", segs).map((x) => x._raw || x.textContent).join("\n\n")); toast("Copied.", "ok"); });
         segs.append(a);
       }
@@ -847,18 +1204,21 @@ async function stream(path, body, turn) {
         const d = JSON.parse(data);
         if (ev === "token") turn.token(d.text);
         else if (ev === "tool_call") {
-          const sub = d.name === "task" ? d.args?.subagent_type : String(d.name).split("__")[0];
+          const sub = d.name === "task" ? d.args?.subagent_type : agentFor(String(d.name).split("__")[0]);
+          if (/^net_|^controller_|^network_|follow_relations/.test(d.name)) active.add(d.args?.controller ? `ctl:${d.args.controller}` : "mcp");
+          if (/^twin_/.test(d.name)) active.add("twin");
           if (sub && (state.info?.subagents || []).includes(sub)) active.add(sub);
           renderAgentStrip(active); noteActivity(active);
           open.push({ name: d.name, card: turn.tool(d.name, d.args || {}) });
           flowCall(turn.flow, d.name, d.args || {}); renderFlow(turn);
         } else if (ev === "tool_result") {
           const k = open.findIndex((o) => o.name === d.name); const o = k >= 0 ? open.splice(k, 1)[0] : open.shift();
-          turn.result(o?.card, d.content);
-          flowResult(turn.flow, d.name, d.content); renderFlow(turn);
+          turn.result(o?.card, d.content, d.ms);
+          flowResult(turn.flow, d.name, d.content, d.ms); renderFlow(turn);
         } else if (ev === "reply") {
           if (d.thread_id && !state.chat.thread) state.chat.thread = d.thread_id;
           turn.final(d.text || "");
+          showUsage(d.usage);
           turn.flow.reply = d.text || ""; turn.flow.pending = d.pending || [];
           if (d.pending?.length) showPending(turn, d.pending);
         } else if (ev === "error") { turn.text(`**Error:** ${d.error}`); turn.flow.error = d.error; }
@@ -960,10 +1320,18 @@ const levelRank = (l) => ({ observer: 0, admin: 1, root: 2 }[l] ?? 0);
 function md(src) {
   const lines = String(src).replace(/\r/g, "").split("\n"); const out = []; let i = 0;
   const inline = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*(.+?)\*\*(?!\*)/g, "<b>$1</b>").replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, "$1<i>$2</i>")
+    .replace(/!?\[([^\]]*)\]\(\/diagrams\/([0-9a-f]{16})\.(?:png|svg)\)/g, (m0, t, id) => dgFigure(id, t.replace(/\s*\((?:PNG|SVG)\)\s*$/i, "")))
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   while (i < lines.length) {
     const l = lines[i];
-    if (/^```/.test(l)) { const buf = []; i++; while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]); i++; out.push(`<pre>${esc(buf.join("\n"))}</pre>`); continue; }
+    if (/^\s*```/.test(l)) {
+      const lang = (l.trim().slice(3).trim().split(/\s+/)[0] || "").toLowerCase();
+      const buf = []; i++; while (i < lines.length && !/^\s*```/.test(lines[i])) buf.push(lines[i++]);
+      const closed = i < lines.length; i++;
+      const code = buf.join("\n");
+      out.push(`<div class="code-box${lang === "mermaid" ? " mermaid-box" : ""}"${closed ? "" : ' data-open="1"'} data-lang="${esc(lang)}"><div class="code-h"><span class="lang">${esc(lang || "code")}</span><span class="sp"></span>${lang === "mermaid" ? `<button type="button" data-code-act="toggle" hidden>Code</button><button type="button" data-code-act="svg" hidden>SVG</button><button type="button" data-code-act="png" hidden>PNG</button>` : ""}<button type="button" data-code-act="copy">Copy</button></div><pre><code>${esc(code)}</code></pre></div>`);
+      continue;
+    }
     if (/^\s*\|.*\|\s*$/.test(l) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] || "")) {
       const row = (r) => r.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
       const head = row(l); i += 2; const body = [];
@@ -972,7 +1340,17 @@ function md(src) {
     }
     const h = l.match(/^(#{1,4})\s+(.*)$/); if (h) { out.push(`<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`); i++; continue; }
     if (/^\s*[-*•]\s+/.test(l)) { const it = []; while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) it.push(lines[i++].replace(/^\s*[-*•]\s+/, "")); out.push(`<ul>${it.map((x) => `<li>${inline(x)}</li>`).join("")}</ul>`); continue; }
-    if (/^\s*\d+[.)]\s+/.test(l)) { const it = []; while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) it.push(lines[i++].replace(/^\s*\d+[.)]\s+/, "")); out.push(`<ol>${it.map((x) => `<li>${inline(x)}</li>`).join("")}</ol>`); continue; }
+    if (/^\s*\d+[.)]\s+/.test(l)) {
+      // One list across blank lines and indented lines under an item; it starts at the number written.
+      const start = parseInt(l.trim(), 10) || 1; const it = [];
+      while (i < lines.length) {
+        if (/^\s*\d+[.)]\s+/.test(lines[i])) { it.push([lines[i++].replace(/^\s*\d+[.)]\s+/, "")]); continue; }
+        if (it.length && /^\s{2,}\S/.test(lines[i])) { it[it.length - 1].push(lines[i++].trim().replace(/^[-*•]\s+/, "• ")); continue; }
+        if (!lines[i].trim() && /^\s*\d+[.)]\s+/.test(lines.slice(i + 1).find((x) => x.trim()) || "")) { i++; continue; }
+        break;
+      }
+      out.push(`<ol${start !== 1 ? ` start="${start}"` : ""}>${it.map((x) => `<li>${x.map(inline).join("<br>")}</li>`).join("")}</ol>`); continue;
+    }
     if (!l.trim()) { i++; continue; }
     const p = []; while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|```|\s*[-*•]\s|\s*\d+[.)]\s|\s*\|)/.test(lines[i])) p.push(lines[i++]);
     if (!p.length) p.push(lines[i++]);
@@ -980,6 +1358,187 @@ function md(src) {
   }
   return out.join("");
 }
+
+/* ---------- the pictures CANAH draws (draw_diagram): in the answer, in the thread's gallery, open to change ---------- */
+const DG_ID = /^[0-9a-f]{16}$/;
+function dgFigure(id, title) {
+  if (!DG_ID.test(id)) return "";
+  const t = esc(title || "Diagram");
+  return `<figure class="dg-fig" data-dg="${id}" data-title="${t}"><button type="button" class="dg-img" data-dg-act="open" title="Open"><img src="/diagrams/${id}.png" alt="${t}" loading="lazy"></button>
+    <figcaption><span class="t">${t}</span><span class="sp"></span><button type="button" data-dg-act="open">Open</button><a href="/diagrams/${id}.png" download="${id}.png">PNG</a><a href="/diagrams/${id}.svg" download="${id}.svg">SVG</a><button type="button" class="chg" data-dg-act="change">Suggest a change</button></figcaption></figure>`;
+}
+function threadDiagrams() {
+  const seen = new Map();
+  $$("#messages .dg-fig").forEach((f) => { if (!seen.has(f.dataset.dg)) seen.set(f.dataset.dg, f.dataset.title || "Diagram"); });
+  return [...seen].map(([id, title]) => ({ id, title }));
+}
+function refreshGalleryButton() {
+  const n = threadDiagrams().length, b = $("#dg-gallery-btn"); if (!b) return;
+  b.hidden = !n; $(".n", b).textContent = n;
+}
+function suggestChange(id, title) {
+  go("chat"); closeLightbox();
+  const c = $("#composer"); c.value = `Change diagram ${id} ("${title}"): `; c.focus(); c.setSelectionRange(c.value.length, c.value.length);
+  c.dispatchEvent(new Event("input"));
+}
+function lightbox(id, title) {
+  let lb = $("#dg-lightbox");
+  if (!lb) {
+    lb = document.createElement("div"); lb.id = "dg-lightbox"; lb.className = "dg-lightbox"; lb.hidden = true;
+    lb.innerHTML = `<div class="dg-lb-card" role="dialog" aria-modal="true"><div class="dg-lb-h"><b class="t"></b><span class="faint mono id"></span><span class="sp"></span>
+      <a class="btn sm png" download>PNG</a><a class="btn sm svg" download>SVG</a><button type="button" class="btn sm primary chg">Suggest a change</button><button type="button" class="btn sm ghost x" aria-label="Close">✕</button></div>
+      <div class="dg-lb-body"><img alt=""></div><div class="dg-lb-strip"></div></div>`;
+    document.body.append(lb);
+    lb.addEventListener("click", (e) => { if (e.target === lb || e.target.closest(".x")) closeLightbox(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !lb.hidden) closeLightbox(); });
+    $(".chg", lb).addEventListener("click", () => suggestChange(lb.dataset.id, lb.dataset.title));
+  }
+  const all = threadDiagrams();
+  lb.dataset.id = id; lb.dataset.title = title;
+  $(".t", lb).textContent = title || "Diagram"; $(".id", lb).textContent = id;
+  $("img", lb).src = `/diagrams/${id}.png`; $("img", lb).alt = title || "";
+  $(".png", lb).href = `/diagrams/${id}.png`; $(".svg", lb).href = `/diagrams/${id}.svg`;
+  $(".dg-lb-strip", lb).innerHTML = all.length > 1 ? all.map((d) => `<button type="button" class="${d.id === id ? "on" : ""}" data-id="${d.id}" data-title="${esc(d.title)}" title="${esc(d.title)}"><img src="/diagrams/${d.id}.png" alt=""></button>`).join("") : "";
+  $$(".dg-lb-strip button", lb).forEach((b) => b.addEventListener("click", () => lightbox(b.dataset.id, b.dataset.title)));
+  lb.hidden = false;
+}
+function closeLightbox() { const lb = $("#dg-lightbox"); if (lb) lb.hidden = true; }
+(function wireDiagrams() {
+  $("#messages").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-dg-act]"); if (!b) return;
+    const f = b.closest(".dg-fig"); if (!f) return;
+    if (b.dataset.dgAct === "open") lightbox(f.dataset.dg, f.dataset.title);
+    if (b.dataset.dgAct === "change") suggestChange(f.dataset.dg, f.dataset.title);
+  });
+  const head = $(".lg-head"); if (!head) return;
+  const btn = document.createElement("button"); btn.type = "button"; btn.id = "dg-gallery-btn"; btn.className = "btn sm ghost dg-gallery-btn"; btn.hidden = true;
+  btn.title = "The pictures in this conversation";
+  btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Images <span class="n">0</span>`;
+  btn.addEventListener("click", () => { const all = threadDiagrams(); if (all.length) lightbox(all[all.length - 1].id, all[all.length - 1].title); });
+  head.append(btn);
+})();
+
+/* ---------- diagrams: a ```mermaid block is drawn (mermaid.js, served by CANAH itself) ---------- */
+let mermaidReady = null;
+function loadMermaid() {
+  if (mermaidReady) return mermaidReady;
+  mermaidReady = new Promise((res, rej) => {
+    const sc = document.createElement("script"); sc.src = "/static/vendor/mermaid.min.js";
+    sc.onload = () => { try { window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "default", fontFamily: "inherit", themeVariables: { fontSize: "14px" } }); res(window.mermaid); } catch (e) { rej(e); } };
+    sc.onerror = () => { mermaidReady = null; rej(new Error("mermaid.js is not installed (start.sh fetches it into canah/static/vendor)")); };
+    document.head.append(sc);
+  });
+  return mermaidReady;
+}
+let mermaidN = 0;
+async function drawDiagrams(root) {
+  refreshGalleryButton();
+  const boxes = [...(root || document).querySelectorAll(".mermaid-box:not([data-open]):not(.drawn)")];
+  if (!boxes.length) return;
+  if ((root || document).querySelector(".dg-fig")) {
+    // The drawn picture is in the answer: the text stays as code, folded, not drawn a second time.
+    boxes.forEach((box) => { box.classList.add("drawn", "folded"); const t = box.querySelector("[data-code-act=toggle]"); if (t) { t.hidden = false; t.textContent = "Code"; } });
+    return;
+  }
+  let mm; try { mm = await loadMermaid(); } catch (e) { boxes.forEach((b) => b.classList.add("drawn")); return; }
+  for (const box of boxes) {
+    box.classList.add("drawn");
+    const src = box.querySelector("code").textContent; box.dataset.src = src;
+    try {
+      const { svg } = await mm.render(`mmd-${Date.now()}-${mermaidN++}`, src);
+      const fig = document.createElement("div"); fig.className = "diagram"; fig.innerHTML = svg;
+      box.querySelector(".code-h").after(fig);
+      box.querySelectorAll("[data-code-act=toggle], [data-code-act=svg], [data-code-act=png]").forEach((b) => b.hidden = false);
+    } catch (e) {
+      const err = document.createElement("div"); err.className = "diagram-err"; err.textContent = `The diagram could not be drawn: ${String(e.message || e).split("\n")[0]}`;
+      box.querySelector(".code-h").after(err);
+    }
+  }
+}
+function downloadDiagram(box, kind) {
+  const svg = box.querySelector(".diagram svg"); if (!svg) return;
+  const xml = new XMLSerializer().serializeToString(svg);
+  const name = `canah-diagram-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
+  const save = (href, ext) => { const a = document.createElement("a"); a.href = href; a.download = `${name}.${ext}`; a.click(); };
+  if (kind === "svg") { save(URL.createObjectURL(new Blob([xml], { type: "image/svg+xml" })), "svg"); return; }
+  const img = new Image(), r = svg.getBoundingClientRect(), scale = 2;
+  img.onload = () => {
+    const c = document.createElement("canvas"); c.width = Math.ceil(r.width * scale); c.height = Math.ceil(r.height * scale);
+    const g = c.getContext("2d"); g.fillStyle = getComputedStyle(document.body).getPropertyValue("--panel") || "#fff"; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(img, 0, 0, c.width, c.height); save(c.toDataURL("image/png"), "png");
+  };
+  img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(xml)));
+}
+
+/* ================= the model ================= */
+async function renderModel() {
+  const root = levelRank(state.level) >= 2;
+  let m;
+  try { m = state.modelInfo = await api("/admin/model"); }
+  catch (e) { $("#md-banner").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  $("#md-banner").innerHTML = m.env_override ? `<div class="banner warn">CANAH_MODEL is set in the environment (<span class="mono">${esc(m.env_override)}</span>): it wins over the choice made here.</div>` : "";
+  const cur = m.current?.model || "–", [prov, ...rest] = cur.split(":"), name = rest.join(":");
+  $("#md-current").innerHTML = `<div class="md-cur"><div class="md-ico">${prov === "ollama" ? "◉" : "☁"}</div><div><div class="eyebrow">CANAH runs on</div>
+      <h3 class="mono">${esc(name || cur)}</h3><div class="faint">${esc(prov)}${m.context?.window ? ` · context window ${Number(m.context.window).toLocaleString()} tokens, compacted at ${Math.round((m.context.compact_at || 0.85) * 100)}%` : ""}${m.choice ? " · chosen on this page" : " · from canah/models.py"}</div></div>
+      <div class="spacer"></div>${m.choice ? `<button class="btn sm" id="md-reset" ${root ? "" : "disabled title='root'"}>Back to the default in canah/models.py</button>` : ""}</div>`;
+  $("#md-reset")?.addEventListener("click", async () => {
+    if (!confirm("Go back to the model in canah/models.py?")) return;
+    try { await api("/admin/model", { method: "PUT", body: { reset: true } }); toast("Back to the default model.", "ok"); await refreshStatus(); renderModel(); } catch (e) { toast(e.message, "bad"); }
+  });
+  // Ollama's models
+  $("#md-ollama-url").textContent = m.ollama?.url || "";
+  const om = (m.ollama?.models || []).filter((x) => !x.embedding);
+  $("#md-ollama").innerHTML = m.ollama?.error ? `<div class="banner bad" style="margin:12px">Ollama did not answer: ${esc(m.ollama.error)}</div>`
+    : om.length ? `<table class="tbl"><thead><tr><th>model</th><th>size</th><th>state</th><th></th></tr></thead><tbody>${om.map((x) => {
+      const using = prov === "ollama" && name === x.name;
+      return `<tr${using ? ' class="sel"' : ""}><td><b class="mono">${esc(x.name)}</b><div class="faint cell-sub">${esc([x.family, x.params, x.quant].filter(Boolean).join(" · "))}</div></td>
+        <td class="num">${x.size_gb} GB</td><td>${x.loaded ? `<span class="tag ok">in memory</span>` : `<span class="tag">on disk</span>`}</td>
+        <td style="text-align:right">${using ? `<span class="tag info">in use</span>` : `<button class="btn sm" data-ollama="${esc(x.name)}" ${root ? "" : "disabled title='root'"}>Use</button>`}</td></tr>`; }).join("")}</tbody></table>`
+    : `<div class="empty">Ollama has no chat models: <span class="mono">ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M</span></div>`;
+  $$("[data-ollama]").forEach((b) => b.addEventListener("click", () => useModel({ provider: "ollama", model: b.dataset.ollama, num_ctx: Number($("#md-ctx").value) }, b)));
+  // other providers
+  const sel = $("#md-provider"), keep = sel.value;
+  sel.innerHTML = m.providers.filter((x) => x.id !== "ollama").map((x) => `<option value="${esc(x.id)}">${esc(x.title)}${x.installed ? "" : " (not installed)"}</option>`).join("");
+  if (keep) sel.value = keep; else if (prov !== "ollama" && m.providers.some((x) => x.id === prov)) sel.value = prov;
+  providerChanged();
+  $$("#md-form input, #md-form select, #md-form button, #md-ctx").forEach((x) => x.disabled = !root);
+  if (!root) $("#md-msg").textContent = "Sign in as root to change the model.";
+}
+function providerChanged() {
+  const m = state.modelInfo; if (!m) return;
+  const pv = m.providers.find((x) => x.id === $("#md-provider").value) || {};
+  $("#md-examples").innerHTML = (pv.examples || []).map((x) => `<option value="${esc(x)}">`).join("");
+  $("#md-model").placeholder = pv.examples?.[0] ? `e.g. ${pv.examples[0]}` : "the model's name";
+  $$(".md-base").forEach((x) => x.hidden = !pv.base_url);
+  $("#md-key").placeholder = pv.key_set ? "•••••••••• set: paste a new one to replace it" : "paste the key";
+  $("#md-key-note").innerHTML = !pv.installed ? `Not installed here: <span class="mono">.venv/bin/pip install ${esc(pv.pip)}</span>, then restart CANAH.`
+    : `The key is kept on CANAH's host, readable by CANAH's user only, never shown again${pv.key_env ? ` (it is used as <span class="mono">${esc(pv.key_env)}</span>)` : ""}.`;
+  $("#md-key-drop").hidden = !pv.key_on_page;
+}
+$("#md-provider").addEventListener("change", providerChanged);
+$("#md-refresh").addEventListener("click", renderModel);
+async function useModel(body, btn) {
+  const was = btn?.textContent; if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+  $("#md-msg").textContent = `Trying ${body.model}…`;
+  try {
+    const r = await api("/admin/model", { method: "PUT", body });
+    toast(`CANAH now runs on ${r.current?.model} (it answered in ${r.test?.seconds} s).`, "ok");
+    $("#md-msg").innerHTML = `<span class="tag ok">in use</span> answered in ${r.test?.seconds} s`; $("#md-key").value = "";
+    await refreshStatus(); renderModel();
+  } catch (e) { $("#md-msg").innerHTML = `<span class="tag bad">not changed</span> ${esc(e.message)}`; toast(e.message, "bad"); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = was; } }
+}
+$("#md-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const body = { provider: $("#md-provider").value, model: $("#md-model").value.trim(), base_url: $("#md-base").value.trim() };
+  if ($("#md-key").value.trim()) body.api_key = $("#md-key").value.trim();
+  useModel(body, $("#md-go"));
+});
+$("#md-key-drop").addEventListener("click", async () => {
+  const pv = $("#md-provider").value;
+  if (!confirm(`Remove the stored API key for ${pv}?`)) return;
+  try { await api(`/admin/keys/${encodeURIComponent(pv)}`, { method: "DELETE" }); toast("Key removed.", "ok"); renderModel(); } catch (e) { toast(e.message, "bad"); }
+});
 
 /* ================= approvals & audit ================= */
 async function refreshPendingBadge() {
@@ -1005,6 +1564,8 @@ async function renderOps() {
     $("#ops-kpis").innerHTML = [k("Waiting", rows.length, "changes in your conversations", rows.length ? "warn" : "ok"),
       k("Requests · 24 h", m.requests ?? 0, m.requests ? `median ${m.median_seconds} s · p95 ${m.p95_seconds} s` : "none yet"),
       k("Tool calls · 24 h", m.tool_calls ?? 0, `${m.model_calls ?? 0} model calls`),
+      k("KV cache · 24 h", m.kv_cache_percent != null ? `${m.kv_cache_percent}%` : "–", "of prompt tokens reused, not read again"),
+      k("Context window", m.context_percent_median != null ? `${m.context_percent_median}%` : "–", m.context_percent_max != null ? `median filled · max ${m.context_percent_max}%` : "filled, after each request"),
       k("Sent back · 24 h", Object.values(m.sent_back || {}).reduce((a, b) => a + b, 0), Object.entries(m.sent_back || {}).map(([a, b]) => `${a} ${b}`).join(" · ") || "by the checks"),
       k("Audit entries", a.audit.length, "latest shown")].join("");
     $("#ops-audit").innerHTML = a.audit.length ? `<table class="tbl"><thead><tr><th>when</th><th>event</th><th>who</th><th>tool</th><th>arguments / result</th></tr></thead><tbody>${a.audit.map((r) => `<tr><td style="white-space:nowrap">${esc(fmtTime(r.at))}</td><td><span class="tag ${r.event === "executed" ? "ok" : r.event === "decided" ? (r.decision === "reject" ? "bad" : "info") : r.event === "proposed" ? "warn" : ""}">${esc(r.event)}${r.decision ? " · " + esc(r.decision) : ""}</span></td><td>${esc(r.user)} <span class="faint">${esc(r.level)}</span></td><td class="mono">${esc(r.tool)}</td><td class="mono" style="font-size:11px;max-width:520px;overflow-wrap:anywhere">${esc(typeof r.args === "string" ? r.args : JSON.stringify(r.args)).slice(0, 260)}${r.result ? `<div class="faint">${esc(String(r.result).slice(0, 220))}</div>` : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">The audit log is empty.</div>`;
@@ -1013,11 +1574,15 @@ async function renderOps() {
 $("#ops-refresh").addEventListener("click", renderOps);
 
 /* ================= digital twins ================= */
+const twinLabel = (w) => !w ? "" : /^net-?t?wins?$/i.test(w.name) ? "NetTwin" : w.name;
 async function refreshTwinPill() {
   try {
     const t = await api("/twins");
     const act = (t.twins || []).find((x) => x.active);
-    $("#st-twin span:last-child").textContent = act ? `twin: ${act.name}` : "no twin";
+    const before = JSON.stringify(state.twin?.name || null);
+    state.twin = act || null;
+    if (state.topology && JSON.stringify(act?.name || null) !== before) { buildGraph(state.topology); if (state.view === "topology") renderTopology(); }
+    $("#st-twin span:last-child").textContent = act ? `twin: ${twinLabel(act)}` : "no twin";
     $("#st-twin .dot").className = `dot ${act ? (act.ok ? "ok" : "bad") : ""}`;
     $("#st-twin").hidden = false;
     return t;
@@ -1026,24 +1591,49 @@ async function refreshTwinPill() {
 $("#st-twin").addEventListener("click", () => go("twins"));
 async function renderTwins() {
   const t = await refreshTwinPill();
-  if (!t) { $("#tw-cards").innerHTML = `<div class="banner warn">This agent was built without digital twins: add one under <span class="mono">twins:</span> in canah.yaml.</div>`; return; }
+  if (!t) { $("#tw-active").innerHTML = `<div class="banner warn">This agent was built without digital twins: add one under <span class="mono">twins:</span> in canah.yaml.</div>`; $("#tw-cards").innerHTML = ""; $("#tw-domains").innerHTML = ""; return; }
   $("#tw-contract").textContent = `contract ${t.contract}`;
   const admin = levelRank(state.level) >= 1, root = levelRank(state.level) >= 2;
-  $("#tw-cards").innerHTML = (t.twins || []).map((w) => `<div class="tw-card${w.active ? " active" : ""}">
-      <div class="h"><span class="dot ${w.ok ? "ok" : "bad"}"></span><b>${esc(w.name)}</b>${w.active ? `<span class="tag info">in use</span>` : ""}
-        <span class="tag">${esc(w.kind)}</span>${w.version ? `<span class="faint" style="font-size:11.5px">v${esc(w.version)}</span>` : ""}<div class="spacer"></div>
-        ${w.declared ? `<span class="faint" style="font-size:11px">canah.yaml</span>` : ""}</div>
-      <div class="where">${esc(w.url || w.spec || "")}${w.path ? ` · ${esc(w.path)}` : ""}${w.token_env ? ` · token: $${esc(w.token_env)}` : ""}</div>
-      ${w.ok ? `<div class="muted" style="font-size:12.5px">${esc(w.about || "")}</div>
-        ${(w.domains || []).map((d) => `<div class="tw-dom"><b>${esc(d.title || d.domain)}</b> <span class="faint mono" style="font-size:11px">${esc(d.domain)}</span><div>${esc(d.answers || "")}</div><div class="k">KPIs: ${esc((d.kpis || []).join(", "))}</div></div>`).join("")}
-        <div class="faint" style="font-size:11.5px">can: ${esc((w.capabilities || []).join(", "))}${(w.controller_domains || []).length ? ` · checks writes on ${esc(w.controller_domains.join(", "))} controllers` : ""}${(w.extras || []).length ? ` · extras: ${esc(w.extras.map((x) => x.name).join(", "))}` : ""}</div>`
-      : `<div class="banner bad" style="margin:0">${esc(w.error || "does not answer")}</div>`}
-      <div class="acts">${!w.active ? `<button class="btn sm primary" data-use="${esc(w.name)}" ${admin ? "" : "disabled title='admin'"}>Use this twin</button>` : ""}
+  const twins = t.twins || [], cur = twins.find((w) => w.active);
+  const caps = (w) => (w.capabilities || []).map((c) => `<span class="chip">${esc(c.replace(/_/g, " "))}</span>`).join("");
+  // 1. the twin in use
+  $("#tw-active").innerHTML = cur ? `<div class="card tw-hero${/^net-?t?wins?$/i.test(cur.name) ? " with-logo" : ""}">${/^net-?t?wins?$/i.test(cur.name) ? `<img class="tw-logo" src="/static/nettwin-logo.png" alt="NetTwin: rehearse the change before you make it">` : ""}
+      <div class="tw-hero-h"><span class="dot ${cur.ok ? "ok" : "bad"}"></span><div><div class="eyebrow">In use · the digital twin CANAH rehearses changes in</div><h3>${esc(twinLabel(cur))}${twinLabel(cur) !== cur.name ? ` <span class="mono faint" style="font-size:12px;font-weight:400">${esc(cur.name)}</span>` : ""}</h3></div>
+        <div class="tags"><span class="tag">${esc(cur.kind)}</span>${cur.version ? `<span class="tag">v${esc(cur.version)}</span>` : ""}${cur.declared ? `<span class="tag">canah.yaml</span>` : ""}</div>
+        <div class="spacer"></div><button class="btn sm" data-test="${esc(cur.name)}">Test</button></div>
+      ${cur.ok ? `<p class="muted tw-about">${esc(cur.about || "")}</p>
+      <div class="tw-facts">
+        <div><div class="label">Where</div><div class="mono">${esc(cur.url || cur.spec || "–")}${cur.path ? `<span class="faint"> · ${esc(cur.path)}</span>` : ""}</div></div>
+        <div><div class="label">Domains</div><div>${(cur.domains || []).length}</div></div>
+        <div><div class="label">Checks writes on</div><div>${esc((cur.controller_domains || []).join(", ") || "none")}</div></div>
+        <div><div class="label">Extras</div><div>${esc((cur.extras || []).map((x) => x.name).join(", ") || "none")}</div></div>
+      </div><div class="chips">${caps(cur)}</div>`
+      : `<div class="banner bad" style="margin:0">${esc(cur.error || "does not answer")}</div>`}</div>`
+    : `<div class="card tw-hero none"><div class="tw-hero-h"><span class="dot"></span><div><div class="eyebrow">In use</div><h3>No twin</h3></div></div>
+       <p class="muted tw-about">Answers come from the controllers alone, and writes go through approval alone, with no prediction first. Choose a twin below.</p></div>`;
+  // 2. its domains, as equal boxes
+  const doms = cur?.ok ? cur.domains || [] : [];
+  $("#tw-dom-of").textContent = cur ? `of ${cur.name}` : "";
+  $("#tw-domains").innerHTML = doms.length ? doms.map((d) => `<div class="tw-dom-card">
+      <div class="h"><b>${esc(d.title || d.domain)}</b><span class="mono faint">${esc(d.domain)}</span></div>
+      <p>${esc(d.answers || "")}</p>
+      <div class="label">KPIs</div><div class="chips">${(d.kpis || []).map((k) => `<span class="chip mono">${esc(k)}</span>`).join("")}</div>
+      ${d.fidelity ? `<div class="label">Fidelity</div><p class="faint">${esc(d.fidelity)}</p>` : ""}
+      ${d.not_modelled ? `<div class="label">Not modelled</div><p class="faint">${esc(d.not_modelled)}</p>` : ""}</div>`).join("")
+    : `<div class="empty">${cur ? "The twin in use does not answer." : "No twin in use."}</div>`;
+  // 3. every twin, as aligned rows, "no twin" among them
+  const row = (w) => `<div class="tw-row${w.active ? " active" : ""}">
+      <div class="c-name"><span class="dot ${w.ok ? "ok" : "bad"}"></span><div><b>${esc(w.name)}</b>${w.active ? ` <span class="tag info">in use</span>` : ""}
+        <div class="faint mono cell-sub">${esc(w.url || w.spec || "")}${w.token_env ? ` · token $${esc(w.token_env)}` : ""}</div></div></div>
+      <div class="c-kind"><span class="tag">${esc(w.kind)}</span>${w.version ? ` <span class="faint">v${esc(w.version)}</span>` : ""}</div>
+      <div class="c-doms">${w.ok ? (w.domains || []).map((d) => `<span class="chip">${esc(d.title || d.domain)}</span>`).join("") : `<span class="tag bad">${esc((w.error || "does not answer").slice(0, 80))}</span>`}</div>
+      <div class="c-acts">${!w.active ? `<button class="btn sm primary" data-use="${esc(w.name)}" ${admin ? "" : "disabled title='admin'"}>Use</button>` : ""}
         <button class="btn sm" data-test="${esc(w.name)}">Test</button>
-        ${!w.declared ? `<button class="btn sm danger" data-drop="${esc(w.name)}" ${root ? "" : "disabled title='root'"}>Remove</button>` : ""}</div>
-    </div>`).join("") + `<div class="tw-card${t.active ? "" : " active"}"><div class="h"><b>No twin</b><div class="spacer"></div>${!t.active ? `<span class="tag info">in use</span>` : ""}</div>
-      <div class="muted" style="font-size:12.5px">Answers come from the controllers alone, and writes go through approval alone, with no prediction first.</div>
-      <div class="acts">${t.active ? `<button class="btn sm" data-use="none" ${admin ? "" : "disabled"}>Use no twin</button>` : ""}</div></div>`;
+        ${!w.declared ? `<button class="btn sm danger" data-drop="${esc(w.name)}" ${root ? "" : "disabled title='root'"}>Remove</button>` : `<span class="faint cell-sub" title="declared in canah.yaml">canah.yaml</span>`}</div></div>`;
+  $("#tw-cards").innerHTML = twins.map(row).join("") + `<div class="tw-row none${t.active ? "" : " active"}">
+      <div class="c-name"><span class="dot"></span><div><b>No twin</b>${!t.active ? ` <span class="tag info">in use</span>` : ""}<div class="faint cell-sub">no prediction before a write</div></div></div>
+      <div class="c-kind"></div><div class="c-doms faint" style="font-size:12px">answers from the controllers alone; writes through approval alone</div>
+      <div class="c-acts">${t.active ? `<button class="btn sm" data-use="none" ${admin ? "" : "disabled"}>Use no twin</button>` : ""}</div></div>`;
   $$("[data-use]").forEach((b) => b.addEventListener("click", async () => {
     try { await api("/twins/active", { method: "PUT", body: { name: b.dataset.use } }); toast(b.dataset.use === "none" ? "No twin in use." : `Using ${b.dataset.use} from the next question.`, "ok"); renderTwins(); }
     catch (e) { toast(e.message, "bad"); }

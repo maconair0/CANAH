@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -66,19 +67,44 @@ class FakeMCP:
     sent = []
 
     def _headers(self):
-        return {}
+        import os as _os
+        t = self.token
+        return {"Authorization": f"Bearer {t}"} if t else {}
+
+    @property
+    def token(self):
+        import os as _os
+        return _os.getenv("AGENTIC_MCP_TOKEN", "")
+
+    CONTRACT = {"version": 1, "domains": [{"name": "inventory", "required": True, "verbs": {"read_devices": {"methods": ["GET"]}}}]}
 
     class _Http:
         def request(self, method, url, **kw):
-            FakeMCP.sent.append((method, url, kw.get("json"), kw.get("params")))
+            FakeMCP.sent.append((method, url, kw.get("json"), kw.get("params"), (kw.get("headers") or {}).get("Authorization")))
+            path = url.split("fake", 1)[-1]
+
+            broken = (kw.get("json") or {}).get("key") == "broken"
 
             class R:
-                status_code = 200
-                text = "{}"
+                status_code = 502 if broken else 200
+                text = "the controller did not answer" if broken else "{}"
+                ok = not broken
 
                 def json(self):
+                    if path == "/contract" and method == "GET":
+                        return {"contract": FakeMCP.CONTRACT, "controllers": [{"key": "onos", "verdict": "accepted", "gaps": []}]}
+                    if path == "/contract/check":
+                        return {"ok": True, "problems": [], "controllers": [{"key": "onos", "verdict": "accepted, with gaps", "gaps": ["x"]}]}
+                    if path == "/contract" and method == "PUT":
+                        return {"version": 2, "domains": 1, "verbs": 1, "added": [], "removed": [], "backup": "/x.bak", "controllers": []}
                     return {"key": (kw.get("json") or {}).get("key"), "conformance": {"verdict": "accepted"}}
             return R()
+
+        def get(self, url, **kw):
+            return self.request("GET", url, **kw)
+
+        def post(self, url, **kw):
+            return self.request("POST", url, **kw)
 
     http = _Http()
 
@@ -121,7 +147,7 @@ class Service(unittest.TestCase):
 
     def test_health_info_and_page(self):
         self.assertTrue(self.client.get("/health").json()["ok"])
-        self.assertEqual(self.client.get("/info").json()["tools"], 2)
+        self.assertEqual(self.client.get("/info").json()["tools"], 4)        # list_items, drop_item, draw_diagram, get_diagram
         page = self.client.get("/").text
         self.assertIn("Controller Agnostic Network Agent Harness", page)
         self.assertIn('id="login"', page)
@@ -172,7 +198,7 @@ class Service(unittest.TestCase):
         r = self.client.post("/network/controllers", headers=h, json=body)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["reload_needed"])
-        method, url, sent, _ = FakeMCP.sent[-1]
+        method, url, sent, _, _ = FakeMCP.sent[-1]
         self.assertEqual((method, url.endswith("/controllers"), sent["key"], sent["user_env"]),
                          ("POST", True, "onos2", "ONOS2_USER"))
         self.assertEqual(self.client.delete("/network/controllers/onos2", headers=h).status_code, 403)   # root only
@@ -275,6 +301,98 @@ class Service(unittest.TestCase):
     def test_the_page_is_sent_compressed(self):
         r = self.client.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
         self.assertEqual(r.headers.get("content-encoding"), "gzip")
+
+    def test_the_agentic_mcp_token_is_set_by_root_kept_private_and_never_sent_back(self):
+        import stat
+        os.environ.pop("AGENTIC_MCP_TOKEN", None)
+        self.addCleanup(os.environ.pop, "AGENTIC_MCP_TOKEN", None)
+        r = self.client.put("/network/connection", json={"token": "s3cr3t"}, headers=self.sign_in())
+        self.assertEqual(r.status_code, 403)                       # admin is not enough
+        r = self.client.put("/network/connection", json={"token": "s3cr3t"}, headers=self.sign_in("root", "r00t"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("s3cr3t", r.text)
+        self.assertTrue(r.json()["token_set"])
+        f = Path(self.home) / "agentic_mcp.json"
+        self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
+        self.assertEqual(os.environ["AGENTIC_MCP_TOKEN"], "s3cr3t")
+        self.assertEqual(FakeMCP.sent[-1][-1], "Bearer s3cr3t")    # used from the next call on
+        got = self.client.get("/network/connection").json()
+        self.assertNotIn("s3cr3t", json.dumps(got))
+        r = self.client.put("/network/connection", json={"token": "two words"}, headers=self.sign_in("root", "r00t"))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.put("/network/connection", json={"clear_token": True}, headers=self.sign_in("root", "r00t"))
+        self.assertFalse(r.json()["token_set"])
+        self.assertNotIn("AGENTIC_MCP_TOKEN", os.environ)
+
+    def test_the_common_contract_is_read_checked_and_changed_by_root(self):
+        self.assertEqual(self.client.get("/network/contract").json()["contract"]["version"], 1)
+        self.assertEqual(self.client.post("/network/contract/check", json={"contract": FakeMCP.CONTRACT}).status_code, 403)
+        r = self.client.post("/network/contract/check", json={"contract": FakeMCP.CONTRACT}, headers=self.sign_in())
+        self.assertEqual(r.json()["controllers"][0]["verdict"], "accepted, with gaps")
+        self.assertEqual(self.client.put("/network/contract", json={"contract": FakeMCP.CONTRACT}, headers=self.sign_in()).status_code, 403)
+        r = self.client.put("/network/contract", json={"contract": FakeMCP.CONTRACT}, headers=self.sign_in("root", "r00t"))
+        self.assertEqual(r.json()["version"], 2)
+        self.assertEqual(FakeMCP.sent[-1][0], "PUT")
+
+    def test_several_controllers_from_one_file_each_on_its_own(self):
+        import base64
+        yml = "controllers:\n  - {key: onos2, url: 'http://10.0.0.5:8181'}\n  - {key: broken, url: 'http://10.0.0.6'}\n  - {key: Bad, url: 'http://x'}\n"
+        r = self.client.post("/network/controllers/batch", json={"content_base64": base64.b64encode(yml.encode()).decode()},
+                             headers=self.sign_in())
+        self.assertEqual(r.status_code, 200, r.text)
+        got = {x["key"]: x for x in r.json()["results"]}
+        self.assertTrue(got["onos2"]["ok"])
+        self.assertFalse(got["broken"]["ok"])
+        self.assertFalse(got["Bad"]["ok"])                          # a key the form would refuse
+        self.assertEqual(r.json()["onboarded"], 1)
+
+    def test_each_tool_result_carries_how_long_it_took(self):
+        self.script(call("list_items"), say("a and b"))
+        got = events(self.client.post("/threads/t8/stream", json={"text": "items?"}).text)
+        res = [d for k, d in got if k == "tool_result"][0]
+        self.assertIsInstance(res["ms"], int)
+        hist = self.client.get("/threads/t8/history").json()["messages"]
+        self.assertIsInstance([m for m in hist if m["role"] == "tool"][0]["ms"], int)
+
+    def test_the_model_is_changed_by_root_only_if_it_answers_and_its_key_stays_private(self):
+        from unittest import mock
+        from canah import models as M
+        self.addCleanup(M.save_page_choice, self.home, clear=True)
+        self.addCleanup(os.environ.pop, "ANTHROPIC_API_KEY", None)
+        body = {"provider": "anthropic", "model": "claude-x", "api_key": "sk-test-123"}
+        self.assertEqual(self.client.put("/admin/model", json=body, headers=self.sign_in()).status_code, 403)
+        root = self.sign_in("root", "r00t")
+
+        class Broken:
+            def invoke(self, _):
+                raise RuntimeError("401 invalid key")
+        with mock.patch.object(M, "build_choice", return_value=Broken()):
+            r = self.client.put("/admin/model", json=body, headers=root)
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn("ANTHROPIC_API_KEY", os.environ)                    # the tried key is not kept
+        self.assertFalse((Path(self.home) / "model.json").exists())
+
+        class Works:
+            def invoke(self, _):
+                return say("OK")
+        with mock.patch.object(M, "build_choice", return_value=Works()):
+            r = self.client.put("/admin/model", json=body, headers=root)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("sk-test-123", r.text)
+        import stat
+        self.assertEqual(stat.S_IMODE((Path(self.home) / "keys.json").stat().st_mode), 0o600)
+        info = self.client.get("/admin/model").json()
+        self.assertNotIn("sk-test-123", json.dumps(info))
+        self.assertTrue([x for x in info["providers"] if x["id"] == "anthropic"][0]["key_set"])
+        self.assertEqual(info["choice"]["model"], "claude-x")
+
+    def test_only_real_diagram_names_are_served(self):
+        d = Path(self.home) / "diagrams"
+        d.mkdir()
+        (d / "0123456789abcdef.svg").write_text("<svg/>")
+        self.assertEqual(self.client.get("/diagrams/0123456789abcdef.svg").status_code, 200)
+        for bad in ("..%2Fusers.json", "users.json", "0123456789abcdef.txt", "0123456789ABCDEF.svg"):
+            self.assertEqual(self.client.get(f"/diagrams/{bad}").status_code, 404, bad)
 
     def test_a_change_waits_and_an_admin_approves_it(self):
         h = self.sign_in()

@@ -10,3 +10,4 @@ canah_data/
 *.sqlite-*
 testbed/results/
 netwins_data/
+canah/static/vendor/
