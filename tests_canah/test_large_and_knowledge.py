@@ -96,6 +96,7 @@ class Passages(unittest.TestCase):
     def test_named_terms(self):
         self.assertEqual(named_terms("What threshold does Spec-X2 set for eMode? Cite the source."), ["Spec-X2", "eMode"])
         self.assertEqual(named_terms("how does a cache decide what to keep"), [])
+        self.assertNotIn("1200", named_terms("Can I use VLAN 1200 for a new customer service?")) # a value, not a name
 
     def test_a_passage_about_something_else_is_marked(self):
         text = render([{"text": "a threshold of 4e-3 triggers reconfiguration", "source": "x.pdf",

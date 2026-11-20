@@ -659,7 +659,9 @@ class AgenticMCPProvider:
                     f"agent: give it the exact change (controller, verb or tool, values) and what qot's rehearsal found. Its "
                     f"call waits for the operator's approval.\n"
                     f"For a change: qot first (rehearse and propose), then the domain's config agent (apply), then report "
-                    f"what both said. A change across domains goes to each domain's config agent in turn.")
+                    f"what both said. If qot says the twin rejects it, do not apply it; if the twin cannot model it, it "
+                    f"still goes to the config agent, and the operator's approval decides. A change across domains goes "
+                    f"to each domain's config agent in turn.")
         return (f"Networks are reached through the agentic MCP, which holds these SDN controllers: "
                 f"{', '.join(rows) or 'none'}. You work them all yourself, with the same tools for every controller: "
                 f"a net_<verb> tool per contract verb (net_read_devices, net_read_links, net_provision, ...), with the "

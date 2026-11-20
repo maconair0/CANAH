@@ -590,6 +590,8 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
                                "arguments it would send. End with:\n"
                                "PROPOSAL: the exact configuration (domain, controller, verb or tool, arguments), or none\n"
                                "TWIN: the decision, probability with its interval, trust tier, and what it does not model\n"
+                               "If the twin cannot model the change (not_modelled, or no twin for that domain), say so in "
+                               "TWIN: the PROPOSAL still stands, and the operator's approval alone decides.\n"
                                "Never say a change is made: the supervisor hands your proposal to the domain's config agent."),
              "tools": chosen}]
 

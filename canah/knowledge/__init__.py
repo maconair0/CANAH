@@ -67,6 +67,8 @@ def named_terms(query: str) -> List[str]:
         if w.lower() in _STOP or len(w) < 2:
             continue
         # A capital after the first letter, a digit or a symbol marks a name (not "What", "Explain").
+        if re.fullmatch(r"[\d.,/]+", w):
+            continue              # a plain number is a value (VLAN 1200), not a name: a rule covers it without naming it
         if re.search(r"[A-Z].*[A-Z]|[a-z][A-Z]|\d|[+./]", w[1:] if w[:1].isupper() else w):
             out.append(w)
     return list(dict.fromkeys(out))
