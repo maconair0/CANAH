@@ -250,6 +250,21 @@ class KeepAnswer(AgentMiddleware):
             if run is not None:
                 run["kept"] = True
             return {"messages": [RemoveMessage(id=msgs[-2].id), RemoveMessage(id=msgs[-1].id)]}
+        # KEEP after looking something up is not an answer: what was read may contradict what was said before
+        # (it did: an earlier answer said the harness had no roles or audit, the lookup said it had both, and the
+        # model kept the earlier one). Once only: answer from what the tools returned.
+        if (msgs and isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls and is_keep(msgs[-1].content)):
+            check = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
+                         and any(t in str(m.content) for t in (_LOOK, _NUDGE))), default=-1)
+            looked = check >= 0 and any(isinstance(m, ToolMessage) for m in msgs[check:])
+            run = _this_run()
+            if looked and not (run or {}).get("rewrote"):
+                if run is not None:
+                    run["rewrote"] = True
+                return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                    f"{_LOOK} You looked it up, so KEEP no longer applies: write the answer now from what the tools "
+                    f"returned. Where it contradicts something said earlier in this conversation, what the tools "
+                    f"returned is right; say so.", msgs, keep=False))]}
         return None
 
 

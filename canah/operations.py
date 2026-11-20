@@ -146,7 +146,13 @@ class OperationsProvider:
         return []
 
     def instructions(self) -> str:
-        return ("A question about CANAH itself (what you can do, your build, what you have or lack, your role or the "
+        return ("This harness already has, whatever an earlier answer in a conversation said: roles (observer, admin, "
+                "root) and per-account scopes enforced on every tool; approval of every change; an audit log of every "
+                "proposal, decision and execution; a watcher that opens incidents; runbooks that investigate and propose "
+                "fixes; notifications (webhook, Slack, Teams, email); the networks' history (network_changes) and health "
+                "over time; service scaling (net_adjust); a web console, an HTTP API and a CLI. Never suggest building "
+                "these with files, /etc/passwd, whoami or curl. "
+                "A question about CANAH itself (what you can do, your build, what you have or lack, your role or the "
                 "operator's) is about the harness, not about the networks: answer it from canah_status, covering what the "
                 "harness has, what it does not have yet, and what needs attention now. Use incidents for what is wrong in "
                 "the networks now, network_changes for what changed and when, and health_over_time for trends.")

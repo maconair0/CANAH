@@ -15,6 +15,7 @@ and `CanahAgent` is the small surface a service, a CLI or a test uses:
 from __future__ import annotations
 
 import json
+import re
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -164,11 +165,13 @@ class CanahAgent:
                                                 "tool": p["name"], "args": p.get("args"), "needs": p.get("needs")})
 
     def _reply(self, out: Dict[str, Any], cfg: Dict[str, Any], start: int) -> Reply:
+        from .grounding import is_keep
         msgs = out.get("messages", [])[start:]
         text = ""
         for m in reversed(msgs):
-            if isinstance(m, AIMessage) and str(m.content or "").strip():
+            if isinstance(m, AIMessage) and str(m.content or "").strip() and not is_keep(m.content):
                 text = m.content if isinstance(m.content, str) else str(m.content)
+                text = re.sub(r"\n+\s*KEEP\s*$", "", text)       # a KEEP tacked on the end of an answer
                 break
         results = {m.tool_call_id: str(m.content) for m in msgs if isinstance(m, ToolMessage)}
         calls = []

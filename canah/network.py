@@ -354,7 +354,14 @@ class VerbTool(_CatalogTool):
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=min(8, len(keys) or 1)) as pool:
                 got = list(pool.map(lambda k: self._call(k, self.catalog[k][self.served[k]], arguments, config), keys))
-            return _clip(json.dumps({k: _maybe_json(v) for k, v in zip(keys, got)}, indent=1, default=str))
+            per = int(os.getenv("CANAH_FANOUT_CHARS", "3000"))
+
+            def short(k: str, v: str) -> Any:
+                # One controller's long answer (a YANG library for "health") must not drown the others.
+                if len(v) <= per:
+                    return _maybe_json(v)
+                return v[:per] + f" ... [cut: {len(v)} characters; call {self.name} with controller={k!r} for all of it]"
+            return _clip(json.dumps({k: short(k, v) for k, v in zip(keys, got)}, indent=1, default=str))
         return self._call(controller, self.catalog[controller][self.served[controller]], arguments, config)
 
 

@@ -88,17 +88,26 @@ class RepeatGuard(AgentMiddleware):
     """The same tool with the same arguments, a third time in one request, is not run: it answers the same.
     The model is told to use what it has (a model on a loop otherwise spends the whole request there)."""
 
-    def __init__(self, limit: int = 2):
+    def __init__(self, limit: int = 2, max_pages: int = 8):
         super().__init__()
-        self.limit = limit
+        self.limit, self.max_pages = limit, max_pages
 
     def _seen(self, request) -> Optional[ToolMessage]:
         run = _run()
         if run is None:
             return None
         call = request.tool_call
-        key = f"{call.get('name')}:{json.dumps(call.get('args') or {}, sort_keys=True, default=str)}"
+        args = call.get("args") or {}
         seen = run.setdefault("calls_seen", {})
+        if call.get("name") == "read_file" and args.get("file_path"):
+            # Paging through one file: a few pages, then grep it or answer.
+            pk = f"pages:{args['file_path']}"
+            seen[pk] = seen.get(pk, 0) + 1
+            if seen[pk] > self.max_pages:
+                return ToolMessage(tool_call_id=call["id"], name="read_file", status="error", content=(
+                    f"Not read: {seen[pk] - 1} pages of {args['file_path']} already in this request. Stop paging: grep it "
+                    f"for what the question needs, or answer now with what you have read."))
+        key = f"{call.get('name')}:{json.dumps(args, sort_keys=True, default=str)}"
         seen[key] = seen.get(key, 0) + 1
         if seen[key] <= self.limit:
             return None

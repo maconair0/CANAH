@@ -243,3 +243,30 @@ class StaysOnTheQuestion(unittest.TestCase):
         self.assertEqual(a.ask("what is in x?").text, "It is empty.")
         self.assertEqual(len(calls), 2)
         self.assertIn("Not run again", model.tool_results(-1)[-1])
+
+
+class KeepAfterALookup(unittest.TestCase):
+    def test_keep_after_reading_is_sent_back_and_the_reply_is_never_keep(self):
+        old = "The harness has no audit log and no roles, and nothing watches the network. " * 2
+        a, model = agent(say(old), call("read_power"), say("KEEP"), say("Read it: the power is -2.37 dBm."))
+        r = a.ask("what is the transmit power?", thread_id="kp")
+        self.assertEqual(r.text, "Read it: the power is -2.37 dBm.")
+        self.assertIn("KEEP no longer applies", str(model.seen[3][-1].content))
+
+    def test_a_keep_tacked_on_an_answer_is_cut(self):
+        a, model = agent(say("Two routers are down.\n\nKEEP"))
+        self.assertEqual(a.ask("which routers are down?").text, "Two routers are down.")
+
+
+class Paging(unittest.TestCase):
+    def test_paging_through_one_file_stops_after_a_few_pages(self):
+        p = FunctionProvider()
+
+        def read_file(file_path: str, offset: int = 0) -> str:
+            """Read a file."""
+            return f"page at {offset}"
+        p.add(read_file)
+        model = ScriptedModel(script=[call("read_file", file_path="/big.txt", offset=i * 100) for i in range(10)] + [say("Done.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        a.ask("read it all")
+        self.assertIn("Stop paging", model.tool_results(-1)[-1])
