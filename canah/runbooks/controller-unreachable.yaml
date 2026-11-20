@@ -1,0 +1,8 @@
+name: controller-unreachable
+when: {kind: [controller_unreachable, agentic_mcp_down]}
+mode: investigate
+instructions: |
+  A controller (or the agentic MCP itself) cannot be read. Check network_health for its state, its last error and
+  since when. Say whether other controllers still answer, what the operator loses while it is down (its domain,
+  its services), and what to check (the controller's address, its credentials on the agentic MCP's host, its
+  process). Do not change anything.

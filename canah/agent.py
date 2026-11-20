@@ -14,6 +14,7 @@ and `CanahAgent` is the small surface a service, a CLI or a test uses:
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
+from .notify import Notifier
 from .grounding import FollowThrough, GroundingGuard, KeepAnswer, LookFirst, TimeBudget
 from .identity import OBSERVER, Identity
 from . import memory as mem
@@ -60,6 +62,7 @@ class CanahAgent:
     twins: Any = None               # canah.twins.Registry: the digital twins and the one in use
     twin_checks: Any = None         # the checks they made, and operators' overrides
     providers: List[Any] = field(default_factory=list)   # the ToolProviders, for warm()
+    notifier: Any = None            # canah.notify.Notifier: incidents and waiting approvals, to the channels
     model: Any = None               # the main agent's model
 
     def warm(self) -> Dict[str, float]:
@@ -102,7 +105,8 @@ class CanahAgent:
         return self.interrupts.get(tool)
 
     def config(self, thread_id: str, who: Identity = OBSERVER, deadline: bool = False) -> Dict[str, Any]:
-        c = {"configurable": {"thread_id": thread_id, "user_id": who.user, "level": who.level},
+        c = {"configurable": {"thread_id": thread_id, "user_id": who.user, "level": who.level,
+                              "scope": list(getattr(who, "controllers", ()) or ())},
              "recursion_limit": self.settings.recursion_limit}
         if deadline:
             import time
@@ -150,17 +154,14 @@ class CanahAgent:
         return reply
 
     def _notify(self, c: Dict[str, Any], p: Dict[str, Any]) -> None:
-        """Tell someone a change is waiting: POST to settings.notify_url (a webhook), if set."""
-        url = getattr(self.settings, "notify_url", "")
-        if not url:
+        """Tell someone a change is waiting, on every channel that takes approvals (canah/notify.py)."""
+        if self.notifier is None:
             return
-        try:
-            import requests
-            requests.post(url, timeout=5, json={"event": "change waiting", "thread": c.get("thread_id"),
-                                                "requested_by": c.get("user_id"), "tool": p["name"],
-                                                "args": p.get("args"), "needs": p.get("needs")})
-        except Exception as e:  # noqa: BLE001 - a missed notification is logged, not fatal
-            logger.warning("notification to %s failed: %s", url, e)
+        args = json.dumps(p.get("args") or {}, default=str)[:400]
+        self.notifier.send("approval_waiting", "major", f"A change waits for approval: {p['name']}",
+                           f"Asked by {c.get('user_id')}; needs {p.get('needs') or 'admin'}.\n{p['name']} {args}",
+                           link="/#ops", data={"thread": c.get("thread_id"), "requested_by": c.get("user_id"),
+                                                "tool": p["name"], "args": p.get("args"), "needs": p.get("needs")})
 
     def _reply(self, out: Dict[str, Any], cfg: Dict[str, Any], start: int) -> Reply:
         msgs = out.get("messages", [])[start:]
@@ -360,8 +361,29 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     twin_checks = Checks()
     twin_provider = [TwinsProvider(twins, settings.home_path, twin_checks)] if twins.entries() else []
     from .diagrams import DiagramProvider
+    from .operations import OperationsProvider
     diagram_provider = [DiagramProvider(settings.home_path)] if settings.diagrams else []
-    all_providers = list(providers) + load_providers(settings.providers) + twin_provider + diagram_provider
+    base_providers = list(providers) + load_providers(settings.providers)
+
+    def describe_now() -> Dict[str, Any]:
+        ctls = []
+        for pv in base_providers:
+            st = getattr(pv, "status", None) or {}
+            ctls += [k for k, v in (st.get("controllers") or {}).items() if v.get("ok")]
+        act = twins.active() if twins.entries() else None
+        down = []
+        for pv in base_providers:
+            st = getattr(pv, "status", None) or {}
+            down += [k for k, v in (st.get("controllers") or {}).items() if not v.get("ok")]
+        try:
+            sess = next((pv.service.get("/sessions", timeout=5) for pv in base_providers if hasattr(pv, "service")), {}) or {}
+            down += [x["controller"] for x in sess.get("sessions", []) if x.get("state") == "down" and x["controller"] not in down]
+        except Exception:  # noqa: BLE001
+            pass
+        return {"controllers": ctls, "controllers_down": down, "twin": getattr(act, "name", None),
+                "model": (models.describe() if model is None else {}).get("model")}
+    ops_provider = [OperationsProvider(settings.home_path, settings, describe_now)]
+    all_providers = base_providers + twin_provider + diagram_provider + ops_provider
     got = merge(all_providers)
     tools = list(got["tools"]) + list(extra_tools)
     writes = list(got["writes"]) + list(extra_writes) + list(settings.approve_tools)
@@ -519,7 +541,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                        "compact_tool": bool(compact_mw)}
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
                       interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
-                      providers=all_providers, model=main_model)
+                      providers=all_providers, model=main_model,
+                      notifier=Notifier(settings.notify_channels, settings.notify_url, settings.console_url))
 
 
 def _fallback() -> List[Any]:

@@ -57,9 +57,14 @@ def rank(level: str) -> int:
 class Identity:
     user: str
     level: str = "observer"
+    # The controllers this person works with (a tenant, a site, a domain); empty: every one.
+    controllers: tuple = ()
 
     def can(self, needed: str) -> bool:
         return rank(self.level) >= rank(needed)
+
+    def sees(self, controller: str) -> bool:
+        return not self.controllers or controller in self.controllers
 
     @property
     def label(self) -> str:
@@ -111,7 +116,8 @@ class Accounts:
                 logger.warning("%s signs in with the documented default password; set CANAH_%s_PASSWORD",
                                user, level.upper())
         for name, a in self._file().items():
-            self.users[name] = {"level": a["level"], "digest": a["hash"], "default": False}
+            self.users[name] = {"level": a["level"], "digest": a["hash"], "default": False,
+                                "controllers": tuple(a.get("controllers") or ())}
         self._fails: Dict[str, List[float]] = {}
         self._lock = threading.Lock()
 
@@ -133,7 +139,7 @@ class Accounts:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
-    def add(self, user: str, level: str, password: str) -> None:
+    def add(self, user: str, level: str, password: str, controllers: Iterable[str] = ()) -> None:
         if level not in ("admin", "root"):
             raise ValueError("an account is admin or root (an observer needs none)")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{2,40}", user or ""):
@@ -141,9 +147,31 @@ class Accounts:
         if len(password or "") < 8:
             raise ValueError("a password is at least 8 characters")
         users = self._file()
-        users[user] = {"level": level, "hash": hash_password(password)}
+        scope = sorted({str(c).strip() for c in controllers if str(c).strip()})
+        users[user] = {"level": level, "hash": hash_password(password), **({"controllers": scope} if scope else {})}
         self._save(users)
-        self.users[user] = {"level": level, "digest": users[user]["hash"], "default": False}
+        self.users[user] = {"level": level, "digest": users[user]["hash"], "default": False, "controllers": tuple(scope)}
+
+    def set_scope(self, user: str, controllers: Iterable[str]) -> None:
+        """Limit an account to some controllers (empty: every one). The admin and root accounts from the
+        environment are never limited."""
+        users = self._file()
+        if user not in users:
+            raise ValueError(f"{user} is not an account kept here (the environment's admin and root see everything)")
+        scope = sorted({str(c).strip() for c in controllers if str(c).strip()})
+        if scope:
+            users[user]["controllers"] = scope
+        else:
+            users[user].pop("controllers", None)
+        self._save(users)
+        self.users[user]["controllers"] = tuple(scope)
+
+    def describe(self) -> List[Dict[str, Any]]:
+        """Every account: its level, its scope, whether it is kept here or comes from the environment."""
+        kept = self._file()
+        return [{"user": u, "level": a["level"], "controllers": list(a.get("controllers") or ()),
+                 "from": "users.json" if u in kept else "environment", "default_password": bool(a.get("default"))}
+                for u, a in sorted(self.users.items())]
 
     def remove(self, user: str) -> bool:
         users = self._file()
@@ -173,7 +201,7 @@ class Accounts:
             raise PermissionError("wrong user or password")
         with self._lock:
             self._fails.pop(user, None)
-        return Identity(user, account["level"])
+        return Identity(user, account["level"], tuple(account.get("controllers") or ()))
 
 
 def required(tool: str, writes: Iterable[str], root_tools: Iterable[str]) -> str:
@@ -186,7 +214,18 @@ def required(tool: str, writes: Iterable[str], root_tools: Iterable[str]) -> str
 def from_config(config: Optional[Dict[str, Any]]) -> Identity:
     c = (config or {}).get("configurable") or {}
     level = c.get("level") if c.get("level") in LEVELS else "observer"
-    return Identity(str(c.get("user_id") or level), level)
+    return Identity(str(c.get("user_id") or level), level, tuple(c.get("scope") or ()))
+
+
+def scope_of(config: Optional[Dict[str, Any]] = None) -> tuple:
+    """The controllers the person behind this run may reach (empty: every one), from the run's config."""
+    if config is None:
+        try:
+            from langgraph.config import get_config
+            config = get_config()
+        except Exception:  # noqa: BLE001
+            return ()
+    return tuple(((config or {}).get("configurable") or {}).get("scope") or ())
 
 
 class RoleMiddleware(AgentMiddleware):

@@ -26,3 +26,15 @@ twins:
   # - {name: flow-example, kind: http, url: "http://127.0.0.1:8430"}                  # python examples/custom_twin.py
 twin_active: netwins
 twin_gate: true
+
+# Operations (canah/incidents.py): the watcher reads every controller through the contract each minute and opens
+# incidents; runbooks (canah/runbooks, and <CANAH_HOME>/runbooks) investigate or propose fixes for approval.
+# watch_interval_s: 60
+# respond: true                 # runbooks may investigate on their own (respond_per_hour: 6)
+# Where incidents and waiting approvals are sent; a secret is the NAME of an environment variable:
+# notify_channels:
+#   - {kind: slack, url_env: SLACK_WEBHOOK_URL, min_severity: major}
+#   - {kind: teams, url_env: TEAMS_WEBHOOK_URL}
+#   - {kind: webhook, url_env: OPS_WEBHOOK_URL}
+#   - {kind: email, to: [noc@example.org], min_severity: critical}   # CANAH_SMTP_HOST, _PORT, _USER, _PASSWORD, _FROM
+# console_url: http://canah.example.org:8350

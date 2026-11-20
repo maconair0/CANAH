@@ -12,6 +12,10 @@ person's approval.
 - **Digital twin first:** what-ifs and writes are tried in NetTwin, or any twin that speaks
   [`canah.twin/1`](docs/TWIN_CONTRACT.md).
 - **Approval and audit:** every change waits for an operator; every decision is logged.
+- **Operations:** a watcher reads every controller each minute and opens incidents (a controller unreachable,
+  something down, an alarm). Runbooks have CANAH investigate, or propose a fix rehearsed in the twin. Incidents
+  go to Slack, Teams, email or a webhook, and the networks' history answers "what changed?".
+- **Scopes:** an account may be limited to some controllers (a tenant, a site, a domain).
 - **Documents:** hybrid search with re-ranking on the GPU; answers cite their source, or say the documents do
   not cover it.
 - **Web console:**
@@ -36,7 +40,8 @@ You need Python 3.10+ and [Ollama](https://ollama.com) with a model that can cal
 
 ## Learn more
 
-- [The full guide](docs/GUIDE.md): every page, setting and check, the retrieval pipeline, speed and the KV cache.
+- [The full guide](docs/GUIDE.md): every page, setting and check, operations, the retrieval pipeline, speed and the KV cache.
+- [The roadmap](docs/ROADMAP.md): what is built and what comes next.
 - [The digital-twin contract](docs/TWIN_CONTRACT.md), and [a custom twin in fifty lines](examples/custom_twin.py).
 - Tests: `.venv/bin/python -m unittest discover -s tests_canah -t .`
 

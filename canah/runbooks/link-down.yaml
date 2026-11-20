@@ -1,0 +1,12 @@
+name: link-down
+when: {kind: link_down}
+mode: propose
+instructions: |
+  A link is down. Find out what it carried and propose how to restore it:
+  1. Read the link's controller (net_read_links, net_read_services) and, if a controller publishes relations,
+     follow_relations from the link: which services and which other domains depend on it.
+  2. If services are affected, compute an alternative (net_compute_path, or the controller's reroute verb) and
+     rehearse it in the digital twin (twin_predict with the link down and the services rerouted).
+  3. If the twin supports it, propose the change (net_reroute, or the controller's write that does it): it waits
+     for an operator's approval. If not, say why and what the operator could do instead.
+  Report: what is down, what it affects, what you rehearsed and its result, what you propose.

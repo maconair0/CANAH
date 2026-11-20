@@ -60,6 +60,7 @@
     <span class="pill" id="st-model" title="The model the agent runs on"><span class="dot"></span><span>model</span></span>
     <span class="pill click" id="st-ctl" title="Controllers the agentic MCP holds, and how many could be read"><span class="dot"></span><span>controllers</span></span>
     <span class="pill click" id="st-twin" title="The digital twin in use"><span class="dot"></span><span>twin</span></span>
+    <span class="pill click" id="st-inc" title="Incidents the watcher opened" hidden><span class="dot"></span><span>incidents</span></span>
     <span class="pill" id="st-busy" hidden><span class="dot busy"></span><span>agent working</span></span>
     <div class="spacer"></div>
     <span class="pill click" id="st-who" title="Your profile"><span class="dot"></span><span id="st-who-text">observer</span></span>
@@ -73,6 +74,7 @@
     <div class="section">Monitor</div>
     <button data-view="topology"><span class="ico">◎</span>Topology</button>
     <button data-view="controllers"><span class="ico">⬡</span>SDN controllers</button>
+    <button data-view="incidents"><span class="ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>Incidents<span class="badge bad" id="inc-badge" hidden>0</span></button>
     <div class="section">Operate</div>
     <button data-view="chat"><span class="ico">✦</span>Chat</button>
     <button data-view="ops"><span class="ico">✔</span>Approvals &amp; audit<span class="badge warn" id="pending-badge" hidden>0</span></button>
@@ -344,6 +346,50 @@
       </div>
     </section>
 
+    <!-- Incidents: what the watcher found, runbooks, the networks' history, notifications -->
+    <section class="view" id="view-incidents">
+      <div class="row"><h2>Incidents</h2><div class="spacer" style="flex:1"></div>
+        <span class="faint" id="inc-watch" style="font-size:12px"></span><button class="btn sm" id="inc-poll" title="Read every controller now (admin)">Check now</button>
+        <button class="btn sm" id="inc-refresh">Refresh</button></div>
+      <p class="muted page-lead">CANAH reads every controller through the common contract each minute. A controller it cannot read, a device,
+        link or service down, an alarm: each becomes an incident, sent to the notification channels, and resolved by itself when it clears.
+        A runbook may have CANAH investigate, or rehearse a fix in the digital twin and propose it; a fix always waits for approval.</p>
+      <div class="kpis" id="inc-kpis"></div>
+      <div class="tabs" id="inc-tabs" role="tablist">
+        <button class="tab active" data-tab="active">Active <span class="count" id="inc-n"></span></button>
+        <button class="tab" data-tab="all">All</button>
+        <button class="tab" data-tab="health">Health over time</button>
+        <button class="tab" data-tab="changes">Network changes</button>
+        <button class="tab" data-tab="setup">Runbooks &amp; notifications</button>
+      </div>
+      <div class="inc-pane" data-pane="list">
+        <div class="grid inc-grid">
+          <div class="card"><div class="body" style="padding:0;overflow-x:auto" id="inc-table"></div></div>
+          <div class="card"><header><h3 id="inc-detail-title">An incident</h3></header><div class="body" id="inc-detail">
+            <span class="muted">Pick an incident to see what was seen, its runbook, CANAH's investigation and any fix waiting for approval.</span></div></div>
+        </div>
+      </div>
+      <div class="inc-pane" data-pane="health" hidden>
+        <div class="row" style="margin-bottom:10px"><span class="muted" style="font-size:12.5px">Each controller at every watcher reading: what is down, and the incidents open.</span><div class="spacer" style="flex:1"></div>
+          <select id="hl-hours"><option value="1">last hour</option><option value="6">last 6 hours</option><option value="24" selected>last 24 hours</option><option value="168">last 7 days</option></select></div>
+        <div id="hl-body" class="hl-grid"></div>
+      </div>
+      <div class="inc-pane" data-pane="changes" hidden>
+        <div class="card"><header><h3>What changed in the networks</h3><div class="spacer"></div>
+          <select id="hist-ctl"><option value="">every controller</option></select>
+          <select id="hist-hours"><option value="1">last hour</option><option value="24" selected>last 24 hours</option><option value="168">last 7 days</option><option value="720">last 30 days</option></select></header>
+          <div class="body" style="padding:0" id="hist-body"></div></div>
+      </div>
+      <div class="inc-pane" data-pane="setup" hidden>
+        <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start">
+          <div class="card"><header><h3>Runbooks</h3><div class="spacer"></div><span class="faint" style="font-size:11.5px">canah/runbooks, and CANAH_HOME/runbooks</span></header>
+            <div class="body" style="padding:0" id="rb-body"></div></div>
+          <div class="card"><header><h3>Notification channels</h3><div class="spacer"></div><button class="btn sm" id="nt-test">Send a test</button></header>
+            <div class="body" id="nt-body"></div></div>
+        </div>
+      </div>
+    </section>
+
     <!-- Approvals & audit -->
     <section class="view" id="view-ops">
       <div class="row"><h2>Approvals &amp; audit</h2><div style="flex:1"></div><button class="btn sm" id="ops-refresh">Refresh</button></div>
@@ -387,6 +433,19 @@
           <div class="row" style="margin-top:14px"><button class="btn" id="id-switch">Sign in as someone else</button><button class="btn danger" id="id-out">Sign out</button></div></div></div>
         <div class="card"><header><h3>What each profile may do</h3></header><div class="body" id="id-levels"></div></div>
       </div>
+      <div class="card" id="acc-card" style="margin-top:14px"><header><h3>Accounts and their scopes</h3><div class="spacer"></div><span class="faint" style="font-size:12px">root to change</span></header>
+        <div class="body">
+          <p class="muted" style="margin:0 0 10px;font-size:12.5px">An account may be limited to some controllers: a tenant, a site or a domain. It then sees,
+            asks about and approves changes on those only. The admin and root accounts from the environment see everything.</p>
+          <div id="acc-table"></div>
+          <form id="acc-form" class="acc-form" autocomplete="off">
+            <input id="acc-user" placeholder="user name" required pattern="[A-Za-z0-9_.-]{2,40}">
+            <select id="acc-level"><option value="admin">admin</option><option value="root">root</option></select>
+            <input id="acc-pass" type="password" placeholder="password (8+)" required minlength="8" autocomplete="new-password">
+            <div class="acc-scope" id="acc-scope"></div>
+            <button class="btn primary" type="submit">Add the account</button><span id="acc-msg" class="muted" style="font-size:12.5px"></span>
+          </form>
+        </div></div>
     </section>
 
     <!-- About -->

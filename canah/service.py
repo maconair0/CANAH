@@ -61,6 +61,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import approval
 from .agent import CanahAgent, Reply
 from .identity import OBSERVER, Accounts, Identity
 
@@ -80,6 +81,8 @@ class Sessions:
         self._db = sqlite3.connect(path or ":memory:", check_same_thread=False, isolation_level=None)
         self._db.execute("create table if not exists sessions (token text primary key, user text, level text, "
                          "at real, used real)")
+        if "scope" not in {r[1] for r in self._db.execute("pragma table_info(sessions)")}:
+            self._db.execute("alter table sessions add column scope text default ''")
         self._lock = threading.Lock()
 
     @staticmethod
@@ -91,13 +94,14 @@ class Sessions:
         token = secrets.token_urlsafe(32)
         now = time.time()
         with self._lock:
-            self._db.execute("insert into sessions values (?,?,?,?,?)", (self._key(token), who.user, who.level, now, now))
+            self._db.execute("insert into sessions (token, user, level, at, used, scope) values (?,?,?,?,?,?)",
+                             (self._key(token), who.user, who.level, now, now, ",".join(who.controllers)))
         return token
 
     def who(self, token: str) -> Optional[Identity]:
         now = time.time()
         with self._lock:
-            row = self._db.execute("select user, level, at, used from sessions where token = ?",
+            row = self._db.execute("select user, level, at, used, scope from sessions where token = ?",
                                    (self._key(token),)).fetchone()
             if row is None:
                 return None
@@ -105,7 +109,7 @@ class Sessions:
                 self._db.execute("delete from sessions where token = ?", (self._key(token),))
                 return None
             self._db.execute("update sessions set used = ? where token = ?", (now, self._key(token)))
-            return Identity(row[0], row[1])
+            return Identity(row[0], row[1], tuple(x for x in (row[4] or "").split(",") if x))
 
     def close(self, token: str) -> bool:
         with self._lock:
@@ -212,7 +216,7 @@ def _reply_json(r: Reply) -> Dict[str, Any]:
 
 
 def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology: Any = None,
-               rebuild: Optional[Any] = None) -> FastAPI:
+               rebuild: Optional[Any] = None, watch: bool = False) -> FastAPI:
     """`topology`: what /network and /topology read (a canah.topology.Topology); by default one over the
     agentic MCP the settings name. `rebuild`: makes a new agent from the settings, for /admin/reload (a
     controller onboarded since the start gets its agent); without it, reload is refused."""
@@ -318,11 +322,62 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             who = accounts.sign_in(str(body.get("username") or ""), str(body.get("password") or ""))
         except PermissionError as e:
             raise HTTPException(401, str(e))
-        return {"token": sessions.open(who), "user": who.user, "level": who.level}
+        return {"token": sessions.open(who), "user": who.user, "level": who.level, "scope": list(who.controllers)}
 
     @app.get("/session")
     def whoami(c=Depends(caller)):
-        return {"user": c["who"].user, "level": c["who"].level, "signed_in": bool(c["token"])}
+        return {"user": c["who"].user, "level": c["who"].level, "signed_in": bool(c["token"]),
+                "scope": list(c["who"].controllers)}
+
+    # ----- accounts and their scopes (root) -----
+
+    def root(c) -> Identity:
+        if not c["who"].can("root"):
+            raise HTTPException(403, "this needs root")
+        return c["who"]
+
+    @app.get("/users")
+    def users(c=Depends(caller)):
+        admin(c)
+        return {"users": accounts.describe()}
+
+    @app.post("/users")
+    def add_user(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """An account (root): {user, level: admin|root, password, controllers: [...] or [] for every one}."""
+        who = root(c)
+        try:
+            accounts.add(str(body.get("user") or ""), str(body.get("level") or ""), str(body.get("password") or ""),
+                         body.get("controllers") or [])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if A().ops:
+            A().ops.audit("account added", who.user, who.level, "", "accounts",
+                          {"user": body.get("user"), "level": body.get("level"), "controllers": body.get("controllers") or []})
+        return {"users": accounts.describe()}
+
+    @app.put("/users/{name}/scope")
+    def set_scope(name: str, body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """Which controllers an account works with (root); [] for every one. Takes effect at its next sign-in."""
+        who = root(c)
+        try:
+            accounts.set_scope(name, body.get("controllers") or [])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if A().ops:
+            A().ops.audit("account scope changed", who.user, who.level, "", "accounts",
+                          {"user": name, "controllers": body.get("controllers") or []})
+        return {"users": accounts.describe()}
+
+    @app.delete("/users/{name}")
+    def drop_user(name: str, c=Depends(caller)):
+        who = root(c)
+        if name == who.user:
+            raise HTTPException(400, "you cannot remove the account you are signed in with")
+        if not accounts.remove(name):
+            raise HTTPException(404, f"{name} is not an account kept here")
+        if A().ops:
+            A().ops.audit("account removed", who.user, who.level, "", "accounts", {"user": name})
+        return {"users": accounts.describe()}
 
     @app.delete("/session")
     def sign_out(c=Depends(caller)):
@@ -349,11 +404,9 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             raise HTTPException(400, "say something")
         return sse(key, A().stream(text, key, c["who"]), thread_id)
 
-    @app.get("/threads/{thread_id}/history")
-    def history(thread_id: str, c=Depends(caller)):
-        key = thread_key(c["who"], thread_id)
+    def thread_messages(key: str, who: Identity) -> tuple:
         try:
-            msgs = A().graph.get_state(A().config(key, c["who"])).values.get("messages", [])
+            msgs = A().graph.get_state(A().config(key, who)).values.get("messages", [])
         except Exception:  # noqa: BLE001 - an unknown thread has no history
             msgs = []
         # In order, as the console draws them: what was asked, each tool the agent called (with its
@@ -375,6 +428,12 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                     out.append({"role": "tool", "name": t.get("name"), "args": t.get("args") or {},
                                 "result": (str(r.content)[:4000] if r is not None else None),
                                 "ms": ((r.additional_kwargs or {}).get("ms") if r is not None else None)})
+        return out, msgs
+
+    @app.get("/threads/{thread_id}/history")
+    def history(thread_id: str, c=Depends(caller)):
+        key = thread_key(c["who"], thread_id)
+        out, msgs = thread_messages(key, c["who"])
         # How full the window is now: the last model call's prompt and answer (the next call starts there).
         context = None
         win = (A().info.get("context") or {}).get("window")
@@ -493,7 +552,171 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             sessions_ = topology.service.get("/sessions", timeout=8)
         except Exception:  # noqa: BLE001 - health is extra
             sessions_ = {}
-        return {"ok": True, "url": topology.service.url, "controllers": rows, "sessions": sessions_}
+        return {"ok": True, "url": topology.service.url, "controllers": in_scope(c["who"], rows), "sessions": sessions_,
+                "scope": list(c["who"].controllers)}
+
+    # ----- the watcher: incidents, runbooks, the networks' history, notifications -----
+
+    from .history import History
+    from .incidents import BUILTIN_RUNBOOKS, Incidents, Watcher, load_runbooks
+    home = agent.settings.home_path
+    incidents = Incidents(home / "incidents.sqlite")
+    net_history = History(home)
+    from .health import Series
+    health_series = Series(home)
+    WATCH_WHO = Identity("canah-watch", "admin")
+    responded: List[float] = []
+
+    def runbooks() -> List[Dict[str, Any]]:
+        st = A().settings
+        return load_runbooks([BUILTIN_RUNBOOKS, *st.runbooks_dirs, st.home_path / "runbooks"])
+
+    def respond(inc: Dict[str, Any], mode: str = "", by: str = "") -> Dict[str, Any]:
+        """CANAH looks into an incident in a thread of its own (canah-watch.incident-<id>), as its runbook says:
+        a report, and for `propose` a fix rehearsed in the twin and proposed (it waits for approval)."""
+        st = A().settings
+        rb = inc.get("runbook_spec") or next((r for r in runbooks() if r["name"] == inc.get("runbook")), None) or {}
+        mode = mode or inc.get("mode") or rb.get("mode") or "investigate"
+        now = time.time()
+        if not by:
+            if not st.respond:
+                return {"started": False, "why": "runbook responses are switched off (respond: false)"}
+            recent = [t for t in responded if now - t < 3600]
+            responded[:] = recent
+            if len(recent) >= st.respond_per_hour:
+                incidents.set(inc["id"], note=f"not investigated: {st.respond_per_hour} investigations in the last hour already")
+                return {"started": False, "why": "the hourly limit of investigations is reached"}
+            responded.append(now)
+        key = f"{WATCH_WHO.user}.incident-{inc['id']}"
+        prompt = (f"[incident {inc['id']}] The watcher opened an incident.\n"
+                  f"- what: {inc['title']}\n- controller: {inc['controller']}\n- kind: {inc['kind']}\n- severity: {inc['severity']}\n"
+                  f"- first seen: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(inc['first_seen']))}\n"
+                  f"- details: {(inc.get('details') or '')[:1200]}\n\n"
+                  + (f"Runbook {rb.get('name')}:\n{rb.get('instructions', '').strip()}\n\n" if rb else "")
+                  + ("Investigate and report. Do not change anything." if mode == "investigate" else
+                     "Investigate, rehearse a fix in the digital twin, and propose it with the tool that makes it: it waits "
+                     "for an operator's approval. Do not claim it is done.")
+                  + " End with a short report: what happened, what it affects, what you found, what you propose.")
+        incidents.set(inc["id"], thread=key, investigated_at=now, mode=mode)
+
+        def go():
+            lock = lock_for(key)
+            if not lock.acquire(blocking=False):
+                return
+            try:
+                r = A().ask(prompt, key, WATCH_WHO)
+                note = f"a fix waits for approval: {', '.join(p['name'] for p in r.pending)}" if r.pending else ""
+                incidents.set(inc["id"], report=r.text, note=note)
+                if r.pending:
+                    A().notifier.send("approval_waiting", inc["severity"], f"Incident {inc['id']}: a fix waits for approval",
+                                      f"{inc['title']}\n\n{(r.text or '')[:800]}", link=f"/#incident-{inc['id']}",
+                                      data={"incident": inc["id"]})
+            except Exception as e:  # noqa: BLE001 - said on the incident
+                logger.exception("investigating incident %s failed", inc["id"])
+                incidents.set(inc["id"], report=f"The investigation failed: {type(e).__name__}: {e}")
+            finally:
+                lock.release()
+        threading.Thread(target=go, name=f"canah-incident-{inc['id']}", daemon=True).start()
+        return {"started": True, "mode": mode, "thread": key}
+
+    watcher = Watcher(topology, incidents, agent.notifier or __import__("canah.notify", fromlist=["Notifier"]).Notifier([]),
+                      net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s,
+                      resolve_after=agent.settings.resolve_after, history_every=agent.settings.history_every,
+                      series=health_series)
+    app.state.watcher = watcher
+    if watch and agent.settings.watch:
+        watcher.start()
+
+    def visible(c, inc) -> Dict[str, Any]:
+        if not inc or not (c["who"].sees(inc["controller"]) or inc["controller"] == "agentic-mcp"):
+            raise HTTPException(404, "no such incident")
+        return inc
+
+    @app.get("/incidents")
+    def list_incidents(status: str = "active", limit: int = 200, c=Depends(caller)):
+        rows = incidents.list(status if status in ("active", "open", "acked", "resolved", "all") and status != "all" else
+                              ("" if status == "all" else "active"), min(limit, 1000), c["who"].controllers)
+        return {"incidents": rows, "counts": incidents.counts(c["who"].controllers), "watch": watcher.last,
+                "watching": bool(watcher._thread and watcher._thread.is_alive())}
+
+    @app.get("/incidents/{iid}")
+    def one_incident(iid: int, c=Depends(caller)):
+        inc = visible(c, incidents.get(iid))
+        out = {"incident": inc, "messages": [], "pending": []}
+        if inc.get("thread"):
+            out["messages"], _ = thread_messages(inc["thread"], WATCH_WHO)
+            try:
+                out["pending"] = approval.pending(A().graph, A().config(inc["thread"], WATCH_WHO))
+                for p in out["pending"]:
+                    p["needs"] = A().needs(p["name"])
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    @app.post("/incidents/{iid}/{what}")
+    def incident_action(iid: int, what: str, body: Dict[str, Any] = Body(default={}), c=Depends(caller)):
+        who = admin(c)
+        inc = visible(c, incidents.get(iid))
+        if what == "ack":
+            got = incidents.set(iid, status="acked", acked_by=who.user)
+        elif what == "resolve":
+            got = incidents.set(iid, status="resolved", resolved_at=time.time(), acked_by=inc.get("acked_by") or who.user)
+        elif what == "note":
+            got = incidents.set(iid, note=str(body.get("note") or "")[:1000])
+        elif what == "investigate":
+            started = respond(inc, mode=str(body.get("mode") or ""), by=who.user)
+            got = {**incidents.get(iid), "started": started}
+        elif what == "decide":
+            if not inc.get("thread"):
+                raise HTTPException(409, "nothing waits on this incident")
+            try:
+                r = A().decide(inc["thread"], body.get("decisions") or [], who=who)
+            except PermissionError as e:
+                raise HTTPException(403, str(e))
+            except (RuntimeError, ValueError) as e:
+                raise HTTPException(*_status(e))
+            got = incidents.set(iid, report=r.text or inc.get("report"), note="decided by " + who.user)
+        else:
+            raise HTTPException(404, f"no action {what}")
+        if A().ops:
+            A().ops.audit(f"incident {what}", who.user, who.level, inc.get("thread") or "", "incidents", {"incident": iid})
+        return {"incident": got}
+
+    @app.post("/watch/poll")
+    def poll_now(c=Depends(caller)):
+        admin(c)
+        return watcher.poll()
+
+    @app.get("/history")
+    def network_history(controller: str = "", hours: float = 24.0, c=Depends(caller)):
+        if controller and not c["who"].sees(controller):
+            raise HTTPException(404, "no such controller")
+        rows = [r for r in net_history.changes(controller, max(0.1, min(hours, 24 * 90)) * 3600) if c["who"].sees(r["controller"])]
+        return {"changes": rows[:500], "controllers": [k for k in net_history.controllers() if c["who"].sees(k)]}
+
+    @app.get("/health/series")
+    def health_series_view(hours: float = 24.0, controller: str = "", c=Depends(caller)):
+        got = health_series.get(max(0.05, min(hours, 24 * 30)), controller)
+        return {"series": {k: v for k, v in got.items() if c["who"].sees(k)}}
+
+    @app.get("/notify")
+    def notify_info(c=Depends(caller)):
+        n = A().notifier
+        return {"channels": n.describe() if n else [], "sent": list(reversed(n.sent[-20:])) if n else []}
+
+    @app.post("/notify/test")
+    def notify_test(c=Depends(caller)):
+        who = admin(c)
+        n = A().notifier
+        if not n or not n.channels:
+            raise HTTPException(409, "no notification channel is set (notify_channels in canah.yaml)")
+        return {"results": n.send("incident_opened", "critical", "Test from CANAH",
+                                  f"{who.user} sent this test from the web page.", link="/#incidents", wait=True)}
+
+    @app.get("/runbooks")
+    def list_runbooks(c=Depends(caller)):
+        return {"runbooks": [{k: v for k, v in r.items() if k != "file"} | {"builtin": str(BUILTIN_RUNBOOKS) in r["file"]}
+                             for r in runbooks()]}
 
     @app.get("/diagrams/{name}")
     def diagram(name: str):
@@ -507,9 +730,19 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         return FileResponse(str(f), media_type="image/svg+xml" if name.endswith(".svg") else "image/png",
                             headers={"Cache-Control": "private, max-age=86400"})
 
+    def in_scope(who: Identity, rows: List[Dict[str, Any]], key: str = "key") -> List[Dict[str, Any]]:
+        return [r for r in rows if who.sees(str(r.get(key) or r.get("controller") or ""))]
+
     @app.get("/topology")
     def topo(refresh: int = 0, c=Depends(caller)):
-        return topology.read(bool(refresh))
+        got = topology.read(bool(refresh))
+        if c["who"].controllers:
+            keep = set(c["who"].controllers)
+            got = {**got, "controllers": in_scope(c["who"], got.get("controllers") or []),
+                   "relations": [r for r in got.get("relations") or []
+                                 if str(r.get("from", "")).split(":")[0] in keep and str(r.get("to", "")).split(":")[0] in keep],
+                   "scope": sorted(keep)}
+        return got
 
 
     # ----- attachments -----
@@ -963,7 +1196,7 @@ def serve(host: str = "127.0.0.1", port: int = 8350, config: Optional[str] = Non
         if not tls and host not in ("127.0.0.1", "localhost", "::1"):
             logger.warning("serving on %s without TLS: passwords and tokens cross the network in the clear "
                            "(use --tls-cert and --tls-key)", host)
-        uvicorn.run(create_app(agent, rebuild=lambda: build_agent(settings)), host=host, port=port,
+        uvicorn.run(create_app(agent, rebuild=lambda: build_agent(settings), watch=True), host=host, port=port,
                     log_level="info", **tls)
     finally:
         agent.close()

@@ -54,6 +54,19 @@ class Settings:
     look_first: bool = True
     # draw_diagram: Mermaid pictures, rendered and kept under CANAH_HOME/diagrams (canah/diagrams.py).
     diagrams: bool = True
+    # The watcher (canah/incidents.py): reads every controller through the contract every watch_interval_s;
+    # incidents, notifications, runbooks and the networks' history follow. Only in the service.
+    watch: bool = True
+    watch_interval_s: int = 60
+    resolve_after: int = 2              # polls in a row without a finding before its incident is resolved
+    history_every: int = 5              # keep the networks' history every this many polls
+    # Runbooks may investigate (and propose a fix for approval) on their own; at most this many an hour.
+    respond: bool = True
+    respond_per_hour: int = 6
+    runbooks_dirs: List[str] = field(default_factory=list)
+    # Where incidents and waiting approvals are sent (canah/notify.py): webhook, slack, teams, email.
+    notify_channels: List[Dict[str, Any]] = field(default_factory=list)
+    console_url: str = ""               # the web page's address, for links in notifications
     # A tool result longer than this is saved whole and the model gets a preview and the path.
     large_result_chars: int = 12000
     # Tools only root may approve (names or glob patterns); every other write needs admin.

@@ -1,0 +1,9 @@
+name: service-down
+when: {kind: service_down}
+mode: propose
+instructions: |
+  A service reads as down. Find why and propose how to bring it back:
+  1. Read the service (net_read_service) and what it runs over (net_read_links, net_read_devices, follow_relations).
+  2. If a link or device under it is down, rehearse a reroute in the digital twin and propose it (it waits for
+     approval). If nothing under it is down, say so and propose to re-provision it only if the twin supports it.
+  Report: the service, its cause, what you rehearsed, what you propose.

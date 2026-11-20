@@ -147,7 +147,7 @@ class Service(unittest.TestCase):
 
     def test_health_info_and_page(self):
         self.assertTrue(self.client.get("/health").json()["ok"])
-        self.assertEqual(self.client.get("/info").json()["tools"], 4)        # list_items, drop_item, draw_diagram, get_diagram
+        self.assertEqual(self.client.get("/info").json()["tools"], 8)        # 2 here; draw_/get_diagram; canah_status, incidents, network_changes, health_over_time
         page = self.client.get("/").text
         self.assertIn("Controller Agnostic Network Agent Harness", page)
         self.assertIn('id="login"', page)
@@ -241,7 +241,7 @@ class Service(unittest.TestCase):
         self.assertEqual(self.client.post("/session", json={"username": "admin", "password": "no"}).status_code, 401)
         h = self.sign_in()
         self.assertEqual(self.client.get("/session", headers=h).json(), {"user": "admin", "level": "admin",
-                                                                         "signed_in": True})
+                                                                         "signed_in": True, "scope": []})
         self.client.delete("/session", headers=h)
         self.assertEqual(self.client.get("/session", headers=h).status_code, 401)
 
@@ -393,6 +393,40 @@ class Service(unittest.TestCase):
         self.assertEqual(self.client.get("/diagrams/0123456789abcdef.svg").status_code, 200)
         for bad in ("..%2Fusers.json", "users.json", "0123456789abcdef.txt", "0123456789ABCDEF.svg"):
             self.assertEqual(self.client.get(f"/diagrams/{bad}").status_code, 404, bad)
+
+    def test_root_manages_accounts_and_their_scopes(self):
+        self.assertEqual(self.client.post("/users", json={"user": "ana", "level": "admin", "password": "password-1"},
+                                          headers=self.sign_in()).status_code, 403)
+        root = self.sign_in("root", "r00t")
+        r = self.client.post("/users", json={"user": "ana", "level": "admin", "password": "password-1", "controllers": ["onos"]},
+                             headers=root)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([u for u in r.json()["users"] if u["user"] == "ana"][0]["controllers"], ["onos"])
+        self.assertNotIn("password-1", r.text)
+        ana = self.sign_in("ana", "password-1")
+        self.assertEqual(self.client.get("/session", headers=ana).json()["scope"], ["onos"])
+        self.assertEqual([x["key"] for x in self.client.get("/topology", headers=ana).json()["controllers"]], ["onos"])
+        self.client.put("/users/ana/scope", json={"controllers": []}, headers=root)
+        self.assertEqual(self.client.delete("/users/ana", headers=root).status_code, 200)
+
+    def test_incidents_are_listed_within_the_scope_and_acknowledged_by_admin(self):
+        from canah.incidents import Incidents
+        store = Incidents(Path(self.home) / "incidents.sqlite")
+        store.update([{"fp": "onos:link:L1", "controller": "onos", "severity": "major", "kind": "link_down", "title": "L1 down"},
+                      {"fp": "tpce:unreachable", "controller": "tpce", "severity": "major", "kind": "controller_unreachable",
+                       "title": "tpce cannot be read"}])
+        got = self.client.get("/incidents").json()
+        self.assertEqual(got["counts"]["active"], 2)
+        iid = [i for i in got["incidents"] if i["controller"] == "onos"][0]["id"]
+        self.assertEqual(self.client.post(f"/incidents/{iid}/ack").status_code, 403)            # an observer may not
+        r = self.client.post(f"/incidents/{iid}/ack", headers=self.sign_in())
+        self.assertEqual(r.json()["incident"]["status"], "acked")
+        root = self.sign_in("root", "r00t")
+        self.client.post("/users", json={"user": "bo", "level": "admin", "password": "password-2", "controllers": ["tpce"]}, headers=root)
+        bo = self.sign_in("bo", "password-2")
+        self.assertEqual([i["controller"] for i in self.client.get("/incidents", headers=bo).json()["incidents"]], ["tpce"])
+        self.assertEqual(self.client.get(f"/incidents/{iid}", headers=bo).status_code, 404)    # outside bo's scope
+        self.assertIn("runbooks", self.client.get("/runbooks").json())
 
     def test_a_change_waits_and_an_admin_approves_it(self):
         h = self.sign_in()

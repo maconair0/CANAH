@@ -1,0 +1,7 @@
+name: critical-alarm
+when: {kind: alarm, severity: [critical]}
+mode: investigate
+instructions: |
+  A critical alarm was raised. Read the alarm's resource on its controller (devices, ports, links, services) and
+  follow_relations from it when relations are published. Say what it affects and what the operator should do.
+  Do not change anything.

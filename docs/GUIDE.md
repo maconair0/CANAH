@@ -218,6 +218,44 @@ sudo systemctl restart ollama
 
 For qwen3 30B-A3B at 32k tokens, one slot at 16-bit takes about 3.2 GB, and two slots at 8-bit take the same. Ollama sends each request to the slot whose cache matches it best.
 
+## Operations: incidents, runbooks, history, notifications, scopes
+
+Everything here runs on the common contract's verbs and the normalised topology, so any controller the agentic
+MCP accepts is covered with no new code.
+
+- **The watcher** (`canah/incidents.py`) reads every controller each minute (`watch_interval_s`). It sees:
+  - the agentic MCP or a controller not answering (its sessions, and failed reads);
+  - a device or link down, from the topology;
+  - a service whose status reads as down (`read_services`);
+  - an alarm (`read_alarms`), at the severity the controller gave it.
+
+  Each finding becomes an **incident**, deduplicated, and resolved by itself after `resolve_after` reads without it.
+- **Runbooks** (`canah/runbooks/*.yaml`, and yours in `<CANAH_HOME>/runbooks`) match an incident by kind, severity,
+  controller or text:
+  - `notify` only sends the incident;
+  - `investigate` has CANAH look into it in a thread of its own (`canah-watch.incident-<id>`) and write a report;
+  - `propose` also rehearses a fix in the digital twin and proposes it.
+
+  A fix always waits for a person: approve or reject it on the incident. At most `respond_per_hour`
+  investigations start on their own; `respond: false` stops them.
+- **Notifications** (`canah/notify.py`, `notify_channels`): webhook, Slack, Teams or email. Each channel has a
+  minimum severity and the events it takes: an incident opened or resolved, a change waiting for approval. A
+  secret is always the name of an environment variable.
+- **The networks' history** (`canah/history.py`) keeps each controller's devices, links and services whenever
+  they change. The Incidents page's **Network changes** tab, and the agent's `network_changes`, answer "what
+  changed, and when".
+- **Health over time** (`canah/health.py`): at every reading, each controller's devices, links and services (how
+  many, how many down) and its open incidents, kept for 30 days. They are charted on the Incidents page, and the
+  agent reads them with `health_over_time`.
+- **Scopes:** root can limit an account to some controllers (Profile & access). Its tools, topology, incidents
+  and approvals then keep to them.
+- **Self-knowledge:** `canah_status` gives the agent who is asking and what they may do, the controllers in reach,
+  what the harness already has, what it does not have yet, and what needs attention.
+- **Undo:** on an executed change in the audit log, **Propose undo** asks CANAH for the inverse change, rehearsed
+  and approved like any other.
+- **Skills:** `intent-to-change` ("10 Gbit/s from A to B" to a checked change), `service-scaling` and
+  `incident-triage`.
+
 ## Who may do what
 
 | Signed in as | Sees write tools | May approve |

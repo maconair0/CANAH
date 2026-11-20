@@ -6,8 +6,11 @@ CANAH's canah/network.py speaks to a real agentic MCP.
   GET  /controllers                  [{key, label, domain, tools, conformance}]
   GET  /controllers/{key}/tools      [{name, description, schema, write}]
   POST /controllers/{key}/call       {tool, arguments, approved_by} -> {text, is_error}
-  GET  /sessions                     each controller's session
+  GET  /sessions                     each controller's session (up, or down while it is made unreachable)
   POST /reset                        every domain back to its start (test use)
+  POST /fault                        {domain, kind, target, severity, text}: break something (test use);
+                                     kinds: device_down, link_down, service_down, alarm, controller_down
+  POST /fault/clear                  {domain} or every domain: back to its start
 
 As the real agentic MCP's write gate does: a write without `approved_by` is
 refused before it reaches the domain. Optional bearer token (TESTBED_TOKEN).
@@ -52,7 +55,7 @@ def create_app(domains: Optional[Dict[str, Domain]] = None, token: str = "") -> 
     def tools(key: str):
         d = domains.get(key) or (_ for _ in ()).throw(HTTPException(404, f"no controller {key}"))
         return {"tools": [{"name": t.name, "description": t.description, "schema": t.schema, "write": t.write,
-                           "verb": ""} for t in d.tools()]}
+                           "verb": t.verb} for t in d.tools()]}
 
     @app.post("/controllers/{key}/call")
     def call(key: str, body: Dict[str, Any] = Body(...), authorization: str = Header(default="")):
@@ -60,6 +63,8 @@ def create_app(domains: Optional[Dict[str, Domain]] = None, token: str = "") -> 
         d = domains.get(key)
         if d is None:
             raise HTTPException(404, f"no controller {key}")
+        if getattr(d, "unreachable", False):
+            return {"text": f"Error: {key} does not answer (ConnectTimeout)", "is_error": True}
         t = {x.name: x for x in d.tools()}.get(str(body.get("tool")))
         if t is None:
             return {"text": f"Error: {key} has no tool {body.get('tool')}", "is_error": True}
@@ -75,7 +80,35 @@ def create_app(domains: Optional[Dict[str, Domain]] = None, token: str = "") -> 
 
     @app.get("/sessions")
     def sessions():
-        return {k: {"reachable": True, "latency_ms": 3} for k in domains}
+        return {"sessions": [{"controller": k, "state": "down" if getattr(d, "unreachable", False) else "up",
+                              "last_error": "ConnectTimeout: the controller does not answer" if getattr(d, "unreachable", False) else "",
+                              "latency_ms": None if getattr(d, "unreachable", False) else 3} for k, d in domains.items()]}
+
+    @app.post("/fault")
+    def fault(body: Dict[str, Any] = Body(...)):
+        d = domains.get(str(body.get("domain")))
+        if d is None:
+            raise HTTPException(404, f"no domain {body.get('domain')}")
+        try:
+            done = d.fault(str(body.get("kind")), str(body.get("target") or ""), str(body.get("severity") or "major"),
+                           str(body.get("text") or ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        # Across domains, as in the real thing: a packet link carried by a lightpath goes down with it.
+        if "optical" in domains and "packet" in domains and hasattr(domains["optical"], "out_of_service"):
+            gone = set(domains["optical"].out_of_service())
+            for l in domains["packet"].state["links"]:
+                if any(f"lightpath {lp} " in l["carried_by"] + " " for lp in gone):
+                    l["status"] = "down"
+            domains["packet"]._services_follow()
+        return {"done": done}
+
+    @app.post("/fault/clear")
+    def clear(body: Dict[str, Any] = Body(default={})):
+        for k, d in domains.items():
+            if not body.get("domain") or body.get("domain") == k:
+                d.reset()
+        return {"ok": True}
 
     @app.post("/reset")
     def reset():

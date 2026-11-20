@@ -1,0 +1,7 @@
+name: device-down
+when: {kind: device_down}
+mode: investigate
+instructions: |
+  A device is down. Read its controller's devices, links and services, and alarms if served (net_read_alarms).
+  Say what the device carried, which links and services are affected, and what the operator should check.
+  Do not change anything.

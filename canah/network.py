@@ -193,13 +193,17 @@ class _ControllersTool(BaseTool):
     service: Any
     args_schema: Type[BaseModel] = _Open
 
-    def _run(self, run_manager: Any = None, **kwargs: Any) -> str:
+    def _run(self, config: RunnableConfig, run_manager: Any = None, **kwargs: Any) -> str:
+        from .identity import scope_of
         try:
             rows = self.service.controllers()
         except Exception as e:  # noqa: BLE001
             return f"Error: the agentic MCP did not answer: {type(e).__name__}: {e}"
+        scope = scope_of(config)
         out = []
         for c in rows:
+            if scope and c.get("key") not in scope:
+                continue
             conf = c.get("conformance") or {}
             out.append({"controller": c.get("key"), "label": c.get("label"), "domain": c.get("domain"),
                         "family": c.get("family"), "tools": c.get("tools"), "contract": conf.get("verdict"),
@@ -301,7 +305,18 @@ class _CatalogTool(BaseTool):
     def _find(self, controller: str, tool: str) -> Optional[Dict[str, Any]]:
         return _find(self.catalog, controller, tool)
 
+    def _out_of_scope(self, controller: str, config: Any) -> Optional[str]:
+        from .identity import scope_of
+        scope = scope_of(config)
+        if scope and controller not in scope:
+            return (f"Error: {controller} is outside what this operator works with ({', '.join(scope)}). Answer "
+                    f"from those controllers only, and say so.")
+        return None
+
     def _call(self, controller: str, rec: Dict[str, Any], arguments: Dict[str, Any], config: Any) -> str:
+        refused = self._out_of_scope(controller, config)
+        if refused:
+            return refused
         # A write reaches here only after the operator approved it (interrupt_on stops the call before it
         # runs); the approval travels to the agentic MCP as approved_by, and its own gate checks it.
         by = f"{_user(config)} (approved in canah)" if rec.get("write") else ""
@@ -331,7 +346,11 @@ class VerbTool(_CatalogTool):
         if not controller:
             if self.write:
                 return f"Error: {self.verb} changes the network: name the controller ({', '.join(self.served)})."
-            keys = list(self.served)
+            from .identity import scope_of
+            scope = scope_of(config)
+            keys = [k for k in self.served if not scope or k in scope]
+            if not keys:
+                return f"No controller this operator works with ({', '.join(scope)}) serves {self.verb}."
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=min(8, len(keys) or 1)) as pool:
                 got = list(pool.map(lambda k: self._call(k, self.catalog[k][self.served[k]], arguments, config), keys))
@@ -353,12 +372,14 @@ class _SearchTool(_CatalogTool):
         "query": {"type": "string", "description": "words to look for in the tools' names and descriptions"},
         "limit": {"type": "integer", "description": "at most this many (default 15)"}}}
 
-    def _run(self, controller: str = "", verb: str = "", query: str = "", limit: int = 15,
+    def _run(self, config: RunnableConfig, controller: str = "", verb: str = "", query: str = "", limit: int = 15,
              run_manager: Any = None, **kwargs: Any) -> str:
+        from .identity import scope_of
+        scope = scope_of(config)
         words = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) > 1]
         rows = []
         for key, tools in self.catalog.items():
-            if controller and key != controller:
+            if (controller and key != controller) or (scope and key not in scope):
                 continue
             for rec in tools.values():
                 if verb and rec.get("verb") != verb:

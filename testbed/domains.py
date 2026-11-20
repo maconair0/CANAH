@@ -15,8 +15,10 @@ A packet link between pe-a and pe-b rides an optical lightpath between xpdr-a1 a
 xpdr-b1. A tenant in the fabric reaches site-a through border-leaf-1, pe-b, that
 link and pe-a.
 
-Each tool: name, description, JSON schema, write flag, function. `reset()` puts a
-domain back to its starting state. A fault can be injected (`degrade`).
+Each tool: name, description, JSON schema, write flag, the contract verb it serves (as the agentic MCP
+maps them), function. `reset()` puts a domain back to its starting state. Faults are injected with
+`fault(kind, target)` (a device, link or service down, an alarm, the controller unreachable) and `degrade`
+(a lightpath's OSNR), and cleared with `reset()`.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ class Tool:
     fn: Callable[..., Any]
     schema: Dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
     write: bool = False
+    verb: str = ""
 
 
 def _obj(**props):
@@ -56,9 +59,35 @@ class Domain:
     def reset(self):
         self.state = copy.deepcopy(self.START)
         self.writes: List[Dict[str, Any]] = []
+        self.alarms: List[Dict[str, Any]] = []
+        self.unreachable = False
 
     def tools(self) -> List[Tool]:
         raise NotImplementedError
+
+    def common_tools(self) -> List[Tool]:
+        """What every emulated controller serves besides its own: its alarms and its health."""
+        def list_alarms():
+            return json.dumps({"alarms": self.alarms})
+
+        def health():
+            return json.dumps({"controller": self.key, "ok": True, "alarms": len(self.alarms)})
+        return [Tool("list_alarms", "The active alarms: id, severity, text, resource.", list_alarms, verb="read_alarms"),
+                Tool("health", "Whether the controller itself is well.", health, verb="health")]
+
+    def fault(self, kind: str, target: str = "", severity: str = "major", text: str = "") -> str:
+        """Break something on purpose (tests). The domain's own objects only; returns what was done."""
+        if kind == "controller_down":
+            self.unreachable = True
+            return f"{self.key} does not answer"
+        if kind == "alarm":
+            self.alarms.append({"id": f"AL-{len(self.alarms) + 1}", "severity": severity, "text": text or "an alarm",
+                                "resource": target})
+            return f"alarm raised on {target or self.key}"
+        return self._fault(kind, target)
+
+    def _fault(self, kind: str, target: str) -> str:
+        raise ValueError(f"{self.key} cannot take a {kind} fault")
 
     def _did(self, tool, **args):
         self.writes.append({"tool": tool, **args})
@@ -94,7 +123,7 @@ class Packet(Domain):
         st = self.state
 
         def list_routers():
-            return json.dumps(st["routers"])
+            return json.dumps({"routers": [{"name": n, **r} for n, r in st["routers"].items()]})
 
         def list_links():
             return json.dumps(st["links"])
@@ -103,7 +132,7 @@ class Packet(Domain):
             return json.dumps(st["handoffs"])
 
         def list_services():
-            return json.dumps(st["services"])
+            return json.dumps({"services": [{"name": n, **v} for n, v in st["services"].items()]})
 
         def interface_counters(router: str):
             if router not in st["routers"]:
@@ -164,31 +193,65 @@ class Packet(Domain):
         return [
             Tool("list_relations", "What depends on what in this domain, and where it meets others: rows "
                  "{from, relation, to}.", list_relations),
-            Tool("list_routers", "List the routers with site, role and status.", list_routers),
-            Tool("list_links", "List the links between routers, their status and what carries each.", list_links),
+            Tool("list_routers", "List the routers with site, role and status.", list_routers, verb="read_devices"),
+            Tool("list_links", "List the links between routers, their status and what carries each.", list_links,
+                 verb="read_links"),
             Tool("list_handoffs", "List the ports that hand off to other domains, and to what.", list_handoffs),
             Tool("list_services", "List the VLAN services: vlan, ends, the link they use, customer, status.",
-                 list_services),
+                 list_services, verb="read_services"),
             Tool("interface_counters", "Every interface's counters on one router (in/out octets, errors, state).",
-                 interface_counters, _obj(router=dict(S))),
+                 interface_counters, _obj(router=dict(S)), verb="read_statistics"),
             Tool("create_vlan_service", "Create a VLAN service between two routers (or router:port), optionally over "
                  "a named link.", create_vlan_service,
-                 _obj(name=dict(S), vlan=dict(I), a=dict(S), z=dict(S), over=dict(S, optional=True)), write=True),
-            Tool("delete_service", "Delete a VLAN service by name.", delete_service, _obj(name=dict(S)), write=True),
+                 _obj(name=dict(S), vlan=dict(I), a=dict(S), z=dict(S), over=dict(S, optional=True)), write=True,
+                 verb="provision"),
+            Tool("delete_service", "Delete a VLAN service by name.", delete_service, _obj(name=dict(S)), write=True,
+                 verb="teardown"),
             Tool("restart_router", "Restart a router.", restart_router, _obj(name=dict(S)), write=True),
+            *self.common_tools(),
         ]
+
+    def _fault(self, kind: str, target: str) -> str:
+        st = self.state
+        if kind == "device_down" and target in st["routers"]:
+            st["routers"][target]["status"] = "down"
+            for l in st["links"]:
+                if l["a"].startswith(target + ":") or l["z"].startswith(target + ":"):
+                    l["status"] = "down"
+            self._services_follow()
+            return f"router {target} is down, with its links"
+        if kind == "link_down":
+            for l in st["links"]:
+                if l["name"] == target:
+                    l["status"] = "down"
+                    self._services_follow()
+                    return f"link {target} is down"
+        if kind == "service_down" and target in st["services"]:
+            st["services"][target]["status"] = "down"
+            return f"service {target} is down"
+        raise ValueError(f"packet has no {kind} target {target!r}")
+
+    def _services_follow(self):
+        down = {l["name"] for l in self.state["links"] if l["status"] == "down"}
+        for svc in self.state["services"].values():
+            if svc.get("over") in down:
+                svc["status"] = "down"
+
 
 
 class Optical(Domain):
     key, label, domain = "optical", "OptiCtl", "optical"
     START = {
-        "nodes": {**{f"roadm-{s}": {"site": f"site-{s}", "node-type": "ROADM"} for s in "abc"},
-                  **{f"xpdr-{s}{i}": {"site": f"site-{s}", "node-type": "XPONDER"} for s in "abc" for i in (1, 2)},
-                  **{f"amp-{n}": {"site": "span", "node-type": "AMPLIFIER"} for n in range(1, 5)}},
+        "nodes": {**{f"roadm-{s}": {"site": f"site-{s}", "node-type": "ROADM", "status": "up"} for s in "abc"},
+                  **{f"xpdr-{s}{i}": {"site": f"site-{s}", "node-type": "XPONDER", "status": "up"} for s in "abc" for i in (1, 2)},
+                  **{f"amp-{n}": {"site": "span", "node-type": "AMPLIFIER", "status": "up"} for n in range(1, 5)}},
+        "fibres": [{"name": "F-ab", "a": "roadm-a", "z": "roadm-b", "length_km": 240, "status": "up"},
+                   {"name": "F-bc", "a": "roadm-b", "z": "roadm-c", "length_km": 380, "status": "up"},
+                   {"name": "F-ac", "a": "roadm-a", "z": "roadm-c", "length_km": 400, "status": "up"}],
         "lightpaths": {
-            "LP-1": {"a": "xpdr-a1", "z": "xpdr-b1", "rate_gbps": 100, "osnr_db": 21.4, "state": "in-service",
+            "LP-1": {"a": "xpdr-a1", "z": "xpdr-b1", "rate_gbps": 100, "osnr_db": 21.4, "state": "in-service", "path": ["F-ab"],
                      "client": {"xpdr-a1": "packet pe-a:eth3", "xpdr-b1": "packet pe-b:eth3"}},
-            "LP-2": {"a": "xpdr-a2", "z": "xpdr-c1", "rate_gbps": 400, "osnr_db": 24.9, "state": "in-service",
+            "LP-2": {"a": "xpdr-a2", "z": "xpdr-c1", "rate_gbps": 400, "osnr_db": 24.9, "state": "in-service", "path": ["F-ac"],
                      "client": {}},
         },
     }
@@ -205,7 +268,10 @@ class Optical(Domain):
             return json.dumps({"nodes": rows})
 
         def list_lightpaths():
-            return json.dumps(st["lightpaths"])
+            return json.dumps({"lightpaths": [{"name": n, **lp} for n, lp in st["lightpaths"].items()]})
+
+        def list_fibres():
+            return json.dumps({"links": st["fibres"]})
 
         def lightpath_osnr(name: str):
             lp = st["lightpaths"].get(name)
@@ -221,7 +287,7 @@ class Optical(Domain):
             if name in st["lightpaths"]:
                 return f"Error: lightpath {name} exists"
             st["lightpaths"][name] = {"a": a, "z": z, "rate_gbps": int(rate_gbps), "osnr_db": 22.0,
-                                      "state": "in-service", "client": {}}
+                                      "state": "in-service", "client": {}, "path": []}
             self._did("create_lightpath", name=name, a=a, z=z, rate_gbps=int(rate_gbps))
             return f"lightpath {name} created ({a} to {z}, {rate_gbps}G), in service"
 
@@ -246,14 +312,47 @@ class Optical(Domain):
             Tool("list_relations", "What depends on what in this domain, and where it meets others: rows "
                  "{from, relation, to}.", list_relations),
             Tool("list_nodes", "Every node (ROADMs, transponders, amplifiers) with its site, node-type and ports.",
-                 list_nodes),
-            Tool("list_lightpaths", "The lightpaths: ends, rate, OSNR, state, and the client each end hands off to.",
-                 list_lightpaths),
+                 list_nodes, verb="read_devices"),
+            Tool("list_fibres", "The fibres between ROADMs: ends, length, status.", list_fibres, verb="read_links"),
+            Tool("list_lightpaths", "The lightpaths: ends, rate, OSNR, state, the fibres they ride, and the client each "
+                 "end hands off to.", list_lightpaths, verb="read_services"),
             Tool("lightpath_osnr", "One lightpath's measured OSNR in dB.", lightpath_osnr, _obj(name=dict(S))),
             Tool("create_lightpath", "Create a lightpath between two transponders at a rate in Gb/s.", create_lightpath,
-                 _obj(name=dict(S), a=dict(S), z=dict(S), rate_gbps=dict(I)), write=True),
-            Tool("delete_lightpath", "Delete a lightpath by name.", delete_lightpath, _obj(name=dict(S)), write=True),
+                 _obj(name=dict(S), a=dict(S), z=dict(S), rate_gbps=dict(I)), write=True, verb="provision"),
+            Tool("delete_lightpath", "Delete a lightpath by name.", delete_lightpath, _obj(name=dict(S)), write=True,
+                 verb="teardown"),
+            *self.common_tools(),
         ]
+
+    def _fault(self, kind: str, target: str) -> str:
+        st = self.state
+        if kind == "device_down" and target in st["nodes"]:
+            st["nodes"][target]["status"] = "down"
+            for f in st["fibres"]:
+                if target in (f["a"], f["z"]):
+                    f["status"] = "down"
+            self._lightpaths_follow()
+            return f"node {target} is down"
+        if kind == "link_down":
+            for f in st["fibres"]:
+                if f["name"] == target:
+                    f["status"] = "down"
+                    self._lightpaths_follow()
+                    return f"fibre {target} is cut"
+        if kind == "service_down" and target in st["lightpaths"]:
+            st["lightpaths"][target]["state"] = "out-of-service"
+            return f"lightpath {target} is out of service"
+        raise ValueError(f"optical has no {kind} target {target!r}")
+
+    def _lightpaths_follow(self):
+        cut = {f["name"] for f in self.state["fibres"] if f["status"] == "down"}
+        dead = {n for n, x in self.state["nodes"].items() if x.get("status") == "down"}
+        for lp in self.state["lightpaths"].values():
+            if set(lp.get("path") or []) & cut or {lp["a"], lp["z"]} & dead:
+                lp["state"] = "out-of-service"
+
+    def out_of_service(self):
+        return [n for n, lp in self.state["lightpaths"].items() if lp["state"] != "in-service"]
 
     def degrade(self, name: str, osnr_db: float):
         self.state["lightpaths"][name]["osnr_db"] = osnr_db
@@ -262,9 +361,9 @@ class Optical(Domain):
 class Fabric(Domain):
     key, label, domain = "fabric", "FabricCtl", "data-centre"
     START = {
-        "switches": {"spine-1": {"role": "spine"}, "spine-2": {"role": "spine"},
-                     "leaf-1": {"role": "leaf"}, "leaf-2": {"role": "leaf"},
-                     "border-leaf-1": {"role": "border-leaf", "uplink": "packet pe-b:eth4 (port48)"}},
+        "switches": {"spine-1": {"role": "spine", "status": "up"}, "spine-2": {"role": "spine", "status": "up"},
+                     "leaf-1": {"role": "leaf", "status": "up"}, "leaf-2": {"role": "leaf", "status": "up"},
+                     "border-leaf-1": {"role": "border-leaf", "uplink": "packet pe-b:eth4 (port48)", "status": "up"}},
         "tenants": {"blue": {"vni": 5001, "leaves": ["leaf-1"], "external": None},
                     "green": {"vni": 5002, "leaves": ["leaf-2"], "external": "VS-200 via border-leaf-1"}},
     }
@@ -273,10 +372,12 @@ class Fabric(Domain):
         st = self.state
 
         def list_switches():
-            return json.dumps(st["switches"])
+            return json.dumps({"switches": [{"name": n, **x} for n, x in st["switches"].items()]})
 
         def list_tenants():
-            return json.dumps(st["tenants"])
+            return json.dumps({"tenants": [{"name": n, "status": "down" if any(st["switches"].get(l, {}).get("status") == "down"
+                                                                                   for l in t["leaves"]) else "up", **t}
+                                           for n, t in st["tenants"].items()]})
 
         def attach_tenant(tenant: str, leaf: str):
             if tenant not in st["tenants"]:
@@ -314,15 +415,22 @@ class Fabric(Domain):
             Tool("list_relations", "What depends on what in this domain, and where it meets others: rows "
                  "{from, relation, to}.", list_relations),
             Tool("list_switches", "The fabric's switches and their roles (and the border leaf's uplink).",
-                 list_switches),
+                 list_switches, verb="read_devices"),
             Tool("list_tenants", "The tenants: VNI, the leaves they are on, and their external connection.",
-                 list_tenants),
+                 list_tenants, verb="read_services"),
             Tool("attach_tenant", "Attach a tenant's network to a leaf switch.", attach_tenant,
-                 _obj(tenant=dict(S), leaf=dict(S)), write=True),
+                 _obj(tenant=dict(S), leaf=dict(S)), write=True, verb="provision"),
             Tool("connect_tenant_external", "Connect a tenant to a service outside the fabric, through the border "
                  "leaf (the tenant must be on the border leaf).", connect_tenant_external,
-                 _obj(tenant=dict(S), service=dict(S)), write=True),
+                 _obj(tenant=dict(S), service=dict(S)), write=True, verb="adjust"),
+            *self.common_tools(),
         ]
+
+    def _fault(self, kind: str, target: str) -> str:
+        if kind == "device_down" and target in self.state["switches"]:
+            self.state["switches"][target]["status"] = "down"
+            return f"switch {target} is down"
+        raise ValueError(f"fabric has no {kind} target {target!r}")
 
 
 def all_domains() -> Dict[str, Domain]:

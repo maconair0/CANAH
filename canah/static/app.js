@@ -90,7 +90,7 @@ async function enter(session) {
   go(state.view, true);
   refreshStatus();
   loadTopology();
-  refreshTwinPill();
+  refreshTwinPill(); refreshIncidents();
 }
 
 /* ================= status strip ================= */
@@ -115,7 +115,7 @@ setInterval(() => { $("#st-clock").textContent = new Date().toLocaleTimeString()
 $("#st-ctl").addEventListener("click", () => go("controllers"));
 
 /* ================= router ================= */
-const VIEWS = ["model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
+const VIEWS = ["incidents", "model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
 function go(view, first = false) {
   if (!VIEWS.includes(view)) view = "topology";
   state.view = view; store.set("canah.view", view);
@@ -138,6 +138,7 @@ function go(view, first = false) {
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
   if (view === "model") renderModel();
+  if (view === "incidents") renderIncidents();
 }
 $$(".nav button[data-view]").forEach((b) => b.addEventListener("click", () => go(b.dataset.view)));
 const setPanel = (which, hidden) => { document.body.classList.toggle(`${which}-hidden`, hidden); store.set(`canah.${which}-hidden`, hidden); if (state.view === "topology") setTimeout(() => fitTopology(false), 30); };
@@ -1470,6 +1471,162 @@ function downloadDiagram(box, kind) {
   img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(xml)));
 }
 
+/* ================= incidents ================= */
+const SEV_CLASS = { critical: "bad", major: "bad", minor: "warn", warning: "warn", info: "" };
+const ago2 = (t) => { const s = Math.max(0, Date.now() / 1000 - t); return s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : s < 172800 ? `${Math.round(s / 3600)} h` : `${Math.round(s / 86400)} d`; };
+async function refreshIncidents() {
+  try {
+    const r = await api("/incidents?status=active&limit=1");
+    const n = r.counts?.active || 0, worst = r.counts?.worst;
+    $("#inc-badge").hidden = !n; $("#inc-badge").textContent = n;
+    $("#st-inc").hidden = false; $("#st-inc span:last-child").textContent = n ? `incidents ${n}` : "no incidents";
+    $("#st-inc .dot").className = `dot ${!n ? "ok" : worst === "critical" || worst === "major" ? "bad" : "warn"}`;
+  } catch (e) { /* the pill stays as it was */ }
+}
+$("#st-inc").addEventListener("click", () => go("incidents"));
+setInterval(() => { if (!$("#shell").hidden) refreshIncidents(); }, 30000);
+function incTab(t) {
+  state.incTab = t;
+  $$("#inc-tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === t));
+  $$("#view-incidents .inc-pane").forEach((p) => p.hidden = p.dataset.pane !== (t === "active" || t === "all" ? "list" : t));
+  if (t === "changes") renderHistory(); else if (t === "setup") renderSetup(); else if (t === "health") renderHealth(); else renderIncidents();
+}
+$$("#inc-tabs .tab").forEach((b) => b.addEventListener("click", () => incTab(b.dataset.tab)));
+async function renderIncidents() {
+  const tab = state.incTab || "active";
+  if (tab === "changes" || tab === "setup" || tab === "health") return;
+  let r; try { r = await api(`/incidents?status=${tab === "all" ? "all" : "active"}`); } catch (e) { $("#inc-table").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  refreshIncidents();
+  const c = r.counts || {}, by = c.by_severity || {};
+  const k = (label, value, sub, dot = "") => `<div class="kpi"><div class="label">${dot ? `<span class="dot ${dot}"></span>` : ""}${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
+  $("#inc-kpis").innerHTML = [k("Active", c.active || 0, "open or acknowledged", c.active ? "bad" : "ok"), k("Critical", by.critical || 0, "", by.critical ? "bad" : ""),
+    k("Major", by.major || 0, "", by.major ? "bad" : ""), k("Minor / warning", (by.minor || 0) + (by.warning || 0), "", ""),
+    k("Watcher", r.watching ? "on" : "off", r.watch?.at ? `last read ${ago2(r.watch.at)} ago` : "not read yet", r.watching ? "ok" : "warn")].join("");
+  $("#inc-n").textContent = c.active || "";
+  $("#inc-watch").textContent = r.watch?.at ? `${r.watch.findings} findings at the last read` : "";
+  const rows = r.incidents || [];
+  $("#inc-table").innerHTML = rows.length ? `<table class="tbl inc-tbl"><thead><tr><th>severity</th><th>what</th><th>controller</th><th>since</th><th>seen</th><th>status</th><th>runbook</th></tr></thead><tbody>
+    ${rows.map((i) => `<tr class="click${state.incSel === i.id ? " sel" : ""}" data-id="${i.id}"><td><span class="tag ${SEV_CLASS[i.severity] || ""}">${esc(i.severity)}</span></td>
+      <td><b>${esc(i.title)}</b><div class="faint cell-sub">${esc(i.kind.replace(/_/g, " "))} · #${i.id}</div></td><td class="mono" style="font-size:12px">${esc(i.controller)}</td>
+      <td>${ago2(i.first_seen)}</td><td class="num">${i.count}</td><td><span class="tag ${i.status === "resolved" ? "ok" : i.status === "acked" ? "info" : "warn"}">${esc(i.status)}</span></td>
+      <td>${i.runbook ? `<span class="faint">${esc(i.runbook)}</span> <span class="tag">${esc(i.mode || "")}</span>` : "<span class='faint'>–</span>"}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">${tab === "all" ? "No incidents yet." : "Nothing is wrong that the watcher can see."}</div>`;
+  $$("#inc-table tr.click").forEach((tr) => tr.addEventListener("click", () => showIncident(Number(tr.dataset.id))));
+  if (state.incSel) showIncident(state.incSel, true);
+}
+async function showIncident(id, quiet = false) {
+  state.incSel = id;
+  $$("#inc-table tr.sel").forEach((x) => x.classList.remove("sel")); $(`#inc-table tr[data-id="${id}"]`)?.classList.add("sel");
+  let r; try { r = await api(`/incidents/${id}`); } catch (e) { if (!quiet) toast(e.message, "bad"); return; }
+  const i = r.incident, adm = levelRank(state.level) >= 1;
+  $("#inc-detail-title").textContent = `#${i.id} · ${i.title}`;
+  let details = i.details || ""; try { details = JSON.stringify(JSON.parse(details), null, 1); } catch (e) { /* as it is */ }
+  const tools = (r.messages || []).filter((m) => m.role === "tool");
+  $("#inc-detail").innerHTML = `<div class="kv"><div>severity</div><div><span class="tag ${SEV_CLASS[i.severity] || ""}">${esc(i.severity)}</span></div>
+      <div>status</div><div>${esc(i.status)}${i.acked_by ? ` · by ${esc(i.acked_by)}` : ""}</div><div>controller</div><div class="mono">${esc(i.controller)}</div>
+      <div>first seen</div><div>${new Date(i.first_seen * 1000).toLocaleString()} (${ago2(i.first_seen)} ago)</div><div>last seen</div><div>${new Date(i.last_seen * 1000).toLocaleString()} · ${i.count} times</div>
+      ${i.resolved_at ? `<div>resolved</div><div>${new Date(i.resolved_at * 1000).toLocaleString()}</div>` : ""}
+      <div>runbook</div><div>${i.runbook ? `${esc(i.runbook)} (${esc(i.mode || "")})` : "none matched"}</div>${i.note ? `<div>note</div><div>${esc(i.note)}</div>` : ""}</div>
+    ${details ? `<details style="margin-top:8px"><summary class="muted">what the watcher saw</summary><pre class="inc-pre">${esc(details)}</pre></details>` : ""}
+    ${(r.pending || []).length ? `<h4>A fix waits for approval</h4>${r.pending.map((p, n) => `<div class="inc-fix"><b class="mono">${esc(p.name)}</b> <span class="faint">needs ${esc(p.needs || "admin")}</span>${kvTable(p.args || {})}
+        <div class="row" style="margin-top:6px"><button class="btn sm primary" data-dec="approve" ${levelRank(state.level) >= levelRank(p.needs || "admin") ? "" : "disabled"}>Approve</button><button class="btn sm danger" data-dec="reject" ${adm ? "" : "disabled"}>Reject</button></div></div>`).join("")}` : ""}
+    <h4>CANAH's investigation</h4>
+    ${i.report ? `<div class="reply-rich inc-report">${md(i.report)}</div>` : i.thread ? `<div class="working"><span class="bars"><i></i><i></i><i></i></span>CANAH is looking into it…</div>` : `<div class="faint" style="font-size:12.5px">Not investigated${i.runbook ? "" : ": no runbook asks for it"}.</div>`}
+    ${tools.length ? `<details style="margin-top:8px"><summary class="muted">${tools.length} tool call${tools.length > 1 ? "s" : ""}</summary>${tools.map((t) => `<div class="inc-step"><span class="mono">${esc(t.name)}</span> <span class="faint">${t.ms != null ? fmtDur(t.ms) : ""}</span><div class="faint">${esc(brief(t.result || "", 220))}</div></div>`).join("")}</details>` : ""}
+    <div class="row" style="margin-top:12px;flex-wrap:wrap">
+      ${i.status !== "resolved" ? `<button class="btn sm" data-act="ack" ${adm && i.status === "open" ? "" : "disabled"}>Acknowledge</button><button class="btn sm" data-act="resolve" ${adm ? "" : "disabled"}>Resolve</button>` : ""}
+      <button class="btn sm" data-act="investigate" ${adm ? "" : "disabled title='admin'"}>Investigate now</button>
+      <button class="btn sm" data-act="propose" ${adm ? "" : "disabled title='admin'"}>Propose a fix</button>
+      <button class="btn sm" data-ask="${esc(`About incident #${i.id} (${i.title}, on ${i.controller}): what happened, what does it affect, and what changed just before it?`)}">Ask CANAH</button></div>`;
+  $$("#inc-detail [data-act]").forEach((b) => b.addEventListener("click", async () => {
+    const act = b.dataset.act, body = act === "investigate" ? { mode: "investigate" } : act === "propose" ? { mode: "propose" } : {};
+    try { await api(`/incidents/${id}/${act === "propose" ? "investigate" : act}`, { method: "POST", body }); toast(act === "ack" ? "Acknowledged." : act === "resolve" ? "Resolved." : "CANAH is looking into it.", "ok"); renderIncidents(); setTimeout(() => showIncident(id, true), 4000); }
+    catch (e) { toast(e.message, "bad"); }
+  }));
+  $$("#inc-detail [data-dec]").forEach((b) => b.addEventListener("click", async () => {
+    try { await api(`/incidents/${id}/decide`, { method: "POST", body: { decisions: (r.pending || []).map(() => ({ type: b.dataset.dec })) } }); toast(b.dataset.dec === "approve" ? "Approved: the fix was sent." : "Rejected.", "ok"); showIncident(id); }
+    catch (e) { toast(e.message, "bad"); }
+  }));
+  $$("#inc-detail [data-ask]").forEach((b) => b.addEventListener("click", () => { go("chat"); $("#composer").value = b.dataset.ask; $("#composer").focus(); }));
+  if (i.thread && !i.report) { clearTimeout(state.incTimer); state.incTimer = setTimeout(() => { if (state.view === "incidents" && state.incSel === id) showIncident(id, true); }, 5000); }
+}
+// A small chart per controller: what is down (devices, links, services) and the incidents open, over time.
+function spark(points, keys, w = 320, h = 70) {
+  if (!points.length) return "";
+  const t0 = points[0].at, t1 = points[points.length - 1].at || t0 + 1, max = Math.max(1, ...points.flatMap((p) => keys.map((k) => p[k.f])));
+  const x = (t) => 4 + ((t - t0) / Math.max(1, t1 - t0)) * (w - 8), y = (v) => h - 6 - (v / max) * (h - 14);
+  return `<svg viewBox="0 0 ${w} ${h}" class="spark" preserveAspectRatio="none"><line x1="4" x2="${w - 4}" y1="${h - 6}" y2="${h - 6}" class="axis"/>${keys.map((k) =>
+    `<polyline fill="none" stroke="${k.c}" stroke-width="1.8" points="${points.map((p) => `${x(p.at).toFixed(1)},${y(p[k.f]).toFixed(1)}`).join(" ")}"><title>${k.l}</title></polyline>`).join("")}
+    <text x="${w - 4}" y="11" text-anchor="end" class="mx">${max}</text></svg>`;
+}
+async function renderHealth() {
+  let r; try { r = await api(`/health/series?hours=${$("#hl-hours").value}`); } catch (e) { $("#hl-body").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  const keys = [{ f: "devices_down", l: "devices down", c: "#ff6b6b" }, { f: "links_down", l: "links down", c: "#f6a52c" },
+                { f: "services_down", l: "services down", c: "#c792ea" }, { f: "incidents", l: "incidents open", c: "#3d8bff" }];
+  const rows = Object.entries(r.series || {});
+  $("#hl-body").innerHTML = rows.length ? rows.map(([k, v]) => { const last = v[v.length - 1], reach = Math.round(100 * v.filter((p) => p.reachable).length / v.length);
+    return `<div class="card hl-card"><header><h3>${esc(k)}</h3><div class="spacer"></div><span class="tag ${last.reachable ? "ok" : "bad"}">${last.reachable ? "reachable" : "not answering"}</span></header>
+      <div class="body">${spark(v, keys)}<div class="hl-legend">${keys.map((x) => `<span><i style="background:${x.c}"></i>${x.l} <b>${last[x.f]}</b></span>`).join("")}</div>
+      <div class="faint" style="font-size:11.5px;margin-top:4px">${last.devices} devices · ${last.links} links · ${last.services} services · reachable ${reach}% of ${v.length} readings</div></div></div>`; }).join("")
+    : `<div class="empty">No readings yet: the watcher records one each minute while CANAH runs.</div>`;
+}
+$("#hl-hours").addEventListener("change", renderHealth);
+
+async function renderHistory() {
+  const ctl = $("#hist-ctl").value, hours = $("#hist-hours").value;
+  let r; try { r = await api(`/history?hours=${hours}${ctl ? `&controller=${encodeURIComponent(ctl)}` : ""}`); } catch (e) { $("#hist-body").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  const sel = $("#hist-ctl"), keep = sel.value;
+  sel.innerHTML = `<option value="">every controller</option>` + (r.controllers || []).map((k) => `<option value="${esc(k)}">${esc(k)}</option>`).join(""); sel.value = keep;
+  const rows = (r.changes || []).flatMap((c) => c.changes.map((x) => ({ ...x, at: c.at, controller: c.controller })));
+  $("#hist-body").innerHTML = rows.length ? `<table class="tbl"><thead><tr><th>when</th><th>controller</th><th>what</th><th>change</th></tr></thead><tbody>${rows.slice(0, 400).map((x) => `<tr><td style="white-space:nowrap">${new Date(x.at * 1000).toLocaleString()}</td>
+      <td class="mono" style="font-size:12px">${esc(x.controller)}</td><td>${esc(x.kind)} <b class="mono">${esc(x.id)}</b></td>
+      <td><span class="tag ${x.change === "added" ? "ok" : x.change === "removed" ? "bad" : "warn"}">${esc(x.change)}</span> ${x.fields ? Object.entries(x.fields).map(([f, v]) => `<span class="faint">${esc(f)}:</span> ${esc(String(v[0]))} → <b>${esc(String(v[1]))}</b>`).join(" · ") : ""}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">No change in this window. The history starts when the watcher first reads each network, and keeps a snapshot whenever something changes.</div>`;
+}
+$("#hist-ctl").addEventListener("change", renderHistory); $("#hist-hours").addEventListener("change", renderHistory);
+async function renderSetup() {
+  try {
+    const [rb, nt] = await Promise.all([api("/runbooks"), api("/notify")]);
+    $("#rb-body").innerHTML = `<table class="tbl"><thead><tr><th>runbook</th><th>when</th><th>does</th></tr></thead><tbody>${(rb.runbooks || []).map((x) => `<tr><td><b>${esc(x.name)}</b><div class="faint cell-sub">${x.builtin ? "built in" : "this site's"}</div></td>
+      <td class="mono" style="font-size:11.5px">${esc(JSON.stringify(x.when || {}))}</td><td><span class="tag ${x.mode === "propose" ? "info" : ""}">${esc(x.mode)}</span><div class="faint cell-sub">${esc(String(x.instructions || "").split("\n")[0].slice(0, 120))}</div></td></tr>`).join("")}</tbody></table>`;
+    $("#nt-body").innerHTML = (nt.channels || []).length ? `<table class="tbl"><thead><tr><th>channel</th><th>events</th><th>from</th><th>ready</th></tr></thead><tbody>${nt.channels.map((c) => `<tr><td><b>${esc(c.kind)}</b><div class="faint cell-sub">${esc(c.name)}${c.to ? " · " + esc([].concat(c.to).join(", ")) : ""}</div></td>
+        <td style="font-size:11.5px">${esc(c.events.join(", ").replace(/_/g, " "))}</td><td>${esc(c.min_severity)}</td><td>${c.ready ? `<span class="tag ok">yes</span>` : `<span class="tag warn">not set</span>`}</td></tr>`).join("")}</tbody></table>`
+      : `<p class="muted" style="margin:0;font-size:12.5px">No channel yet. Add them to <span class="mono">notify_channels</span> in canah.yaml, e.g.<br><span class="mono">- {kind: slack, url_env: SLACK_WEBHOOK_URL, min_severity: major}</span><br>(webhook, slack, teams, or email with CANAH_SMTP_HOST).</p>`;
+    $("#nt-body").innerHTML += (nt.sent || []).length ? `<h4>Last sent</h4>${nt.sent.slice(0, 8).map((x) => `<div class="act-row"><span class="dot ${x.results.every((y) => y.ok) ? "ok" : "bad"}"></span><div>${esc(x.title)}<div class="faint">${esc(x.event.replace(/_/g, " "))}</div></div><span class="faint">${ago2(x.at)}</span></div>`).join("")}` : "";
+    $("#nt-test").disabled = levelRank(state.level) < 1 || !(nt.channels || []).length;
+  } catch (e) { $("#rb-body").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; }
+}
+$("#nt-test").addEventListener("click", async () => { try { const r = await api("/notify/test", { method: "POST" }); toast(r.results.map((x) => `${x.channel}: ${x.ok ? "sent" : x.error}`).join(" · ") || "No channel took it.", r.results.every((x) => x.ok) ? "ok" : "warn"); renderSetup(); } catch (e) { toast(e.message, "bad"); } });
+$("#inc-refresh").addEventListener("click", () => incTab(state.incTab || "active"));
+$("#inc-poll").addEventListener("click", async () => { try { const r = await api("/watch/poll", { method: "POST" }); toast(`Read every controller: ${r.findings} findings, ${r.opened} new, ${r.resolved} resolved.`, "ok"); renderIncidents(); } catch (e) { toast(e.message, "bad"); } });
+window.addEventListener("hashchange", () => { const m = location.hash.match(/^#incident-(\d+)/); if (m) { go("incidents"); incTab("all"); showIncident(Number(m[1])); } });
+
+/* ================= accounts ================= */
+async function renderAccounts() {
+  const root = levelRank(state.level) >= 2;
+  $("#acc-card").hidden = levelRank(state.level) < 1;
+  if ($("#acc-card").hidden) return;
+  let r; try { r = await api("/users"); } catch (e) { $("#acc-table").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  const ctls = (state.topology?.controllers || []).map((c) => c.key);
+  $("#acc-table").innerHTML = `<table class="tbl"><thead><tr><th>account</th><th>level</th><th>controllers</th><th></th></tr></thead><tbody>${r.users.map((u) => `<tr><td><b>${esc(u.user)}</b><div class="faint cell-sub">${esc(u.from)}${u.default_password ? " · <span style='color:var(--warn)'>default password</span>" : ""}</div></td>
+    <td><span class="tag ${u.level === "root" ? "warn" : "ok"}">${esc(u.level)}</span></td>
+    <td>${u.from === "users.json" ? `<div class="acc-scope" data-user="${esc(u.user)}">${ctls.map((k) => `<label class="chip-check"><input type="checkbox" value="${esc(k)}" ${u.controllers.includes(k) ? "checked" : ""} ${root ? "" : "disabled"}>${esc(k)}</label>`).join("")}<span class="faint" style="font-size:11px">${u.controllers.length ? "" : "none ticked: every controller"}</span></div>` : `<span class="faint">every controller</span>`}</td>
+    <td style="text-align:right">${u.from === "users.json" && root && u.user !== state.user ? `<button class="btn sm danger" data-drop-user="${esc(u.user)}">Remove</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
+  $$("#acc-table .acc-scope input").forEach((x) => x.addEventListener("change", async () => {
+    const box = x.closest(".acc-scope"), controllers = $$("input:checked", box).map((y) => y.value);
+    try { await api(`/users/${encodeURIComponent(box.dataset.user)}/scope`, { method: "PUT", body: { controllers } }); toast(`${box.dataset.user}: ${controllers.length ? controllers.join(", ") : "every controller"} (from the next sign-in).`, "ok"); renderAccounts(); } catch (e) { toast(e.message, "bad"); }
+  }));
+  $$("[data-drop-user]").forEach((b) => b.addEventListener("click", async () => { if (!confirm(`Remove the account ${b.dataset.dropUser}?`)) return; try { await api(`/users/${encodeURIComponent(b.dataset.dropUser)}`, { method: "DELETE" }); renderAccounts(); } catch (e) { toast(e.message, "bad"); } }));
+  $("#acc-scope").innerHTML = ctls.map((k) => `<label class="chip-check"><input type="checkbox" value="${esc(k)}">${esc(k)}</label>`).join("") + `<span class="faint" style="font-size:11px">none ticked: every controller</span>`;
+  $$("#acc-form input, #acc-form select, #acc-form button").forEach((x) => x.disabled = !root);
+  $("#acc-msg").textContent = root ? "" : "Sign in as root to add accounts.";
+}
+$("#acc-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { user: $("#acc-user").value.trim(), level: $("#acc-level").value, password: $("#acc-pass").value, controllers: $$("#acc-scope input:checked").map((x) => x.value) };
+  try { await api("/users", { method: "POST", body }); $("#acc-pass").value = ""; $("#acc-user").value = ""; toast(`${body.user} added.`, "ok"); renderAccounts(); } catch (err) { $("#acc-msg").textContent = err.message; }
+});
+
 /* ================= the model ================= */
 async function renderModel() {
   const root = levelRank(state.level) >= 2;
@@ -1568,7 +1725,13 @@ async function renderOps() {
       k("Context window", m.context_percent_median != null ? `${m.context_percent_median}%` : "–", m.context_percent_max != null ? `median filled · max ${m.context_percent_max}%` : "filled, after each request"),
       k("Sent back · 24 h", Object.values(m.sent_back || {}).reduce((a, b) => a + b, 0), Object.entries(m.sent_back || {}).map(([a, b]) => `${a} ${b}`).join(" · ") || "by the checks"),
       k("Audit entries", a.audit.length, "latest shown")].join("");
-    $("#ops-audit").innerHTML = a.audit.length ? `<table class="tbl"><thead><tr><th>when</th><th>event</th><th>who</th><th>tool</th><th>arguments / result</th></tr></thead><tbody>${a.audit.map((r) => `<tr><td style="white-space:nowrap">${esc(fmtTime(r.at))}</td><td><span class="tag ${r.event === "executed" ? "ok" : r.event === "decided" ? (r.decision === "reject" ? "bad" : "info") : r.event === "proposed" ? "warn" : ""}">${esc(r.event)}${r.decision ? " · " + esc(r.decision) : ""}</span></td><td>${esc(r.user)} <span class="faint">${esc(r.level)}</span></td><td class="mono">${esc(r.tool)}</td><td class="mono" style="font-size:11px;max-width:520px;overflow-wrap:anywhere">${esc(typeof r.args === "string" ? r.args : JSON.stringify(r.args)).slice(0, 260)}${r.result ? `<div class="faint">${esc(String(r.result).slice(0, 220))}</div>` : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">The audit log is empty.</div>`;
+    $("#ops-audit").innerHTML = a.audit.length ? `<table class="tbl"><thead><tr><th>when</th><th>event</th><th>who</th><th>tool</th><th>arguments / result</th></tr></thead><tbody>${a.audit.map((r) => `<tr><td style="white-space:nowrap">${esc(fmtTime(r.at))}</td><td><span class="tag ${r.event === "executed" ? "ok" : r.event === "decided" ? (r.decision === "reject" ? "bad" : "info") : r.event === "proposed" ? "warn" : ""}">${esc(r.event)}${r.decision ? " · " + esc(r.decision) : ""}</span></td><td>${esc(r.user)} <span class="faint">${esc(r.level)}</span></td><td class="mono">${esc(r.tool)}</td><td class="mono" style="font-size:11px;max-width:520px;overflow-wrap:anywhere">${esc(typeof r.args === "string" ? r.args : JSON.stringify(r.args)).slice(0, 260)}${r.result ? `<div class="faint">${esc(String(r.result).slice(0, 220))}</div>` : ""}${r.event === "executed" ? `<div style="margin-top:4px"><button class="btn sm ghost" data-undo="${esc(JSON.stringify({ at: r.at, tool: r.tool, args: r.args, user: r.user }))}" title="Ask CANAH to propose the change that undoes this one">Propose undo</button></div>` : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">The audit log is empty.</div>`;
+    $$("#ops-audit [data-undo]").forEach((b) => b.addEventListener("click", () => {
+      const u = JSON.parse(b.dataset.undo);
+      go("chat");
+      $("#composer").value = `Propose the change that undoes this one, executed ${fmtTime(u.at)} by ${u.user}: ${u.tool} with ${typeof u.args === "string" ? u.args : JSON.stringify(u.args)}. Read the current state first, rehearse the undo in the digital twin, then propose it for approval.`;
+      $("#composer").focus();
+    }));
   } catch (e) { $("#ops-audit").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 $("#ops-refresh").addEventListener("click", renderOps);
@@ -1777,6 +1940,7 @@ $("#doc-drop").addEventListener("drop", (e) => { e.preventDefault(); e.currentTa
 
 /* ================= profile, about ================= */
 function renderIdentity() {
+  setTimeout(renderAccounts, 0);
   $("#id-current").innerHTML = `<div>user</div><div>${esc(state.user)}</div><div>level</div><div><span class="tag ${state.level === "root" ? "warn" : state.level === "admin" ? "ok" : ""}">${esc(state.level)}</span></div><div>session</div><div>${state.token ? "signed in" : "observer, no session"}</div>`;
   const yes = (l) => levelRank(state.level) >= levelRank(l) ? "✓" : "";
   $("#id-levels").innerHTML = `<table class="tbl"><thead><tr><th>profile</th><th>may</th><th></th></tr></thead><tbody>

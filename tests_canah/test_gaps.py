@@ -203,7 +203,13 @@ class Approvals(Base):
         self.addCleanup(srv.shutdown)
         a = self.agent(call("bump_counter", by=3), notify_url=f"http://127.0.0.1:{srv.server_port}/hook")
         a.ask("bump", thread_id="n", who=ADMIN)
+        import time
+        for _ in range(50):                    # notifications leave in the background
+            if got:
+                break
+            time.sleep(0.1)
         self.assertEqual((got[0]["tool"], got[0]["requested_by"], got[0]["args"]), ("bump_counter", "ana", {"by": 3}))
+        self.assertEqual(got[0]["event"], "approval_waiting")
 
 
 class Screening(Base):
