@@ -237,6 +237,45 @@ class Service(unittest.TestCase):
         self.assertEqual(got[-1][1]["text"], "a and b")
         self.assertEqual(got[-1][1]["thread_id"], "t2")
 
+    def test_events_leave_as_they_happen_not_at_the_end(self):
+        # A real server: Starlette's TestClient collects the whole body before returning, so it cannot see this.
+        import socket
+        import time
+        import requests
+        import uvicorn
+        got_first = threading.Event()
+        waited = {}
+
+        def slow_stream(text, key, who):
+            yield {"type": "token", "text": "first"}
+            # the next event only once the client has the first: a buffered stream never gets here in time
+            waited["ok"] = got_first.wait(5)
+            yield {"type": "reply", "text": "first", "pending": [], "tool_calls": [], "thread_id": key}
+        self.agent.stream = slow_stream
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        server = uvicorn.Server(uvicorn.Config(self.client.app, host="127.0.0.1", port=port, log_level="error"))
+        t = threading.Thread(target=server.run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(setattr, server, "should_exit", True)
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        with requests.post(f"http://127.0.0.1:{port}/threads/t9/stream", json={"text": "hi"}, stream=True,
+                           headers={"Accept-Encoding": "gzip"}, timeout=10) as r:
+            for line in r.iter_lines(decode_unicode=True):
+                if line.startswith("event: token"):
+                    got_first.set()
+        self.assertTrue(waited.get("ok"), "the first event reached the client only after the turn ended")
+
+    def test_the_page_is_sent_compressed(self):
+        r = self.client.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(r.headers.get("content-encoding"), "gzip")
+
     def test_a_change_waits_and_an_admin_approves_it(self):
         h = self.sign_in()
         self.script(call("drop_item", name="a"), say("a dropped"))

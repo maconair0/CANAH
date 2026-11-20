@@ -47,3 +47,13 @@ RERANK_PREDICT = _int("RERANK_NUM_PREDICT", 400)
 def make_client(role: str = "embed") -> "ollama.Client":
     """An Ollama client (the embedder and the LLM reranker both use one)."""
     return ollama.Client(host=OLLAMA_HOST)
+
+# The production stages (retriever.retrieve):
+#   RAG_MIN_RELEVANCE    a passage the re-ranker scores below this (0-1) is not evidence: it is dropped, and
+#                        when nothing passes, the search says the documents do not cover the question
+#   RAG_CORRECTIVE       on a miss, rewrite the question (keywords, an expansion, a hypothetical answer) and
+#                        search again, still judged against the original question (1/0)
+#   RAG_REWRITE_MODEL    the model that rewrites (default: the LLM re-ranker's)
+MIN_RELEVANCE = float(os.getenv("RAG_MIN_RELEVANCE", "0.1"))   # chosen from the eval, for MiniLM
+CORRECTIVE = os.getenv("RAG_CORRECTIVE", "1") == "1"
+REWRITE_MODEL = os.getenv("RAG_REWRITE_MODEL", "") or DEFAULT_RERANK_MODEL

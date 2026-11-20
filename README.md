@@ -83,7 +83,7 @@ There are three roles: `model` (the main agent), `strong_model` (for a subagent 
 | `canah/agent.py` | `build_agent()`: the pieces into `create_deep_agent`; `CanahAgent.ask / stream / pending / decide`. Takes `middleware` and `interrupt_on` directly too |
 | `canah/tools.py` | the `ToolProvider` contract: `tools()`, `writes()`, and optionally `subagents()`, `main_tools()`, `shared_tools()`, `middleware()`, `instructions()` |
 | `canah/network.py` | networks through an agentic MCP service: `network_controllers` and `network_health` on the main agent; one subagent per controller, holding that controller's tools; `follow_relations`, which follows dependency chains across domains in code, for any controller that publishes `list_relations` |
-| `canah/knowledge/` | documents: a quick cited search (any subagent may use it), a `librarian` subagent, passages marked with the question's names they don't mention, a citation check; hybrid retrieval (dense + BM25, cross-encoder rerank) in `rag/` |
+| `canah/knowledge/` | documents: a quick cited search (any subagent may use it), a `librarian` subagent, passages marked with the question's names they don't mention, a citation check; production retrieval in `rag/` (see [Retrieval](#retrieval)) |
 | `canah/identity.py` | observer / admin / root: accounts (environment, or `users.json` with PBKDF2 hashes), sign-in with lockout; the model is offered only the tools the caller may use |
 | `canah/approval.py` | every write pauses for a decision: approve, edit or reject |
 | `canah/memory.py` | per-thread state (SQLite checkpointer); long-term `/memories/` per user (SQLite store), with listing, deletion and optional expiry |
@@ -109,6 +109,51 @@ There are three roles: `model` (the main agent), `strong_model` (for a subagent 
 3. Index its documents.
 
 The harness imports nothing system-specific.
+
+## Retrieval
+
+The agent's document answers come from `canah/knowledge/rag`, and each stage is there for accuracy:
+
+1. **Hybrid candidates.** Dense search (Chroma, `mxbai-embed-large`) and BM25 each return 20, merged by reciprocal rank fusion. Exact identifiers (RFC numbers, model names) come in through BM25, paraphrases through dense search.
+2. **Filter.** Inadmissible chunks are dropped: front matter, reference lists, fragments. A length prior damps passages too short to answer anything.
+3. **Re-rank.** A cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) reads the question and each of the 24 best candidates together. If it cannot load, the local LLM re-ranks instead.
+4. **Parents.** Small child chunks are ranked, and their parent passages are what the agent reads. Duplicate parents are dropped before the cut to `k`, so `k` results are `k` different passages.
+5. **Relevance gate.** The re-ranker's score becomes a relevance from 0 to 1. A passage below `RAG_MIN_RELEVANCE` (0.1) is not evidence.
+6. **Corrective retrieval.** When nothing passes, the local LLM rewrites the question three ways (key terms, a paraphrase, a hypothetical answer). The search runs again, but the results are still judged against the original question.
+7. **Abstention.** When still nothing passes, the tool answers `NOT IN THE DOCUMENTS`. It lists the nearest sources, judged not to answer, and the agent is told to say the documents do not cover the question.
+
+Every passage the agent sees shows its relevance and its citation, and a citation check runs on the agent's reply.
+
+**Measured, not assumed.** Running `python -m canah.knowledge.rag.evaluate build` writes a golden set to `<CANAH_HOME>/knowledge/eval/golden.json`. It holds one question per sampled passage, written by the local model, plus questions the corpus does not answer, some of them from the same field. `run --compare` scores the pipeline with and without its gate. The current corpus gives these results (40 answerable questions, 14 not answerable):
+
+| | hit@1 | hit@5 | MRR | declines unanswerable | declines answerable | p50 |
+|---|---|---|---|---|---|---|
+| without the gate | 0.75 | 0.90 | 0.82 | 0 of 14 | 0 | 0.27 s |
+| production | 0.75 | 0.875 | 0.81 | **14 of 14** | **0** | 0.27 s on the CPU, 0.04 s on the GPU |
+
+Without the gate, every unanswerable question came back with five confident-looking passages. The production pipeline declines all 14 and declines no answerable question. `BAAI/bge-reranker-base` ranked no better, ran 3.5× slower, and its scores could not separate the two kinds of question, so MiniLM is the default (`RERANK_MODEL` overrides it). If the corpus or the model changes, re-run the eval and choose `RAG_MIN_RELEVANCE` from its `best_relevance` lists.
+
+## Speed
+
+CANAH is built to answer quickly. Measured on an RTX A5000 with qwen3 30B in Ollama:
+
+| | Time |
+|---|---|
+| a document search, from question to re-ranked passages | about 45 ms (was 130 ms) |
+| first event of a reply on the page | 0.5–0.7 s, including the first question after a start |
+| "hello" | 0.6 s |
+| `./start.sh` to a running service | about 5 s |
+
+What makes it fast:
+- **On the GPU.** The re-ranker and the embedder run in half precision, in the service's own process:
+  - re-ranking 24 passages takes 22 ms, against 128 ms on the CPU;
+  - embedding a question takes 19 ms, against 75 ms through Ollama. The vectors match an index built by Ollama (cosine 0.9999).
+- **Device settings.** `start.sh` installs the CUDA build of torch when it finds an NVIDIA GPU (`CANAH_NO_GPU=1` skips that). `RERANK_DEVICE` (`auto`, `cuda`, `cpu`) and `EMBED_BACKEND` (`auto`, `local`, `ollama`) choose where each part runs.
+- **Sharing the GPU with Ollama.** When the GPU is full, the re-ranker moves to the CPU and the embedder falls back to Ollama, rather than failing.
+- **Warm at start.** In the background, the service opens the index, loads both models and runs one hidden turn. That loads the chat model and puts the agent's ~7,000-token system prompt in Ollama's prompt cache, so the first question doesn't wait for any of it (`CANAH_WARM=0` turns this off).
+- **Streamed.** Tokens and tool calls reach the page as they happen. The page and its scripts are gzip-compressed (`app.js` from 95 KB to 28 KB).
+- **No answer written twice.** When the look-first check asks whether an answer needed a lookup, the model can reply with the single word `KEEP` rather than writing the whole answer out again. That made "what can you do?" 2.5 s instead of 6.1 s.
+- **Little repeated work.** The model stays loaded for 24 hours (`keep_alive` in `canah/models.py`), and Ollama still unloads it when another model needs the memory. Question embeddings are cached. The corrective pass embeds and searches its rewrites in one batch.
 
 ## Who may do what
 

@@ -146,6 +146,22 @@ class Grounding(unittest.TestCase):
         self.assertEqual(a.ask("what is recursion?").text, long)
         self.assertEqual(len(model.seen), 2)
 
+    def test_keep_keeps_the_first_answer_without_writing_it_again(self):
+        long = "Recursion is when a function calls itself, with a case that ends it; " * 3
+        a, model = agent(say(long), say("KEEP"))
+        self.assertEqual(a.ask("what is recursion?", thread_id="k1").text, long)
+        self.assertEqual(len(model.seen), 2)
+        msgs = a.graph.get_state(a.config("k1")).values["messages"]
+        self.assertEqual([type(m).__name__ for m in msgs], ["HumanMessage", "AIMessage"])   # no check, no KEEP
+
+    def test_keep_never_reaches_the_stream(self):
+        long = "Recursion is when a function calls itself, with a case that ends it; " * 3
+        a, model = agent(say(long), say("KEEP"))
+        events = list(a.stream("what is recursion?", thread_id="k2"))
+        tokens = "".join(e["text"] for e in events if e["type"] == "token")
+        self.assertNotIn("KEEP", tokens)
+        self.assertEqual(events[-1]["text"], long)
+
     def test_a_run_at_its_step_limit_answers_instead_of_raising(self):
         p = FunctionProvider()
         p.add(read_power)

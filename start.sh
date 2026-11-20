@@ -90,11 +90,31 @@ if [ ! -x "$PY" ]; then
   echo "  creating .venv"
   python3 -m venv .venv
 fi
-if ! "$PY" -c "import deepagents, fastapi, uvicorn" 2>/dev/null; then
+# The package metadata, not an import: importing deepagents or torch costs seconds each.
+pkg() { "$PY" -c "import importlib.metadata as m, sys
+try: print(m.version(sys.argv[1]))
+except m.PackageNotFoundError: pass" "$1" 2>/dev/null; }
+if [ -z "$(pkg deepagents)" ] || [ -z "$(pkg fastapi)" ] || [ -z "$(pkg uvicorn)" ]; then
   echo "  installing requirements (first start takes a few minutes)"
   "$PY" -m pip install -q -r requirements.txt
 fi
-ok "python environment ($("$PY" -c 'import deepagents; print("deepagents", deepagents.__version__)'))"
+# The re-ranker and the embedder run on an NVIDIA GPU when torch is built for CUDA. pip's default torch is
+# CPU-only, so with a GPU and a CPU build, put the CUDA build of the same version in (CANAH_NO_GPU=1 skips it).
+TORCH="$(pkg torch)"
+GPU="$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+if [ -z "${CANAH_NO_GPU:-}" ] && [ -n "$GPU" ] && [ -n "$TORCH" ] && [[ "$TORCH" != *+cu* ]]; then
+  TV="${TORCH%%+*}"
+  CU="$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9.]*' | grep -o '[0-9.]*$' | tr -d .)"
+  echo "  installing torch $TV for CUDA (cu$CU) so retrieval runs on the GPU"
+  "$PY" -m pip install -q "torch==$TV+cu$CU" --index-url "https://download.pytorch.org/whl/cu$CU" \
+      --extra-index-url https://pypi.org/simple 2>/dev/null \
+    || echo "  no torch $TV build for cu$CU: retrieval stays on the CPU (see README, Retrieval)"
+  TORCH="$(pkg torch)"
+fi
+if [ -z "${CANAH_NO_GPU:-}" ] && [ -n "$GPU" ] && [[ "$TORCH" == *+cu* ]]; then
+  ok "retrieval on the GPU ($GPU, torch $TORCH)"
+fi
+ok "python environment (deepagents $(pkg deepagents))"
 
 # ----- the model -----
 MODEL_DESC="$("$PY" -c 'from canah import models; print(models.describe()["model"])' 2>/dev/null || echo "?")"
@@ -168,10 +188,10 @@ nohup "$PY" -m canah serve "${SERVE_ARGS[@]}" >"$LOGS/canah.log" 2>&1 &
 echo $! >"$RUN/canah.pid"
 echo "$URL" >"$RUN/canah.url"
 printf '  waiting for the service'
-for _ in $(seq 120); do
+for _ in $(seq 480); do
   if curl -sk -m 2 "${URL}health" >/dev/null 2>&1; then echo; break; fi
   if ! alive "$RUN/canah.pid"; then echo; rm -f "$RUN/canah.pid"; tail -20 "$LOGS/canah.log"; die "CANAH stopped while starting (log above, in $LOGS/canah.log)"; fi
-  printf '.'; sleep 1
+  printf '.'; sleep 0.25
 done
 curl -sk -m 2 "${URL}health" >/dev/null 2>&1 || die "CANAH did not answer within 2 minutes (see $LOGS/canah.log)"
 

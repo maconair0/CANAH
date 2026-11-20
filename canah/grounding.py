@@ -32,7 +32,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, RemoveMessage
 
 _NUMBER = re.compile(r"(?<![\w.,])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w]|\.\d)")
 _HEX = re.compile(r"\b[0-9a-fA-F]{12,}\b")
@@ -232,6 +232,11 @@ class FollowThrough(AgentMiddleware):
 
 
 _LOOK = "[look-first check]"
+KEEP = "KEEP"
+
+
+def is_keep(content: Any) -> bool:
+    return str(content or "").strip().strip(".!*`\"'").upper() == KEEP
 
 
 class LookFirst(AgentMiddleware):
@@ -249,6 +254,12 @@ class LookFirst(AgentMiddleware):
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
             return None
+        # The model kept its answer: drop the check and the KEEP, and the first answer is the reply. One
+        # word to say so instead of the whole answer written out again, which doubled the wait.
+        if (len(msgs) >= 3 and is_keep(msgs[-1].content) and isinstance(msgs[-2], HumanMessage)
+                and _LOOK in str(msgs[-2].content) and isinstance(msgs[-3], AIMessage)
+                and msgs[-1].id and msgs[-2].id):
+            return {"messages": [RemoveMessage(id=msgs[-2].id), RemoveMessage(id=msgs[-1].id)]}
         if len(str(msgs[-1].content or "")) < self.min_chars:
             return None
         start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
@@ -261,7 +272,7 @@ class LookFirst(AgentMiddleware):
         return {"jump_to": "model", "messages": [HumanMessage(content=(
             f"{_LOOK} You answered without looking anything up. If the question is about this system (its live "
             f"state, its configuration, its documents), read it with your tools or subagents first and answer from "
-            f"that. If it needs no lookup, give the same answer again."))]}
+            f"that. If it needs no lookup, reply with the single word {KEEP} and your answer above stands."))]}
 
 
 class TimeBudget(AgentMiddleware):

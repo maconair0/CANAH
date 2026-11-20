@@ -10,6 +10,7 @@ Two collections live here, mechanically identical but semantically distinct
 """
 import logging
 import os
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -19,6 +20,52 @@ logger = logging.getLogger("rag.store")
 
 from .settings import CHROMA_DIR, CORPUS_DIR, MANIFEST_PATH  # noqa: E402
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
+
+# Where the embeddings are computed:
+#   auto     in-process on the GPU when there is one and the Ollama model has a known twin on the Hugging
+#            Face hub, else Ollama. In-process takes ~19 ms a question against ~75 ms for an Ollama round
+#            trip, and gives the same vectors (cosine 0.9999 against an index built by Ollama), so an index
+#            built either way is searched the same.
+#   local    in-process (sentence-transformers), on RERANK_DEVICE's choice of device
+#   ollama   always Ollama
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", "auto")
+LOCAL_TWINS = {"mxbai-embed-large": "mixedbread-ai/mxbai-embed-large-v1",
+               "nomic-embed-text": "nomic-ai/nomic-embed-text-v1.5",
+               "all-minilm": "sentence-transformers/all-MiniLM-L6-v2"}
+QUERY_CACHE = int(os.getenv("RAG_QUERY_CACHE", "512"))   # question embeddings kept, most recent first
+
+_local_models: Dict[str, Any] = {}
+_local_lock = __import__("threading").Lock()
+
+
+def _local_embedder(ollama_name: str) -> Optional[Any]:
+    """The in-process twin of an Ollama embedding model, loaded once per process; None when not to be used."""
+    if EMBED_BACKEND == "ollama":
+        return None
+    name = LOCAL_TWINS.get(ollama_name.split(":")[0])
+    if not name:
+        if EMBED_BACKEND == "local":
+            logger.warning(f"no in-process twin known for {ollama_name}; embedding through Ollama")
+        return None
+    with _local_lock:
+        if name in _local_models:
+            return _local_models[name]
+        try:
+            import torch
+            from .reranker import RERANK_DEVICE
+            dev = RERANK_DEVICE if RERANK_DEVICE != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+            if EMBED_BACKEND == "auto" and not dev.startswith("cuda"):
+                _local_models[name] = None      # on a CPU, Ollama (on its GPU or not) is no slower
+                return None
+            from sentence_transformers import SentenceTransformer
+            kw = {"model_kwargs": {"torch_dtype": torch.float16}} if dev.startswith("cuda") else {}
+            m = SentenceTransformer(name, device=dev, **kw)
+            logger.info(f"embedding in-process: {name} on {dev}")
+        except Exception as e:  # noqa: BLE001 - Ollama is always there to fall back on
+            logger.warning(f"in-process embedder {name} unavailable ({type(e).__name__}: {e}); using Ollama")
+            m = None
+        _local_models[name] = m
+        return m
 
 # Rows per page when reading the whole collection. Well under SQLite's
 # variable ceiling, and large enough that a full corpus read is a handful of
@@ -37,6 +84,7 @@ class RagStore:
                  ollama_host: str = OLLAMA_HOST):
         os.makedirs(chroma_dir, exist_ok=True)
         self.embed_model = embed_model
+        self._qcache: "OrderedDict[str, List[float]]" = OrderedDict()
         from .settings import make_client
         # The embedder cannot be swapped without reindexing, so it resolves
         # separately from the chat models.
@@ -60,10 +108,31 @@ class RagStore:
         retry on the error itself. One awkward chunk must not kill an ingest
         that is minutes deep.
         """
+        local = _local_embedder(self.embed_model)
+        if local is not None:
+            try:
+                # The model truncates at its own 512 tokens, which is what the shrink-and-retry below
+                # amounts to; one batched call instead of one round trip per text.
+                return [v.tolist() for v in local.encode(list(texts), batch_size=32, show_progress_bar=False)]
+            except Exception as e:  # noqa: BLE001 - a full GPU: Ollama for this call
+                logger.warning(f"in-process embedding failed ({type(e).__name__}); using Ollama")
         out: List[List[float]] = []
         for text in texts:
             out.append(self._embed_one(text))
         return out
+
+    def embed_queries(self, queries: List[str]) -> List[List[float]]:
+        """Question embeddings, through a small cache: an agent often asks the same thing twice in a turn
+        (the librarian, a subagent, a retry), and the corrective pass re-embeds the original question."""
+        missing = [q for q in dict.fromkeys(queries) if q not in self._qcache]
+        if missing:
+            for q, v in zip(missing, self.embed(missing)):
+                self._qcache[q] = v
+                while len(self._qcache) > QUERY_CACHE:
+                    self._qcache.popitem(last=False)
+        for q in queries:
+            self._qcache.move_to_end(q)
+        return [self._qcache[q] for q in queries]
 
     def _embed_one(self, text: str, attempts: int = 5) -> List[float]:
         body = text
@@ -193,24 +262,33 @@ class RagStore:
 
     def query_dense(self, query: str, top_n: int = 20,
                     where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        if self.count() == 0:
-            return []
-        embedding = self.embed([query])[0]
+        got = self.query_dense_many([query], top_n, where)
+        return got[0] if got else []
+
+    def query_dense_many(self, queries: List[str], top_n: int = 20,
+                         where: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
+        """Several questions in one embedding batch and one Chroma query (the corrective pass's rewrites)."""
+        n = self.count()
+        if n == 0 or not queries:
+            return [[] for _ in queries]
         kwargs: Dict[str, Any] = {
-            "query_embeddings": [embedding],
-            "n_results": min(top_n, self.count()),
+            "query_embeddings": self.embed_queries(queries),
+            "n_results": min(top_n, n),
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
             kwargs["where"] = where
         res = self.collection.query(**kwargs)
-        out: List[Dict[str, Any]] = []
-        for i, doc_id in enumerate(res.get("ids", [[]])[0]):
-            out.append({
-                "id": doc_id,
-                "text": res["documents"][0][i],
-                "metadata": res["metadatas"][0][i],
-                "distance": res["distances"][0][i],
-                "source": res["metadatas"][0][i].get("source"),
-            })
-        return out
+        lists: List[List[Dict[str, Any]]] = []
+        for qi in range(len(queries)):
+            out: List[Dict[str, Any]] = []
+            for i, doc_id in enumerate(res.get("ids", [[]] * len(queries))[qi]):
+                out.append({
+                    "id": doc_id,
+                    "text": res["documents"][qi][i],
+                    "metadata": res["metadatas"][qi][i],
+                    "distance": res["distances"][qi][i],
+                    "source": res["metadatas"][qi][i].get("source"),
+                })
+            lists.append(out)
+        return lists

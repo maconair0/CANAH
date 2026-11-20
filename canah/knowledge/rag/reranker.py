@@ -21,6 +21,7 @@ looks.
 """
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -28,7 +29,32 @@ from . import settings as mc
 
 logger = logging.getLogger("rag.reranker")
 
-CROSS_ENCODER_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+# The cross-encoders to try, in order; RERANK_MODEL puts one in front. MiniLM is the default on evidence
+# (python -m canah.knowledge.rag.evaluate run): on CANAH's golden set it ranks as well as bge-reranker-base,
+# 3.5x faster, and its scores separate answerable questions (relevance mostly > 0.9) from ones the corpus
+# does not cover (~0.0), which the relevance gate depends on; bge's crowd around 0.5 for both. A different
+# model needs RAG_MIN_RELEVANCE re-chosen from the eval's best_relevance lists.
+CROSS_ENCODER_MODELS = [m for m in [os.getenv("RERANK_MODEL", ""), "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                                    "BAAI/bge-reranker-base"] if m]
+CROSS_ENCODER_MODEL = CROSS_ENCODER_MODELS[0]
+# Where the cross-encoder runs: auto (the GPU when torch sees one, else the CPU), cuda, cuda:N or cpu. On the
+# GPU it runs in half precision. The GPU is shared with Ollama, so a load or a batch that runs out of GPU
+# memory moves the model to the CPU instead of failing the search.
+RERANK_DEVICE = os.getenv("RERANK_DEVICE", "auto")
+
+
+def _device() -> str:
+    if RERANK_DEVICE != "auto":
+        return RERANK_DEVICE
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:  # noqa: BLE001
+        return "cpu"
+
+
+def _out_of_memory(e: BaseException) -> bool:
+    return "out of memory" in str(e).lower() or type(e).__name__ in ("OutOfMemoryError", "AcceleratorError")
 LLM_RERANK_MODEL = mc.DEFAULT_RERANK_MODEL
 from .settings import OLLAMA_HOST  # noqa: E402
 
@@ -55,6 +81,7 @@ class Reranker:
     def __init__(self, prefer: str = "auto"):
         self.backend = "rrf_only"
         self._cross_encoder = None
+        self.device = None
         self._ollama = None
 
         if prefer in ("auto", "cross_encoder"):
@@ -95,12 +122,53 @@ class Reranker:
                 f"hiding it from transformers so the text cross-encoder can load"
             )
 
+    def _load(self, CrossEncoder, name):
+        dev = _device()
+        if dev.startswith("cuda"):
+            try:
+                ce = CrossEncoder(name, max_length=512, device=dev, model_kwargs={"torch_dtype": "float16"})
+                self.device = dev
+                return ce
+            except Exception as e:  # noqa: BLE001 - a full GPU is not a reason to have no re-ranker
+                if not _out_of_memory(e) and RERANK_DEVICE != "auto":
+                    raise
+                logger.warning(f"cross-encoder {name} could not load on {dev} ({type(e).__name__}); using the CPU")
+                self._free_gpu()
+        self.device = "cpu"
+        return CrossEncoder(name, max_length=512, device="cpu")
+
+    @staticmethod
+    def _free_gpu():
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _to_cpu(self):
+        """Move a GPU cross-encoder to the CPU, in full precision (half precision is slow on a CPU)."""
+        from sentence_transformers import CrossEncoder
+        logger.warning(f"the GPU ran out of memory for the re-ranker; moving {self.model} to the CPU")
+        self._cross_encoder = None
+        self._free_gpu()
+        self._cross_encoder = CrossEncoder(self.model, max_length=512, device="cpu")
+        self.device = "cpu"
+
     def _try_cross_encoder(self):
         try:
             self._disable_transformers_torchvision()
             from sentence_transformers import CrossEncoder
-            self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
-            self.backend = "cross_encoder"
+            last = None
+            for name in dict.fromkeys(CROSS_ENCODER_MODELS):
+                try:
+                    self._cross_encoder = self._load(CrossEncoder, name)
+                    self.model = name
+                    self.backend = "cross_encoder"
+                    return
+                except Exception as e2:  # noqa: BLE001 - the next one, then the LLM
+                    last = e2
+                    logger.warning(f"cross-encoder {name} unavailable ({type(e2).__name__}); trying the next")
+            raise last or RuntimeError("no cross-encoder")
         except Exception as e:
             # Warning, not info. The cross-encoder is the reranker that
             # actually works; the LLM fallback is a consolation prize and a
@@ -145,10 +213,19 @@ class Reranker:
         pairs = [(query, c["text"]) for c in candidates]
         # No progress bar: this runs inside an interactive chat turn, and a
         # tqdm line redrawing over the prompt is worse than no feedback.
-        scores = self._cross_encoder.predict(pairs, show_progress_bar=False)
+        try:
+            scores = self._cross_encoder.predict(pairs, show_progress_bar=False)
+        except Exception as e:  # noqa: BLE001
+            if not (str(getattr(self, "device", "cpu")).startswith("cuda") and _out_of_memory(e)):
+                raise
+            self._to_cpu()
+            scores = self._cross_encoder.predict(pairs, show_progress_bar=False)
         for c, s in zip(candidates, scores):
             c["rerank_score"] = float(s)
             c["reranked_by"] = "cross_encoder"
+            # A cross-encoder's score is a logit: its sigmoid reads as the probability the passage answers
+            # the query, which is what the relevance gate needs (and is comparable across queries).
+            c["relevance"] = 1.0 / (1.0 + math.exp(-float(s)))
         return sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)[:top_k]
 
     def _rerank_llm(self, query, candidates, top_k):
@@ -178,6 +255,7 @@ class Reranker:
                 else:
                     c["rerank_score"] = by_index.get(i, 0.0)
                     c["reranked_by"] = "llm"
+                    c["relevance"] = c["rerank_score"] / 10.0
                     # Break the model's ties with fusion order rather than
                     # leaving them to list position.
                     c["rerank_score"] += min(0.49, c.get("fusion_score", 0.0))

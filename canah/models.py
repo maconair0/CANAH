@@ -52,10 +52,12 @@ from langchain.chat_models import init_chat_model  # noqa: E402
 # No key, no quota. Ollama must be running with the model pulled:
 #   ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M      (~18 GB)
 # Another host: base_url="http://host:11434"
+# keep_alive 24h: an idle model is not unloaded after half an hour, so the first question after a pause does
+# not wait for 18 GB to load again. Ollama still unloads it when another model needs the GPU memory.
 from langchain_ollama import ChatOllama  # noqa: E402
 
 model = ChatOllama(model="qwen3:30b-a3b-instruct-2507-q4_K_M", temperature=0, num_ctx=32768, num_predict=4096,
-                   keep_alive="30m", reasoning=False, client_kwargs={"timeout": 300})
+                   keep_alive="24h", reasoning=False, client_kwargs={"timeout": 300})
 strong_model = model
 fast_model = model
 

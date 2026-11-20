@@ -76,6 +76,22 @@ def _mentions(text: str, term: str) -> bool:
     return re.sub(r"[^a-z0-9+]", "", term.lower()) in re.sub(r"[^a-z0-9+]", "", text.lower())
 
 
+def render_abstention(got: Dict[str, Any]) -> str:
+    """What the agent reads when the re-ranker judged no passage to answer the question."""
+    near = [cite(h) for h in got.get("near_misses") or []]
+    tried = got.get("rewrites") or []
+    return ("NOT IN THE DOCUMENTS: no passage answers this question (best relevance "
+            f"{got.get('best_relevance') if got.get('best_relevance') is not None else 'n/a'}, the bar is "
+            f"{got.get('min_relevance', '?')})."
+            # How many rewrites, not their text: one is a hypothetical answer, and its made-up facts must
+            # not read as evidence.
+            + (f" It was searched again with {len(tried)} rewritten queries." if tried else "")
+            + (f" Closest, and judged not to answer: {', '.join(near)}." if near else "")
+            + " Tell the user the documents do not cover it. Do not answer it from memory as if from the documents, "
+              "and do not cite these sources for it. If the question can be asked another way (a different term, "
+              "the standard's own name), searching once more is fine.")
+
+
 def render(hits: List[Dict[str, Any]], max_chars: int, query: str = "") -> str:
     if not hits:
         return "The corpus holds nothing on this. Say so rather than answering from memory."
@@ -87,8 +103,10 @@ def render(hits: List[Dict[str, Any]], max_chars: int, query: str = "") -> str:
         any_full = any_full or not missing
         if len(text) > max_chars:
             text = text[:max_chars] + " ..."
-        score = h.get("score")
-        out.append(f"{i}. {cite(h)}" + (f" (score {score:.2f})" if isinstance(score, (int, float)) else "")
+        rel, score = h.get("relevance"), h.get("score")
+        tag = (f" (relevance {rel:.2f})" if isinstance(rel, (int, float))
+               else f" (score {score:.2f})" if isinstance(score, (int, float)) else "")
+        out.append(f"{i}. {cite(h)}" + tag
                    + (f" [does not mention: {', '.join(missing)}]" if missing else "") + f"\n{text}")
     head = ""
     if terms and not any_full:
@@ -117,6 +135,18 @@ class HybridKnowledge:
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return self.retriever.search(query, top_k=top_k)
+
+    def retrieve(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Hits, or an abstention with the reasons: hybrid search, re-rank, relevance gate, corrective pass."""
+        from .rag import settings as mc
+        got = self.retriever.retrieve(query, top_k=top_k)
+        got["min_relevance"] = mc.MIN_RELEVANCE
+        return got
+
+    def warm(self) -> None:
+        """Open the index and load the embedder and the re-ranker (Chroma, the BM25 index, two models on
+        the GPU: 10-30 s the first question would otherwise wait)."""
+        self.retriever.retrieve("warm up", top_k=1, corrective=False)
 
     def sources(self) -> List[Dict[str, Any]]:
         got = self.retriever.store.all_documents()
@@ -172,8 +202,9 @@ class CitationGuard(AgentMiddleware):
             return None
         return {"jump_to": "model", "messages": [HumanMessage(content=(
             f"{_GUARD} Your answer cites {', '.join(sorted(set(unseen)))}, which no tool returned in this "
-            f"conversation. Search the corpus (search_knowledge, or the librarian) and answer only from what it "
-            f"returns, citing those sources; if it does not state the answer, say the corpus does not state it."))]}
+            f"conversation. Either search the corpus (search_knowledge, or the librarian) and cite only what it "
+            f"returns, or, if this is general knowledge rather than something the documents must hold, give the same "
+            f"answer without any citation and say it is general knowledge, not from the documents."))]}
 
 
 class KnowledgeProvider:
@@ -186,7 +217,13 @@ class KnowledgeProvider:
 
     def _search(self, query: str, k: int, chars: int) -> str:
         try:
-            hits = self.retriever.search(query, top_k=k)
+            if hasattr(self.retriever, "retrieve"):
+                got = self.retriever.retrieve(query, top_k=k)
+                if got.get("abstained"):
+                    return render_abstention(got)
+                hits = got["hits"]
+            else:                     # any Retriever: search() alone
+                hits = self.retriever.search(query, top_k=k)
         except Exception as e:  # noqa: BLE001 - a missing index is said, not raised
             return f"Error: the knowledge base could not be searched: {type(e).__name__}: {e}"
         return render(hits[:k], chars, query)
@@ -216,6 +253,10 @@ class KnowledgeProvider:
 
     def tools(self) -> List[BaseTool]:
         return list(self._tools)
+
+    def warm(self) -> None:
+        if hasattr(self.retriever, "warm"):
+            self.retriever.warm()
 
     def writes(self) -> List[str]:
         return []
@@ -254,7 +295,9 @@ class KnowledgeProvider:
                 "what was asked; a number from a different standard, product or experiment is not the answer, and "
                 "presenting it as one is a wrong answer. Always search before answering a question about documents, "
                 "standards, the literature or how this system works; only after searching may you say the corpus "
-                "does not state it. A citation names a source a tool returned, never one you did not see.")
+                "does not state it. A citation names a source a tool returned, never one you did not see. "
+                "Every passage has been re-ranked against the question, and its relevance (0-1) is shown; a search "
+                "that answers NOT IN THE DOCUMENTS means no passage answers it: say the documents do not cover it.")
 
 
 def provider() -> KnowledgeProvider:

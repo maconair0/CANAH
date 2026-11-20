@@ -57,6 +57,43 @@ class CanahAgent:
     ops: Any = None
     twins: Any = None               # canah.twins.Registry: the digital twins and the one in use
     twin_checks: Any = None         # the checks they made, and operators' overrides
+    providers: List[Any] = field(default_factory=list)   # the ToolProviders, for warm()
+    model: Any = None               # the main agent's model
+
+    def warm(self) -> Dict[str, float]:
+        """Load what the first question would otherwise wait for: each provider's own models and indexes
+        (the re-ranker, the embedder, BM25) and the main model, into memory. Seconds each, by name."""
+        import time
+        took: Dict[str, float] = {}
+        for p in self.providers:
+            if hasattr(p, "warm"):
+                t = time.time()
+                try:
+                    p.warm()
+                except Exception as e:  # noqa: BLE001 - warming is an optimisation, never a failure
+                    logger.warning("warming %s failed: %s", type(p).__name__, e)
+                took[type(p).__name__] = round(time.time() - t, 2)
+        if self.model is not None:
+            t = time.time()
+            try:
+                # A local model only (a hosted one is always loaded, and would cost tokens). One real turn on a
+                # thread no user owns: Ollama loads the model and keeps the agent's own system prompt and tool
+                # list (~7,000 tokens) in its prompt cache, so the first question does not spend ~2.5 s reading
+                # them. Straight on the graph, so no metrics or audit; the thread is deleted after.
+                if type(self.model).__name__ == "ChatOllama":
+                    cfg = self.config(f"_warm.{uuid.uuid4().hex[:8]}")
+                    try:
+                        self.graph.invoke({"messages": [{"role": "user", "content": "Reply with the single word OK."}]},
+                                          cfg)
+                    finally:
+                        try:
+                            self.memory.checkpointer.delete_thread(cfg["configurable"]["thread_id"])
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning("warming the model failed: %s", e)
+            took["model"] = round(time.time() - t, 2)
+        return took
 
     def interrupt_config(self, tool: str) -> Optional[Dict[str, Any]]:
         """How a tool call pauses (allowed decisions, description), or None if it does not."""
@@ -205,14 +242,26 @@ class CanahAgent:
                "thread_id": thread_id}
 
     def _events(self, payload: Any, cfg: Dict[str, Any]) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        from .grounding import KEEP
         seen_calls = set()
+        # The start of each reply is held back while it could still be the look-first check's one word
+        # KEEP, which never reaches the page; any other reply is let through from its first differing token.
+        cur, held, passing = None, "", False
         for ns, mode, chunk in self.graph.stream(payload, cfg, stream_mode=["messages", "updates"], subgraphs=True):
             if mode == "messages":
                 msg, meta = chunk
                 if not ns and isinstance(msg, AIMessageChunk) and msg.content and not msg.tool_call_chunks:
                     text = msg.content if isinstance(msg.content, str) else ""
-                    if text:
-                        yield mode, {"type": "token", "text": text}
+                    if not text:
+                        continue
+                    if msg.id != cur:
+                        cur, held, passing = msg.id, "", False
+                    if not passing:
+                        held += text
+                        if KEEP.startswith(held.strip().upper()):
+                            continue
+                        passing, text, held = True, held, ""
+                    yield mode, {"type": "token", "text": text}
                 continue
             for update in (chunk or {}).values() if isinstance(chunk, dict) else ():
                 for m in (update or {}).get("messages", []) if isinstance(update, dict) else ():
@@ -287,7 +336,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     twins = Registry(settings.home_path, settings.twins, settings.twin_active)
     twin_checks = Checks()
     twin_provider = [TwinsProvider(twins, settings.home_path, twin_checks)] if twins.entries() else []
-    got = merge(list(providers) + load_providers(settings.providers) + twin_provider)
+    all_providers = list(providers) + load_providers(settings.providers) + twin_provider
+    got = merge(all_providers)
     tools = list(got["tools"]) + list(extra_tools)
     writes = list(got["writes"]) + list(extra_writes) + list(settings.approve_tools)
     if sandbox is not None and settings.approve_execute:
@@ -377,7 +427,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     hidden = set(got.get("subagent_only") or [])
     main_tools = [t for t in tools if t.name not in hidden]
     graph = create_deep_agent(
-        model=model or models.get("model"),
+        model=(main_model := model or models.get("model")),
         tools=main_tools,
         system_prompt=prompt,
         middleware=[budget, tracker, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
@@ -407,7 +457,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     info["interrupt_on"] = sorted(interrupts)
     info["middleware"] = [type(m).__name__ for m in extra_mw]
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
-                      interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks)
+                      interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
+                      providers=all_providers, model=main_model)
 
 
 def _fallback() -> List[Any]:

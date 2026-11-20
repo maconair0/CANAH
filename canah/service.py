@@ -46,6 +46,7 @@ at a time; a second request to a busy thread gets 409.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -218,6 +219,11 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         return ref["agent"]
 
     app = FastAPI(title="CANAH", version="1")
+    # The console's files and the large JSON answers (topology, threads) compressed: app.js goes from 95 KB
+    # to about a quarter of that. Server-sent events (the chat stream) are never compressed by it, so each
+    # token still leaves at once.
+    from fastapi.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     accounts = accounts or Accounts()
     sessions = Sessions(str(A().settings.home_path / "sessions.sqlite"))
     busy: Dict[str, threading.Lock] = {}
@@ -276,7 +282,8 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
 
         def body():
             try:
-                for ev in [*first, *events]:
+                # chain, not [*first, *events]: a list would run the whole turn before sending its first byte
+                for ev in itertools.chain(first, events):
                     if ev.get("type") == "reply":
                         ev = {**ev, "thread_id": public_id}
                     yield f"event: {ev['type']}\ndata: {json.dumps(ev, default=str)}\n\n"
@@ -728,6 +735,14 @@ def serve(host: str = "127.0.0.1", port: int = 8350, config: Optional[str] = Non
         settings.memory_files = [*settings.memory_files, str(tb / "AGENTS.md")]
         settings.skills_dirs = [*settings.skills_dirs, str(tb / "skills")]
     agent = build_agent(settings)
+    # Warm in the background: the page and the API answer at once, and the first question finds the
+    # re-ranker, the embedder and the model already loaded instead of waiting 10-30 s for them.
+    if os.getenv("CANAH_WARM", "1") == "1":
+        import threading
+
+        def _warm():
+            logger.info("warmed: %s", agent.warm())
+        threading.Thread(target=_warm, name="canah-warm", daemon=True).start()
     try:
         tls = {"ssl_certfile": tls_cert, "ssl_keyfile": tls_key} if tls_cert and tls_key else {}
         if not tls and host not in ("127.0.0.1", "localhost", "::1"):

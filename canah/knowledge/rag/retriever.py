@@ -13,6 +13,7 @@ semantic recall that BM25 alone would lose.
 
 Empty corpus returns an empty list, never an error (§7.7).
 """
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -267,28 +268,21 @@ class HybridRetriever:
             return n >= mc.SPARSE_ONLY_MIN_CHARS
         return True
 
-    def search(self, query: str, top_k: int = 5,
-               rerank: bool = True) -> List[Dict[str, Any]]:
-        if self.store.count() == 0:
-            logger.info("corpus is empty; returning no context")
-            return []
-
-        self._check_labelled()
+    def _candidates(self, query: str) -> List[Dict[str, Any]]:
+        """Dense and BM25 candidates, fused (RRF), the inadmissible dropped, best first."""
         dense = self.store.query_dense(query, self.dense_top_n, where=self._where())
         sparse = self.query_sparse(query, self.sparse_top_n)
+        return self._fuse([dense], [sparse])
 
+    def _fuse(self, dense_lists: List[List[Dict[str, Any]]], sparse_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
         by_id: Dict[str, Dict[str, Any]] = {}
-        for hit in dense + sparse:
+        for hit in [h for lst in dense_lists + sparse_lists for h in lst]:
             by_id.setdefault(hit["id"], hit).update(
                 {k: v for k, v in hit.items() if k not in by_id[hit["id"]]}
             )
-
-        fused = reciprocal_rank_fusion([
-            [h["id"] for h in dense],
-            [h["id"] for h in sparse],
-        ])
-        dense_ids = {d["id"] for d in dense}
-        sparse_ids = {s["id"] for s in sparse}
+        fused = reciprocal_rank_fusion([[h["id"] for h in lst] for lst in dense_lists + sparse_lists])
+        dense_ids = {d["id"] for lst in dense_lists for d in lst}
+        sparse_ids = {s["id"] for lst in sparse_lists for s in lst}
         candidates: List[Dict[str, Any]] = []
         for doc_id, score in fused.items():
             hit = dict(by_id[doc_id])
@@ -305,23 +299,94 @@ class HybridRetriever:
             hit["fusion_score"] = score * hit["length_prior"]
             hit["raw_fusion_score"] = score
             candidates.append(hit)
-
         candidates.sort(key=lambda c: c["fusion_score"], reverse=True)
+        return candidates
 
-        if not rerank:
-            for c in candidates:
-                c["score"] = c["fusion_score"]
-            return self._expand(candidates)[:top_k]
-
-        # Rerank a bounded shortlist, not the whole fused set.
+    def _rank(self, query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """Re-rank a bounded shortlist, then swap children for their parents and drop duplicate parents,
+        and only then cut to top_k: two children of one passage are one result, not two of the five."""
         shortlist = candidates[: max(top_k * 3, mc.RERANK_CANDIDATES)]
-        top = self.reranker.rerank(query, shortlist, top_k)
-        for c in top:
+        ranked = self.reranker.rerank(query, shortlist, len(shortlist))
+        for c in ranked:
             c["score"] = c.get("rerank_score", c.get("fusion_score"))
         # Expand last, on purpose: ranking is the child's job (that is why it
         # is small), and reading is the parent's. Expanding before the rerank
         # would score the parent and throw away the precision the split buys.
-        return self._expand(top)
+        return self._expand(ranked)
+
+    def retrieve(self, query: str, top_k: int = 5, gate: bool = True, corrective: Optional[bool] = None) -> Dict[str, Any]:
+        """The production path:
+
+          hybrid candidates (dense + BM25, RRF)  ->  cross-encoder re-rank  ->  one passage per parent
+          ->  relevance gate: a passage scored below RAG_MIN_RELEVANCE is not evidence
+          ->  on a miss, corrective retrieval: the question rewritten three ways (keywords, an expansion,
+              a hypothetical answer), searched again, fused, re-ranked against the ORIGINAL question, gated
+          ->  {"hits", "abstained", "best_relevance", "near_misses", "rewrites", "reranker"}
+
+        `abstained` means the documents do not answer the question: the caller must say so, not answer from
+        the near misses."""
+        out: Dict[str, Any] = {"hits": [], "abstained": False, "best_relevance": None, "near_misses": [],
+                               "rewrites": [], "reranker": self.reranker.backend}
+        if self.store.count() == 0:
+            out["abstained"] = True
+            out["why"] = "the corpus is empty"
+            return out
+        self._check_labelled()
+        ranked = self._rank(query, self._candidates(query), top_k)
+        corrective = mc.CORRECTIVE if corrective is None else corrective
+        judged = [h for h in ranked if h.get("relevance") is not None]
+        if not gate or not judged:                  # no gate, or a re-ranker that cannot judge (fusion only)
+            out["hits"] = ranked[:top_k]
+            out["best_relevance"] = judged[0]["relevance"] if judged else None
+            return out
+        passed = [h for h in ranked if h["relevance"] >= mc.MIN_RELEVANCE]
+        if not passed and corrective:
+            rewrites = self._rewrite(query)
+            out["rewrites"] = rewrites
+            if rewrites:
+                dense_lists = self.store.query_dense_many([query] + rewrites, self.dense_top_n, where=self._where())
+                sparse_lists = [self.query_sparse(q, self.sparse_top_n) for q in [query] + rewrites]
+                ranked = self._rank(query, self._fuse(dense_lists, sparse_lists), top_k)
+                passed = [h for h in ranked if (h.get("relevance") or 0) >= mc.MIN_RELEVANCE]
+        out["best_relevance"] = round(max((h.get("relevance") or 0) for h in ranked), 4) if ranked else None
+        out["hits"] = passed[:top_k]
+        out["abstained"] = not passed
+        out["near_misses"] = [] if passed else ranked[:3]
+        return out
+
+    def search(self, query: str, top_k: int = 5, rerank: bool = True,
+               gate: bool = True, corrective: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """The passages that answer the query, best first (empty when none does). `retrieve` says why."""
+        if self.store.count() == 0:
+            logger.info("corpus is empty; returning no context")
+            return []
+        if not rerank:
+            self._check_labelled()
+            cands = self._candidates(query)
+            for c in cands:
+                c["score"] = c["fusion_score"]
+            return self._expand(cands)[:top_k]
+        return self.retrieve(query, top_k, gate=gate, corrective=corrective)["hits"]
+
+    _REWRITE = (
+        "A search over technical documents found nothing that answers this question:\n{q}\n\n"
+        "Write three different search queries that could find the answer:\n"
+        "1. the key terms only (identifiers, names, figures; no filler words);\n"
+        "2. the question in other words, with synonyms and the expanded form of any abbreviation;\n"
+        "3. one or two sentences that a passage answering it would contain (a hypothetical answer).\n"
+        'Answer with JSON only: {{"queries": ["...", "...", "..."]}}'
+    )
+
+    def _rewrite(self, query: str) -> List[str]:
+        try:
+            client = mc.make_client("chat")
+            r = client.chat(model=mc.REWRITE_MODEL, messages=[{"role": "user", "content": self._REWRITE.format(q=query)}],
+                            format="json", options={"temperature": 0.0, "num_predict": 300})
+            got = json.loads(r["message"]["content"]).get("queries") or []
+            return [str(x).strip() for x in got if str(x).strip() and str(x).strip().lower() != query.lower()][:3]
+        except Exception as e:  # noqa: BLE001 - corrective retrieval is a second chance, not a requirement
+            logger.warning(f"query rewriting failed ({type(e).__name__}: {e}); no second pass")
+            return []
 
     def _expand(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Swap child hits for their parent passages (Phase 5).
@@ -343,5 +408,8 @@ class HybridRetriever:
             "parents": (self.parents.count() if self.parents else 0),
             "sections": "all" if self._unfiltered else ",".join(self.sections),
             "rerank_backend": self.reranker.backend,
+            "rerank_model": getattr(self.reranker, "model", None),
+            "rerank_device": getattr(self.reranker, "device", None),
+            "min_relevance": mc.MIN_RELEVANCE, "corrective": mc.CORRECTIVE,
             "embed_model": self.store.embed_model,
         }
