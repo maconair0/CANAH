@@ -192,3 +192,7 @@ They meet at declared hand-offs: a packet link rides an optical lightpath, and a
 - **across domains:** chains, impact of a fault, a tenant's path out, a build under a cross-domain rule, an observer refusal.
 
 Each case is checked against the answer and against the domain's state afterwards. Results go to `testbed/results/`, with a score per domain, the model and the harness commit. The domain-specific material (the emulator, its `AGENTS.md`, skills and design rules) lives only in `testbed/`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
