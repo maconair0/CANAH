@@ -113,6 +113,11 @@ def _canon(raw: str) -> Optional[int]:
     return None
 
 
+class _Counted(list):
+    """A list that also knows how many there were before the cap."""
+    total = 0
+
+
 def devices_of(data: Any) -> List[Dict[str, Any]]:
     """The records that look most like devices: the longest list whose records carry an id."""
     best: List[Dict[str, Any]] = []
@@ -124,7 +129,8 @@ def devices_of(data: Any) -> List[Dict[str, Any]]:
             best = ids
     if not best and isinstance(data, list) and data and not isinstance(data[0], dict):
         best = [{"id": x} for x in data]                     # a bare list of ids (Ryu's switches)
-    out, seen = [], set()
+    out, seen = _Counted(), set()
+    out.total = len(best)
     for r in best[:MAX_DEVICES]:
         did = _scalar(r)
         if did in seen:
@@ -240,6 +246,7 @@ class Topology:
             out.update(ok=False, error=str(e)[:300])
             return out
         devices = devices_of(dev_data) if dev_data is not None else []
+        total = _total if (_total := getattr(devices, "total", None)) else len(devices)
         if link_data is not None and not devices:
             devices = devices_of(link_data)
         ids = {d["id"] for d in devices}
@@ -249,7 +256,7 @@ class Topology:
                 if end not in ids:
                     ids.add(end)
                     devices.append({"id": end, "label": end[:48], "kind": "endpoint", "status": "up"})
-        out.update(devices=devices[:MAX_DEVICES], links=links)
+        out.update(devices=devices[:MAX_DEVICES], links=links, devices_total=max(total, len(devices)))
         if "list_relations" in tools:
             try:
                 rel = call("list_relations")

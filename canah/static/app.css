@@ -330,7 +330,7 @@ pre.block { background: var(--bg2); border: 1px solid var(--line); border-radius
    agent's as plain text; every tool call a bordered card of its arguments, its result folded beneath;
    an interrupt as a card to accept, edit or reject; a composer box with uploads and a tool-call switch. */
 .lg { flex: 1; display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 0; height: 100%; }
-.lg.no-threads { grid-template-columns: 0 minmax(0, 1fr); }
+.lg.no-threads { grid-template-columns: minmax(0, 1fr); }
 .lg.no-threads .lg-threads { display: none; }
 .lg-threads { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: var(--bg2); }
 .lg-threads-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
@@ -404,7 +404,12 @@ body.hide-tools .lg-tool { display: none; }
 .switch .track i { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--panel); transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
 .switch input:checked + .track { background: var(--accent); }
 .switch input:checked + .track i { transform: translateX(14px); }
-@media (max-width: 1100px) { .lg { grid-template-columns: 0 minmax(0, 1fr); } .lg-threads { display: none; } }
+/* Narrow: the thread history is an overlay (☰ in the chat's header), and the conversation the only column. */
+@media (max-width: 1100px) {
+  .lg, .lg.no-threads { grid-template-columns: minmax(0, 1fr); position: relative; }
+  .lg-threads { display: none; }
+  .lg.threads-open .lg-threads { display: flex; position: absolute; z-index: 20; top: 0; bottom: 0; left: 0; width: min(300px, 86vw); box-shadow: var(--shadow); }
+}
 
 /* ================= forms (onboarding) ================= */
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; }
@@ -443,3 +448,96 @@ body.hide-tools .lg-tool { display: none; }
 #mesh .mlbl { fill: var(--muted); font-size: 12px; pointer-events: none; paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
 .mesh-side { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel2); padding: 12px; overflow: auto; max-height: 440px; font-size: 12.5px; }
 @media (max-width: 1100px) { .mesh-wrap { grid-template-columns: 1fr; } }
+
+/* ================= narrow screens =================
+   Up to 1100 px the menu is an overlay (☰ opens it, choosing a view closes it), the top bar keeps only what
+   matters, and every two-column layout stacks. Nothing scrolls sideways. */
+.lg-head, .chat-head { overflow: hidden; }
+.agents-strip { min-width: 0; }
+.lg-bar { flex-wrap: wrap; row-gap: 6px; }
+@media (max-width: 1100px) {
+  .shell { grid-template-columns: 1fr; }
+  .topbar, .credit { grid-column: 1; }
+  .nav { display: none; position: fixed; top: 56px; left: 0; bottom: 0; width: 248px; z-index: 70; box-shadow: var(--shadow); }
+  body.nav-open .nav { display: flex; }
+  body.nav-hidden .nav { display: none; }
+  .view .grid { grid-template-columns: minmax(0, 1fr) !important; }
+  .topo-wrap { height: auto; min-height: 0; grid-template-rows: minmax(420px, 62vh); }
+  .mesh-wrap { grid-template-columns: minmax(0, 1fr); }
+  #st-clock, #st-service { display: none; }
+}
+@media (max-width: 900px) {
+  .topbar { gap: 8px; padding: 0 10px; overflow: hidden; }
+  #st-model, #st-ctl > span:last-child { display: none; }
+  .brand .names small { display: none; }
+  #st-who-text { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+  .view { padding: 12px; }
+  .lg-col { padding: 16px 12px 12px; }
+  .lg-bottom { padding: 6px 10px 10px; }
+  .lg-user { max-width: 92%; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .topo-tools { right: 10px; }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  .brand .names b { font-size: 13px; }
+  #side-toggle { display: none; }
+  #signout { padding: 3px 7px; }
+}
+
+.brand { flex: none; }
+.card { min-width: 0; }
+@media (max-width: 520px) { #st-ctl { display: none; } }
+
+.ficon { display: inline-block; width: 9px; height: 11px; margin-right: 6px; vertical-align: -1px; border: 1.5px solid currentColor;
+  border-radius: 1px 4px 1px 1px; opacity: .7; }
+@media (max-width: 440px) { #st-who { display: none; } }
+
+/* ================= the chat's call flow, on the right (as in edgeLM's console) ================= */
+.lg { grid-template-columns: 260px minmax(0, 1fr) 380px; }
+.lg.no-threads { grid-template-columns: minmax(0, 1fr) 380px; }
+body.side-hidden .lg { grid-template-columns: 260px minmax(0, 1fr) 0; }
+body.side-hidden .lg.no-threads { grid-template-columns: minmax(0, 1fr) 0; }
+body.side-hidden .flow { display: none; }
+.flow { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg2); border-left: 1px solid var(--line); overflow: hidden; }
+.flow .trace-body { padding: 10px 12px 24px; }
+.fl-turn { display: grid; gap: 0; }
+.fl-step { position: relative; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; padding-bottom: 10px; }
+.fl-step::before { content: ""; position: absolute; left: 8px; top: 18px; bottom: 0; border-left: 1px dashed var(--line); }
+.fl-step:last-child::before { display: none; }
+.fl-dot { width: 16px; height: 16px; border-radius: 50%; margin-top: 2px; background: var(--c, var(--faint)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--faint)) 20%, transparent); }
+.fl-step.run .fl-dot { animation: pulse .9s infinite; }
+.fl-box { min-width: 0; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 9px; }
+.fl-step.ask .fl-box, .fl-step.reply .fl-box { background: transparent; border-style: dashed; }
+.fl-h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.fl-who { font-weight: 700; color: var(--c, var(--text)); font-size: 11.5px; }
+.fl-what { font-family: var(--mono); font-size: 11.5px; }
+.fl-t { margin-left: auto; color: var(--faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.fl-d { color: var(--muted); font-size: 11.5px; margin-top: 3px; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.fl-box details summary { cursor: pointer; color: var(--faint); font-size: 11px; margin-top: 3px; }
+.fl-box pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: var(--muted); max-height: 220px; overflow: auto; }
+.fl-delegate { margin: 0 0 10px 26px; padding-left: 10px; border-left: 2px solid var(--c, var(--accent)); }
+.fl-sum { display: flex; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--faint); margin: 2px 0 10px; }
+.lg-ai.traced .segs { box-shadow: -3px 0 0 var(--accent); padding-left: 8px; }
+.lg-ai { cursor: pointer; }
+@media (max-width: 1400px) { .lg { grid-template-columns: 230px minmax(0, 1fr) 320px; } .lg.no-threads { grid-template-columns: minmax(0, 1fr) 320px; } }
+@media (max-width: 1100px) { .lg, .lg.no-threads, body.side-hidden .lg { grid-template-columns: minmax(0, 1fr); } .flow { display: none; }
+  .lg.flow-open .flow { display: flex; position: absolute; z-index: 20; top: 0; bottom: 0; right: 0; width: min(360px, 90vw); box-shadow: var(--shadow); } }
+
+/* ================= digital twins ================= */
+.tw-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.tw-card { position: relative; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 14px; display: grid; gap: 8px; }
+.tw-card.active { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.tw-card .h { display: flex; align-items: center; gap: 8px; }
+.tw-card .h b { font-size: 15px; }
+.tw-card .h .spacer { flex: 1; }
+.tw-card .where { font-family: var(--mono); font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+.tw-dom { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--panel2); font-size: 12px; }
+.tw-dom b { font-size: 12.5px; }
+.tw-dom .k { color: var(--faint); font-size: 11px; margin-top: 2px; }
+.tw-card .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.tw-contract td { font-size: 12px; }
+
+@media (max-width: 1280px) { #st-clock { display: none; } }
+@media (max-width: 1100px) { #st-model { display: none; } .topbar { overflow: hidden; } }
+@media (max-width: 620px) { #st-twin > span:last-child { max-width: 90px; overflow: hidden; text-overflow: ellipsis; } }

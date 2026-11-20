@@ -28,7 +28,8 @@ function toast(text, kind = "") {
 async function api(path, opts = {}) {
   const headers = { ...(opts.body ? { "Content-Type": "application/json" } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}) };
   const r = await fetch(path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
-  if (r.status === 401 && state.token) { state.token = ""; store.del("canah.token"); toast("Your session ended; sign in again.", "warn"); showLogin(); throw new Error("signed out"); }
+  if (r.status === 401 && path !== "/session" && state.token) { state.token = ""; state.level = "observer"; store.del("canah.token"); toast("Your session ended; sign in again.", "warn"); showLogin(); throw new Error("signed out"); }
+  if (r.status === 401 && path !== "/session") throw new Error("signed out");
   if (!r.ok) { let m = `${r.status}`; try { m = (await r.json()).detail || m; } catch (e) { /* not json */ } throw new Error(m); }
   return opts.raw ? r : r.json();
 }
@@ -89,6 +90,7 @@ async function enter(session) {
   go(state.view, true);
   refreshStatus();
   loadTopology();
+  refreshTwinPill();
 }
 
 /* ================= status strip ================= */
@@ -113,10 +115,11 @@ setInterval(() => { $("#st-clock").textContent = new Date().toLocaleTimeString()
 $("#st-ctl").addEventListener("click", () => go("controllers"));
 
 /* ================= router ================= */
-const VIEWS = ["topology", "controllers", "chat", "ops", "knowledge", "identity", "about"];
+const VIEWS = ["topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
 function go(view, first = false) {
   if (!VIEWS.includes(view)) view = "topology";
   state.view = view; store.set("canah.view", view);
+  document.body.classList.remove("nav-open");
   $$(".nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${view}`));
   if (view === "topology") { if (state.topology) { renderTopology(); if (first || !topo.fitted) fitTopology(false); } }
@@ -130,14 +133,25 @@ function go(view, first = false) {
   }
   if (view === "topology") pollActivity();
   if (view === "ops") renderOps();
+  if (view === "twins") renderTwins();
   if (view === "knowledge") renderKnowledge();
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
 }
 $$(".nav button[data-view]").forEach((b) => b.addEventListener("click", () => go(b.dataset.view)));
 const setPanel = (which, hidden) => { document.body.classList.toggle(`${which}-hidden`, hidden); store.set(`canah.${which}-hidden`, hidden); if (state.view === "topology") setTimeout(() => fitTopology(false), 30); };
-$("#nav-toggle").addEventListener("click", () => setPanel("nav", !document.body.classList.contains("nav-hidden")));
-$("#side-toggle").addEventListener("click", () => setPanel("side", !document.body.classList.contains("side-hidden")));
+const narrow = () => window.matchMedia("(max-width: 1100px)").matches;
+$("#nav-toggle").addEventListener("click", () => {
+  if (narrow()) { document.body.classList.toggle("nav-open"); return; }
+  setPanel("nav", !document.body.classList.contains("nav-hidden"));
+});
+document.addEventListener("click", (e) => {     // a tap outside the overlay menu closes it
+  if (document.body.classList.contains("nav-open") && !e.target.closest("#nav, #nav-toggle")) document.body.classList.remove("nav-open");
+});
+$("#side-toggle").addEventListener("click", () => {
+  if (narrow() && state.view === "chat") { $("#lg").classList.toggle("flow-open"); return; }
+  setPanel("side", !document.body.classList.contains("side-hidden"));
+});
 if (store.get("canah.nav-hidden")) document.body.classList.add("nav-hidden");
 if (store.get("canah.side-hidden")) document.body.classList.add("side-hidden");
 
@@ -179,7 +193,7 @@ function buildGraph(t) {
   for (const c of t.controllers || []) {
     const cid = `ctl:${c.key}`;
     nodes.push({ id: cid, kind: "controller", label: c.label || c.key, key: c.key, domain: c.domain, ok: c.ok, c,
-      sub: `${c.domain || "?"} · ${c.ok ? `${c.devices.length} devices` : "unreadable"}` });
+      sub: `${c.domain || "?"} · ${c.ok ? (c.devices_total > c.devices.length ? `${c.devices.length} of ${c.devices_total} devices` : `${c.devices.length} devices`) : "unreadable"}` });
     links.push({ kind: "delegation", source: "canah", target: cid, ok: c.ok });
     for (const d of c.devices || []) nodes.push({ id: `dev:${c.key}:${d.id}`, kind: "device", label: d.label || d.id, parent: cid, domain: c.domain, ok: d.status !== "down", d, ctl: c.key });
     for (const l of c.links || []) links.push({ kind: "link", source: `dev:${c.key}:${l.a}`, target: `dev:${c.key}:${l.z}`, ok: l.state !== "down", l, ctl: c.key });
@@ -254,6 +268,7 @@ function renderTopology() {
   vp.replaceChildren(gl, gn);
   const pos = topo.pos;
   const vis = new Set(topo.nodes.filter(visible).map((n) => n.id));
+  const fewLinks = topo.links.filter((x) => x.kind === "link").length <= 14;
 
   for (const l of topo.links) {
     if (!vis.has(l.source) || !vis.has(l.target)) continue;
@@ -288,7 +303,7 @@ function renderTopology() {
     const p = S("path", { d, class: cls });
     p.append(S("title", {}, l.kind === "delegation" ? `CANAH → ${l.target.slice(4)} through the agentic MCP${l.ok ? "" : " (cannot be read)"}` : `${l.l.id}: ${l.l.a} ⇄ ${l.l.z} · ${l.l.state}`));
     gl.append(p);
-    if (l.kind === "link" && topo.labels && (state.selected === l.source || state.selected === l.target || topo.links.filter((x) => x.kind === "link").length <= 14))
+    if (l.kind === "link" && topo.labels && (state.selected === l.source || state.selected === l.target || fewLinks))
       gl.append(S("text", { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 6, class: "lbl", "text-anchor": "middle" }, l.l.id));
   }
 
@@ -399,7 +414,7 @@ function toggleAll() {
     topo.pos[drag.id] = { ...topo.pos[drag.id], ...np };
     // A controller carries its open devices with it.
     for (const n of topo.nodes) if (n.parent === drag.id && topo.open[drag.id] && topo.pos[n.id]) topo.pos[n.id] = { x: topo.pos[n.id].x + shift.x, y: topo.pos[n.id].y + shift.y };
-    renderTopology();
+    if (!topo.frame) topo.frame = requestAnimationFrame(() => { topo.frame = 0; renderTopology(); });
   });
   svg.addEventListener("pointerup", () => {
     if (!drag) return;
@@ -488,7 +503,7 @@ function renderDetail(id) {
     body.innerHTML = `${c.ok ? "" : `<div class="banner bad">Cannot be read: ${esc(c.error || "unknown")}</div>`}
       <div class="kv"><div>key</div><div class="mono">${esc(c.key)}</div><div>domain</div><div><span class="dshape ${domainClass(c.domain)}"></span>${esc(c.domain || "–")}</div>
       <div>family</div><div>${esc(c.family || "–")}</div><div>tools</div><div>${c.tools ?? "–"}</div><div>contract</div><div>${esc(c.verdict || "–")}</div>
-      <div>devices</div><div>${c.devices.length}</div><div>links</div><div>${c.links.length} (${c.links.filter((l) => l.state === "down").length} down)</div></div>
+      <div>devices</div><div>${c.devices.length}${c.devices_total > c.devices.length ? ` shown of ${c.devices_total} (the map draws at most ${c.devices.length})` : ""}</div><div>links</div><div>${c.links.length} (${c.links.filter((l) => l.state === "down").length} down)</div></div>
       ${(c.gaps || []).length ? `<h4>Gaps</h4><div class="chips">${c.gaps.map((g) => `<span class="chip">${esc(g)}</span>`).join("")}</div>` : ""}
       ${verbs.length ? `<h4>Contract verbs it serves</h4><table class="tbl"><tbody>${verbs.map(([v, t]) => `<tr><td>${esc(v.replace(/_/g, " "))}</td><td class="mono">${esc(t)}</td></tr>`).join("")}</tbody></table>` : ""}
       <div class="row" style="margin-top:12px">${ask(`Give me an overview of ${c.label || c.key}: its devices, links and anything unhealthy.`)}
@@ -533,7 +548,10 @@ async function renderControllers(refresh = false) {
 }
 $("#ctl-refresh").addEventListener("click", () => { renderControllers(true); loadTopology(true); });
 
+let kindsAt = 0;
 async function loadKinds() {
+  if (Date.now() - kindsAt < 60000) return;
+  kindsAt = Date.now();
   try {
     const k = await api("/network/kinds");
     const sel = $("#ob-kind"), cur = sel.value;
@@ -629,7 +647,10 @@ function loadThreads() {
   $("#lg-title").textContent = cur ? cur.title : "new thread";
 }
 $("#thread-new").addEventListener("click", () => openThread(""));
-$("#threads-toggle").addEventListener("click", () => { $("#lg").classList.toggle("no-threads"); store.set("canah.threads-hidden", $("#lg").classList.contains("no-threads")); });
+$("#threads-toggle").addEventListener("click", () => {
+  if (narrow()) { $("#lg").classList.toggle("threads-open"); return; }
+  $("#lg").classList.toggle("no-threads"); store.set("canah.threads-hidden", $("#lg").classList.contains("no-threads"));
+});
 if (store.get("canah.threads-hidden")) $("#lg").classList.add("no-threads");
 $("#hide-tools").addEventListener("change", (e) => { document.body.classList.toggle("hide-tools", e.target.checked); store.set("canah.hide-tools", e.target.checked); });
 if (store.get("canah.hide-tools")) { $("#hide-tools").checked = true; document.body.classList.add("hide-tools"); }
@@ -646,6 +667,7 @@ function welcome() {
 async function openThread(id) {
   if (state.chat.busy && id !== state.chat.thread) { toast("Wait for the answer to finish before switching threads.", "warn"); return; }
   state.chat.thread = id; state.chat.rendered = id; state.chat.files = []; renderFiles(); loadThreads();
+  $("#lg").classList.remove("threads-open");
   const box = col(); box.innerHTML = "";
   $("#suggest").innerHTML = SUGGEST.map((s) => `<button type="button">${esc(s)}</button>`).join("");
   $$("#suggest button").forEach((b) => b.addEventListener("click", () => { $("#composer").value = b.textContent; send(); }));
@@ -654,14 +676,19 @@ async function openThread(id) {
   try {
     const h = await api(`/threads/${id}/history`);
     if (!h.messages.length) box.innerHTML = welcome();
-    let turn = null;
+    let turn = null, asked = "";
+    const finish = (t) => { if (!t) return; t.flow.done = true; t.flow.ms = null; t.done(); };
     for (const m of h.messages) {
-      if (m.role === "user") { addUser(m.text); turn = null; continue; }
-      turn = turn || addAgent();
-      if (m.role === "tool") { const c = turn.tool(m.name, m.args); if (m.result != null) turn.result(c, m.result); }
-      else turn.text(m.text);
+      if (m.role === "user") { finish(turn); addUser(m.text); asked = String(m.text).split(ATT)[0]; turn = null; continue; }
+      turn = turn || addAgent(asked);
+      if (m.role === "tool") {
+        const c = turn.tool(m.name, m.args); if (m.result != null) turn.result(c, m.result);
+        const st = flowCall(turn.flow, m.name, m.args || {}); st.ms = null; turn.flow.open.pop(); st.result = m.result;
+        if (st.to) turn.flow.delegating.pop();
+      } else { turn.text(m.text); turn.flow.reply = m.text; }
     }
-    if (turn) turn.done();
+    finish(turn);
+    if (turn) showFlow(turn);
     const p = await api(`/threads/${id}/pending`);
     if (p.pending?.length) { const t = turn || addAgent(); showPending(t, p.pending); t.done(); }
   } catch (e) { box.innerHTML = welcome(); }
@@ -680,7 +707,7 @@ function addUser(text) {
   const [words, att] = String(text).split(ATT);
   const files = att ? [...att.matchAll(/^- (\/uploads\/\S+)/gm)].map((m) => m[1].split("/").pop()) : [];
   const m = document.createElement("div"); m.className = "lg-user";
-  m.innerHTML = `${files.length ? `<div class="lg-files">${files.map((f) => `<span class="fchip"><span class="nm">📄 ${esc(f)}</span></span>`).join("")}</div>` : ""}<div class="b"></div>`;
+  m.innerHTML = `${files.length ? `<div class="lg-files">${files.map((f) => `<span class="fchip"><span class="nm"><i class="ficon"></i>${esc(f)}</span></span>`).join("")}</div>` : ""}<div class="b"></div>`;
   $(".b", m).textContent = words; if (!words.trim()) $(".b", m).remove();
   box.append(m); scrollDown();
 }
@@ -689,7 +716,69 @@ function kvTable(obj) {
   if (!rows.length) return `<table class="lg-kv"><tr><td class="faint" colspan="2">no arguments</td></tr></table>`;
   return `<table class="lg-kv">${rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(typeof v === "string" ? v : JSON.stringify(v))}</td></tr>`).join("")}</table>`;
 }
-function addAgent() {
+/* ---------- the agent call flow, on the right ---------- */
+const AGENT_COLORS = ["#3d8bff", "#9b51c0", "#3dc46b", "#f6a52c", "#ff6b6b", "#89ddff", "#c792ea", "#f78c6c"];
+function agentColor(a) {
+  if (a === "CANAH") return "var(--accent)";
+  const ctl = (state.topology?.controllers || []).find((c) => c.key === a);
+  if (ctl) return DOMAIN_COLOR[domainClass(ctl.domain)];
+  const subs = state.info?.subagents || [];
+  return AGENT_COLORS[(subs.indexOf(a) + 1) % AGENT_COLORS.length];
+}
+function newFlow(question) { return { question, steps: [], open: [], delegating: [], t0: performance.now(), done: false }; }
+// Who took a step: a subagent when its tool carries the subagent's prefix (onos__…), or while a delegation to it
+// (task) is still open; CANAH otherwise.
+function flowCall(flow, name, args) {
+  const subs = state.info?.subagents || [];
+  const prefix = String(name).split("__")[0];
+  let agent = "CANAH";
+  if (String(name).includes("__") && subs.includes(prefix)) agent = prefix;
+  else if (flow.delegating.length && name !== "task") agent = flow.delegating[flow.delegating.length - 1];
+  const step = { kind: name === "task" ? "delegate" : "call", agent, name, args, t: performance.now(), ms: null, result: null,
+                 to: name === "task" ? (args?.subagent_type || "general-purpose") : null };
+  if (step.to) flow.delegating.push(step.to);
+  flow.steps.push(step); flow.open.push(step);
+  return step;
+}
+function flowResult(flow, name, content) {
+  const k = flow.open.findIndex((o) => o.name === name);
+  const step = k >= 0 ? flow.open.splice(k, 1)[0] : null;
+  if (!step) return;
+  step.ms = performance.now() - step.t; step.result = content;
+  if (step.to) { const i = flow.delegating.lastIndexOf(step.to); if (i >= 0) flow.delegating.splice(i, 1); }
+}
+const fmtDur = (ms) => ms == null ? "" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+const brief = (v, n = 160) => { const t = typeof v === "string" ? v : JSON.stringify(v); return t.length > n ? t.slice(0, n) + "…" : t; };
+function renderFlow(turn) {
+  const body = $("#flow-body"); if (!body || !turn) return;
+  if (state.flowTurn !== turn) return;
+  const f = turn.flow;
+  $$(".lg-ai.traced").forEach((x) => x.classList.remove("traced")); turn.el.classList.add("traced");
+  $("#flow-of").textContent = f.question ? `“${f.question.slice(0, 60)}”` : "";
+  const counts = {}; for (const s2 of f.steps) counts[s2.agent] = (counts[s2.agent] || 0) + 1;
+  const total = f.done ? (f.ms != null ? fmtDur(f.ms) : "") : "running…";
+  const step = (cls, color, who, what, t, detail, extra = "") =>
+    `<div class="fl-step ${cls}" style="--c:${color}"><span class="fl-dot"></span><div class="fl-box"><div class="fl-h"><span class="fl-who">${esc(who)}</span><span class="fl-what">${esc(what)}</span><span class="fl-t">${esc(t)}</span></div>${detail ? `<div class="fl-d">${esc(detail)}</div>` : ""}${extra}</div></div>`;
+  let html = `<div class="fl-sum"><span>${f.steps.length} step${f.steps.length === 1 ? "" : "s"}</span>${Object.entries(counts).map(([a, n]) => `<span style="color:${agentColor(a)}">● ${esc(a)} ${n}</span>`).join("")}<span>${esc(total)}</span></div><div class="fl-turn">`;
+  html += step("ask", "var(--faint)", "you", "asked", "", f.question || "");
+  for (const s2 of f.steps) {
+    const det = `<details><summary>arguments${s2.result != null ? " and result" : ""}</summary><pre>${esc(JSON.stringify(s2.args || {}, null, 1))}</pre>${s2.result != null ? `<pre>${esc(String(s2.result).slice(0, 3000))}</pre>` : ""}</details>`;
+    const failed = s2.result != null && /^(error|not sent)/i.test(String(s2.result));
+    const running = s2.ms == null && !f.done;
+    if (s2.kind === "delegate")
+      html += step(running ? "run" : "", agentColor(s2.agent), s2.agent, `→ ${s2.to}`, fmtDur(s2.ms), s2.args?.description ? brief(s2.args.description, 200) : "", det);
+    else
+      html += step(running ? "run" : "", failed ? "var(--bad)" : agentColor(s2.agent), s2.agent, s2.name, running ? "…" : fmtDur(s2.ms),
+                   s2.result != null ? brief(s2.result) : brief(s2.args || {}, 120), det);
+  }
+  if (f.pending?.length) html += step("", "var(--warn)", "operator", `approval: ${f.pending.map((x) => x.name).join(", ")}`, "", "waiting for a decision");
+  if (f.done) html += step("reply", "var(--accent)", "CANAH", f.error ? "failed" : "answered", "", f.error || brief(f.reply || "", 220));
+  html += "</div>";
+  body.innerHTML = html;
+}
+function showFlow(turn) { state.flowTurn = turn; renderFlow(turn); }
+
+function addAgent(question = "") {
   const box = col(); $(".welcome", box)?.remove();
   const m = document.createElement("div"); m.className = "lg-ai";
   m.innerHTML = `<div class="av"><img src="${logoSrc()}" alt=""></div><div class="segs"><div class="working"><span class="bars"><i></i><i></i><i></i></span>reading the network…</div></div>`;
@@ -698,7 +787,7 @@ function addAgent() {
   let last = null;                                     // the text segment the tokens go into
   const working = () => $(".working", segs);
   const turn = {
-    el: m, segs, raw: "",
+    el: m, segs, raw: "", flow: newFlow(question),
     token(t) { working()?.remove(); if (!last) { last = document.createElement("div"); last.className = "reply-rich"; last._raw = ""; segs.append(last); } last._raw += t; last.innerHTML = md(last._raw); scrollDown(); },
     text(t) { if (!t) return; working()?.remove(); last = document.createElement("div"); last.className = "reply-rich"; last._raw = t; last.innerHTML = md(t); segs.append(last); },
     final(t) {     // the reply as the agent ended it: replaces what streamed after the last tool card
@@ -735,6 +824,8 @@ function addAgent() {
       }
     },
   };
+  m.addEventListener("click", (e) => { if (!e.target.closest("button, a, textarea, input, summary")) showFlow(turn); });
+  showFlow(turn);
   return turn;
 }
 
@@ -760,18 +851,21 @@ async function stream(path, body, turn) {
           if (sub && (state.info?.subagents || []).includes(sub)) active.add(sub);
           renderAgentStrip(active); noteActivity(active);
           open.push({ name: d.name, card: turn.tool(d.name, d.args || {}) });
+          flowCall(turn.flow, d.name, d.args || {}); renderFlow(turn);
         } else if (ev === "tool_result") {
           const k = open.findIndex((o) => o.name === d.name); const o = k >= 0 ? open.splice(k, 1)[0] : open.shift();
           turn.result(o?.card, d.content);
+          flowResult(turn.flow, d.name, d.content); renderFlow(turn);
         } else if (ev === "reply") {
           if (d.thread_id && !state.chat.thread) state.chat.thread = d.thread_id;
           turn.final(d.text || "");
+          turn.flow.reply = d.text || ""; turn.flow.pending = d.pending || [];
           if (d.pending?.length) showPending(turn, d.pending);
-        } else if (ev === "error") turn.text(`**Error:** ${d.error}`);
+        } else if (ev === "error") { turn.text(`**Error:** ${d.error}`); turn.flow.error = d.error; }
       }
     }
-  } catch (e) { turn.text(`**Error:** ${e.message}`); }
-  finally { turn.done(); setBusy(false); renderAgentStrip(); noteActivity(new Set()); refreshPendingBadge(); loadThreads(); }
+  } catch (e) { turn.text(`**Error:** ${e.message}`); turn.flow.error = e.message; }
+  finally { turn.flow.done = true; turn.flow.ms = performance.now() - turn.flow.t0; renderFlow(turn); turn.done(); setBusy(false); renderAgentStrip(); noteActivity(new Set()); refreshPendingBadge(); loadThreads(); }
 }
 function setBusy(b) { state.chat.busy = b; $("#st-busy").hidden = !b; $("#send").disabled = b; if (state.view === "topology") renderTopology(); }
 function noteActivity(active) { state.localActive = active; if (state.view === "topology") renderTopology(); }
@@ -798,7 +892,7 @@ async function send() {
   ta.value = ""; ta.style.height = ""; state.chat.files = []; renderFiles();
   saveThread(id, words || "attached files");
   addUser(text);
-  await stream(`/threads/${id}/stream`, { text }, addAgent());
+  await stream(`/threads/${id}/stream`, { text }, addAgent(words || "attached files"));
 }
 $("#composer-form").addEventListener("submit", (e) => { e.preventDefault(); send(); });
 $("#composer").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
@@ -809,7 +903,7 @@ const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixe
 state.chat.files = [];
 function renderFiles() {
   const box = $("#files"); if (!box) return;
-  box.innerHTML = state.chat.files.map((f, i) => `<span class="fchip${f.busy ? " busy" : ""}" title="${esc(f.path || "uploading")}"><span class="nm">📄 ${esc(f.name)}</span><span class="sz">${f.busy ? "uploading…" : fmtBytes(f.bytes)}</span><button type="button" data-i="${i}" title="Remove">×</button></span>`).join("");
+  box.innerHTML = state.chat.files.map((f, i) => `<span class="fchip${f.busy ? " busy" : ""}" title="${esc(f.path || "uploading")}"><span class="nm"><i class="ficon"></i>${esc(f.name)}</span><span class="sz">${f.busy ? "uploading…" : fmtBytes(f.bytes)}</span><button type="button" data-i="${i}" title="Remove">×</button></span>`).join("");
   $$("button[data-i]", box).forEach((b) => b.addEventListener("click", () => { state.chat.files.splice(+b.dataset.i, 1); renderFiles(); }));
 }
 async function attach(files) {
@@ -844,7 +938,7 @@ function showPending(turn, pending) {
   const finish = async (decisions, label) => {
     $$("button", card).forEach((x) => x.disabled = true); card.classList.add("done");
     $(".h", card).innerHTML = `<span class="k">interrupt</span>${esc(label)}`;
-    await stream(`/threads/${state.chat.thread}/decide`, { decisions, stream: true }, addAgent());
+    await stream(`/threads/${state.chat.thread}/decide`, { decisions, stream: true }, addAgent(`decision: ${label}`));
   };
   $$("button[data-d]", card).forEach((b) => b.addEventListener("click", async () => {
     if (b.dataset.d === "approve") return finish(pending.map(() => ({ type: "approve" })), "Accepted");
@@ -865,13 +959,13 @@ const levelRank = (l) => ({ observer: 0, admin: 1, root: 2 }[l] ?? 0);
 /* A small markdown reader for replies: headings, lists, code, tables, bold, links. */
 function md(src) {
   const lines = String(src).replace(/\r/g, "").split("\n"); const out = []; let i = 0;
-  const inline = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, "$1<i>$2</i>")
+  const inline = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*(.+?)\*\*(?!\*)/g, "<b>$1</b>").replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, "$1<i>$2</i>")
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   while (i < lines.length) {
     const l = lines[i];
     if (/^```/.test(l)) { const buf = []; i++; while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]); i++; out.push(`<pre>${esc(buf.join("\n"))}</pre>`); continue; }
     if (/^\s*\|.*\|\s*$/.test(l) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] || "")) {
-      const row = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const row = (r) => r.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
       const head = row(l); i += 2; const body = [];
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(row(lines[i++]));
       out.push(`<table><thead><tr>${head.map((h) => `<th>${inline(h)}</th>`).join("")}</tr></thead><tbody>${body.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`); continue;
@@ -917,6 +1011,71 @@ async function renderOps() {
   } catch (e) { $("#ops-audit").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 $("#ops-refresh").addEventListener("click", renderOps);
+
+/* ================= digital twins ================= */
+async function refreshTwinPill() {
+  try {
+    const t = await api("/twins");
+    const act = (t.twins || []).find((x) => x.active);
+    $("#st-twin span:last-child").textContent = act ? `twin: ${act.name}` : "no twin";
+    $("#st-twin .dot").className = `dot ${act ? (act.ok ? "ok" : "bad") : ""}`;
+    $("#st-twin").hidden = false;
+    return t;
+  } catch (e) { $("#st-twin").hidden = true; return null; }
+}
+$("#st-twin").addEventListener("click", () => go("twins"));
+async function renderTwins() {
+  const t = await refreshTwinPill();
+  if (!t) { $("#tw-cards").innerHTML = `<div class="banner warn">This agent was built without digital twins: add one under <span class="mono">twins:</span> in canah.yaml.</div>`; return; }
+  $("#tw-contract").textContent = `contract ${t.contract}`;
+  const admin = levelRank(state.level) >= 1, root = levelRank(state.level) >= 2;
+  $("#tw-cards").innerHTML = (t.twins || []).map((w) => `<div class="tw-card${w.active ? " active" : ""}">
+      <div class="h"><span class="dot ${w.ok ? "ok" : "bad"}"></span><b>${esc(w.name)}</b>${w.active ? `<span class="tag info">in use</span>` : ""}
+        <span class="tag">${esc(w.kind)}</span>${w.version ? `<span class="faint" style="font-size:11.5px">v${esc(w.version)}</span>` : ""}<div class="spacer"></div>
+        ${w.declared ? `<span class="faint" style="font-size:11px">canah.yaml</span>` : ""}</div>
+      <div class="where">${esc(w.url || w.spec || "")}${w.path ? ` · ${esc(w.path)}` : ""}${w.token_env ? ` · token: $${esc(w.token_env)}` : ""}</div>
+      ${w.ok ? `<div class="muted" style="font-size:12.5px">${esc(w.about || "")}</div>
+        ${(w.domains || []).map((d) => `<div class="tw-dom"><b>${esc(d.title || d.domain)}</b> <span class="faint mono" style="font-size:11px">${esc(d.domain)}</span><div>${esc(d.answers || "")}</div><div class="k">KPIs: ${esc((d.kpis || []).join(", "))}</div></div>`).join("")}
+        <div class="faint" style="font-size:11.5px">can: ${esc((w.capabilities || []).join(", "))}${(w.controller_domains || []).length ? ` · checks writes on ${esc(w.controller_domains.join(", "))} controllers` : ""}${(w.extras || []).length ? ` · extras: ${esc(w.extras.map((x) => x.name).join(", "))}` : ""}</div>`
+      : `<div class="banner bad" style="margin:0">${esc(w.error || "does not answer")}</div>`}
+      <div class="acts">${!w.active ? `<button class="btn sm primary" data-use="${esc(w.name)}" ${admin ? "" : "disabled title='admin'"}>Use this twin</button>` : ""}
+        <button class="btn sm" data-test="${esc(w.name)}">Test</button>
+        ${!w.declared ? `<button class="btn sm danger" data-drop="${esc(w.name)}" ${root ? "" : "disabled title='root'"}>Remove</button>` : ""}</div>
+    </div>`).join("") + `<div class="tw-card${t.active ? "" : " active"}"><div class="h"><b>No twin</b><div class="spacer"></div>${!t.active ? `<span class="tag info">in use</span>` : ""}</div>
+      <div class="muted" style="font-size:12.5px">Answers come from the controllers alone, and writes go through approval alone, with no prediction first.</div>
+      <div class="acts">${t.active ? `<button class="btn sm" data-use="none" ${admin ? "" : "disabled"}>Use no twin</button>` : ""}</div></div>`;
+  $$("[data-use]").forEach((b) => b.addEventListener("click", async () => {
+    try { await api("/twins/active", { method: "PUT", body: { name: b.dataset.use } }); toast(b.dataset.use === "none" ? "No twin in use." : `Using ${b.dataset.use} from the next question.`, "ok"); renderTwins(); }
+    catch (e) { toast(e.message, "bad"); }
+  }));
+  $$("[data-test]").forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try { const r = await api(`/twins/${encodeURIComponent(b.dataset.test)}/test`, { method: "POST" });
+      toast(r.ok ? `${r.name} answers (${r.contract}): ${r.domains.join(", ")}` : `It does not answer: ${r.error}`, r.ok ? "ok" : "bad"); }
+    catch (e) { toast(e.message, "bad"); } finally { b.disabled = false; }
+  }));
+  $$("[data-drop]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm(`Remove the twin ${b.dataset.drop}?`)) return;
+    try { await api(`/twins/${encodeURIComponent(b.dataset.drop)}`, { method: "DELETE" }); toast("Removed.", "ok"); renderTwins(); } catch (e) { toast(e.message, "bad"); }
+  }));
+  $$("#tw-form input, #tw-form select, #tw-form button").forEach((x) => x.disabled = !admin);
+  if (!admin) $("#tw-msg").textContent = "Sign in as admin to add a twin.";
+}
+$("#tw-refresh").addEventListener("click", renderTwins);
+$("#tw-kind").addEventListener("change", (e) => { const py = e.target.value === "python"; $$(".tw-http").forEach((x) => x.hidden = py); $$(".tw-py").forEach((x) => x.hidden = !py); });
+$("#tw-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const kind = $("#tw-kind").value;
+  const body = kind === "http" ? { name: $("#tw-name").value.trim(), kind, url: $("#tw-url").value.trim(), token_env: $("#tw-token").value.trim() }
+                               : { name: $("#tw-name").value.trim(), kind, spec: $("#tw-spec").value.trim(), path: $("#tw-path").value.trim() };
+  $("#tw-msg").textContent = "adding and testing…";
+  try {
+    const r = await api("/twins", { method: "POST", body });
+    $("#tw-msg").innerHTML = r.status?.ok ? `<span class="tag ok">added</span> it answers in the contract: ${esc((r.status.domains || []).map((d) => d.domain).join(", "))}. Choose “Use this twin” to use it.`
+      : `<span class="tag warn">added, but it does not answer</span> ${esc(r.status?.error || "")}`;
+    renderTwins();
+  } catch (err) { $("#tw-msg").innerHTML = `<span class="tag bad">not added</span> ${esc(err.message)}`; }
+});
 
 /* ================= knowledge ================= */
 const mesh = { data: null, pos: {}, sel: null, view: { k: 1, x: 0, y: 0 } };
@@ -1049,7 +1208,7 @@ function renderAbout() {
 let gPending = false;
 document.addEventListener("keydown", (e) => {
   if ($("#shell").hidden || e.target.closest("input, textarea, select") || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (gPending) { gPending = false; const v = { t: "topology", c: "controllers", h: "chat", a: "ops", k: "knowledge" }[e.key]; if (v) { go(v); e.preventDefault(); } return; }
+  if (gPending) { gPending = false; const v = { t: "topology", c: "controllers", h: "chat", a: "ops", w: "twins", k: "knowledge" }[e.key]; if (v) { go(v); e.preventDefault(); } return; }
   if (e.key === "g") { gPending = true; setTimeout(() => { gPending = false; }, 900); return; }
   if (e.key === "[") $("#nav-toggle").click();
   else if (e.key === "]") $("#side-toggle").click();

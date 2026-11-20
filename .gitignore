@@ -9,3 +9,4 @@ canah_data/
 *.sqlite
 *.sqlite-*
 testbed/results/
+netwins_data/

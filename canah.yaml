@@ -19,3 +19,10 @@ root_tools:
 # Extra middleware for the main agent and every subagent:
 # middleware:
 #   - mypackage.middleware:AuditLog
+# Digital twins (docs/TWIN_CONTRACT.md): a change is tried in the twin in use before it reaches a controller.
+# More can be added, tested and chosen on the web page (Digital twins).
+twins:
+  - {name: netwins, kind: python, spec: "netwins.contract:twin", path: "~/netwins"}   # github.com/maconair0/NetTwin
+  # - {name: flow-example, kind: http, url: "http://127.0.0.1:8430"}                  # python examples/custom_twin.py
+twin_active: netwins
+twin_gate: true

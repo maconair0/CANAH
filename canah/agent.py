@@ -55,6 +55,8 @@ class CanahAgent:
     sandbox: Any = None
     interrupts: Dict[str, Any] = field(default_factory=dict)
     ops: Any = None
+    twins: Any = None               # canah.twins.Registry: the digital twins and the one in use
+    twin_checks: Any = None         # the checks they made, and operators' overrides
 
     def interrupt_config(self, tool: str) -> Optional[Dict[str, Any]]:
         """How a tool call pauses (allowed decisions, description), or None if it does not."""
@@ -279,7 +281,13 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             sandbox_note = str(e)
             logger.warning("starting without a sandbox: %s", e)
     from .tools import load_providers
-    got = merge(list(providers) + load_providers(settings.providers))
+    # Digital twins: one set of tools for whichever twin is in use, when any is configured.
+    from .twins.provider import Checks, TwinsProvider
+    from .twins.registry import Registry
+    twins = Registry(settings.home_path, settings.twins, settings.twin_active)
+    twin_checks = Checks()
+    twin_provider = [TwinsProvider(twins, settings.home_path, twin_checks)] if twins.entries() else []
+    got = merge(list(providers) + load_providers(settings.providers) + twin_provider)
     tools = list(got["tools"]) + list(extra_tools)
     writes = list(got["writes"]) + list(extra_writes) + list(settings.approve_tools)
     if sandbox is not None and settings.approve_execute:
@@ -316,6 +324,10 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     large = LargeResults(limit=settings.large_result_chars, sandbox=sandbox,
                          folder=settings.home_path / "results" if sandbox is None else None)
     extra_mw = [*_load_middleware(settings.middleware), *list(middleware)]
+    if twin_provider and settings.twin_gate:
+        from .twins.provider import make_gate
+        approvals_set = set(approvals)
+        extra_mw.append(make_gate(twins, twin_checks, lambda: approvals_set))
     if not any(s["name"] == "general-purpose" for s in specs):
         specs.append({"name": "general-purpose",
                       "description": ("A general-purpose agent for a self-contained piece of work that needs several "
@@ -395,7 +407,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     info["interrupt_on"] = sorted(interrupts)
     info["middleware"] = [type(m).__name__ for m in extra_mw]
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
-                      interrupts=interrupts, ops=ops)
+                      interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks)
 
 
 def _fallback() -> List[Any]:

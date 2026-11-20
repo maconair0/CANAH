@@ -67,6 +67,12 @@ class Settings:
     recursion_limit: int = 400
     # Long-term memories not changed for this many days are deleted at start (0: kept).
     memory_ttl_days: float = 0
+    # Digital twins (canah/twins, the canah.twin/1 contract): entries {name, kind: python|http, spec|url, path,
+    # token_env}; more can be added on the web page. `twin_active` names the one in use (the web page's choice
+    # wins); `twin_gate` holds controller writes to the active twin's check, when it checks writes.
+    twins: List[Dict[str, Any]] = field(default_factory=list)
+    twin_active: str = ""
+    twin_gate: bool = True
     # The document collection this agent searches (one per domain or system, if wanted).
     knowledge_collection: str = "corpus"
     # Keep the audit log and request metrics (CANAH_HOME/ops.sqlite).
@@ -115,7 +121,7 @@ ENV = {
     "CANAH_HOME": "home", "CANAH_MCP_CONFIG": "mcp_config", "CANAH_SUBAGENTS": "subagents_file",
     "CANAH_SYSTEM_PROMPT_FILE": "system_prompt_file", "CANAH_SANDBOX": "sandbox",
     "CANAH_RECURSION_LIMIT": "recursion_limit", "CANAH_MAX_SECONDS": "max_seconds", "CANAH_NOTIFY_URL": "notify_url",
-    "CANAH_APPROVAL_TTL_S": "approval_ttl_s", "CANAH_MAX_TOKENS_PER_REQUEST": "max_tokens_per_request", "CANAH_DEBUG": "debug", "CANAH_PROVIDERS": "providers",
+    "CANAH_APPROVAL_TTL_S": "approval_ttl_s", "CANAH_MAX_TOKENS_PER_REQUEST": "max_tokens_per_request", "CANAH_DEBUG": "debug", "CANAH_PROVIDERS": "providers", "CANAH_TWIN": "twin_active",
 }
 
 

@@ -59,6 +59,7 @@
     <span class="pill" id="st-service" title="The CANAH service"><span class="dot"></span>service</span>
     <span class="pill" id="st-model" title="The model the agent runs on"><span class="dot"></span><span>model</span></span>
     <span class="pill click" id="st-ctl" title="Controllers the agentic MCP holds, and how many could be read"><span class="dot"></span><span>controllers</span></span>
+    <span class="pill click" id="st-twin" title="The digital twin in use"><span class="dot"></span><span>twin</span></span>
     <span class="pill" id="st-busy" hidden><span class="dot busy"></span><span>agent working</span></span>
     <div class="spacer"></div>
     <span class="pill click" id="st-who" title="Your profile"><span class="dot"></span><span id="st-who-text">observer</span></span>
@@ -75,6 +76,7 @@
     <div class="section">Operate</div>
     <button data-view="chat"><span class="ico">✦</span>Chat</button>
     <button data-view="ops"><span class="ico">✔</span>Approvals &amp; audit<span class="badge warn" id="pending-badge" hidden>0</span></button>
+    <button data-view="twins"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="3" width="7" height="7" rx="1.5"/><rect x="6" y="1" width="7" height="7" rx="1.5" stroke-dasharray="2 1.5"/></svg></span>Digital twins</button>
     <div class="section">Knowledge</div>
     <button data-view="knowledge"><span class="ico">❏</span>Documents &amp; memory</button>
     <div class="section">Account</div>
@@ -128,7 +130,7 @@
         <span class="faint" id="ctl-src" style="font-size:12px"></span><button class="btn sm" id="ctl-refresh">Refresh</button></div>
       <div id="ctl-banner"></div>
       <div class="grid" style="grid-template-columns:minmax(0,1fr) 420px;align-items:start">
-        <div style="display:grid;gap:14px;min-width:0">
+        <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:14px;min-width:0">
         <div class="card"><header><h3>Held by the agentic MCP</h3><div class="spacer"></div>
           <button class="btn sm" id="ctl-reload" title="Rebuild the agent so every controller held now has its subagent (admin)">Reload CANAH</button></header>
           <div class="body" style="padding:0;overflow:auto" id="ctl-table"></div></div>
@@ -138,7 +140,7 @@
             <form id="onboard-form" class="form-grid" autocomplete="off">
               <label>Key<input id="ob-key" placeholder="onos2" required pattern="[a-z][a-z0-9_]{1,31}" title="lower-case letters, digits, _"></label>
               <label>Label<input id="ob-label" placeholder="ONOS (site B)"></label>
-              <label class="wide">Base URL<input id="ob-url" placeholder="http://10.0.0.5:8181/onos/v1" required></label>
+              <label class="wide">Base URL<input id="ob-url" placeholder="http://10.0.0.5:8181/onos/v1" required pattern="https?://.+" title="starts with http:// or https://"></label>
               <label>Kind<select id="ob-kind"><option value="">recognise it from its API</option></select></label>
               <label>API document URL<input id="ob-spec" placeholder="optional: an OpenAPI / Swagger URL"></label>
               <label>User variable<input id="ob-user" placeholder="ONOS2_USER" pattern="[A-Z_][A-Z0-9_]*"></label>
@@ -190,6 +192,46 @@
             </form>
           </div>
         </div>
+        <aside class="flow" id="flow">
+          <div class="trace-head"><h3>Agent call flow</h3><div style="flex:1"></div>
+            <span class="faint" id="flow-of" style="font-size:11.5px;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
+          <div class="trace-body"><div id="flow-body"><div class="empty" style="font-size:12.5px">Ask something: each step the agent takes shows here, who took it, with what, and how long it took. Click any answer to see its flow.</div></div></div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- Digital twins -->
+    <section class="view" id="view-twins">
+      <div class="row"><h2>Digital twins</h2><div style="flex:1"></div><span class="faint" id="tw-contract" style="font-size:12px"></span>
+        <button class="btn sm" id="tw-refresh">Refresh</button></div>
+      <p class="muted" style="margin:0 0 14px;font-size:13px;max-width:900px">A digital twin predicts what a change or a failure does to a network before the network sees it. CANAH asks the twin in use through one contract, so any twin that speaks it can be used: netwins, or your own. Changing the twin takes effect at the next question; the agent's tools stay the same.</p>
+      <div id="tw-cards" class="tw-cards"></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;margin-top:14px">
+        <div class="card"><header><h3>Add a custom twin</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
+          <div class="body">
+            <form id="tw-form" class="form-grid" autocomplete="off">
+              <label>Name<input id="tw-name" placeholder="lab-twin" required pattern="[a-z][a-z0-9_-]{1,31}" title="lower-case letters, digits, - and _"></label>
+              <label>Kind<select id="tw-kind"><option value="http">HTTP service</option><option value="python">Python object</option></select></label>
+              <label class="wide tw-http">URL<input id="tw-url" placeholder="http://10.0.0.9:8420" pattern="https?://.+"></label>
+              <label class="wide tw-http">Token variable<input id="tw-token" placeholder="LAB_TWIN_TOKEN (optional)" pattern="[A-Z_][A-Z0-9_]*"></label>
+              <label class="wide tw-py" hidden>Spec (module:factory)<input id="tw-spec" placeholder="mytwin.contract:twin"></label>
+              <label class="wide tw-py" hidden>Folder to import from<input id="tw-path" placeholder="/opt/mytwin (optional)"></label>
+              <p class="faint wide" style="margin:0;font-size:11.5px">A token is the <b>name</b> of an environment variable on CANAH's host, never the token itself.</p>
+              <div class="wide row"><button class="btn primary" type="submit">Add and test</button><span id="tw-msg" class="muted" style="font-size:12.5px"></span></div>
+            </form>
+          </div></div>
+        <div class="card"><header><h3>The contract: canah.twin/1</h3></header>
+          <div class="body tw-contract">
+            <p class="muted" style="margin:0 0 8px">Any twin answers four calls, in-process or over HTTP:</p>
+            <table class="tbl"><tbody>
+              <tr><td class="mono">GET /twin</td><td>describe: name, version, domains (what each answers, its KPIs, an example scenario, fidelity, what it does not model), capabilities</td></tr>
+              <tr><td class="mono">POST /twin/validate</td><td><span class="mono">{scenario}</span> → ok, problems</td></tr>
+              <tr><td class="mono">POST /twin/predict</td><td><span class="mono">{scenario}</span> → decision (propose, reject, gather_more_data, met, not_met), probability and interval, trust tier, figures per entity and KPI, the change that ran, what is not modelled</td></tr>
+              <tr><td class="mono">POST /twin/check_write</td><td>optional: a controller write tried before it is sent → propose, reject, ask_operator, … (the write gate uses it)</td></tr>
+              <tr><td class="mono">POST /twin/extra</td><td>optional: the twin's own read-only helpers, listed by describe</td></tr>
+            </tbody></table>
+            <p class="faint" style="margin:8px 0 0;font-size:11.5px">The full text: docs/TWIN_CONTRACT.md. A minimal twin to start from: examples/custom_twin.py.</p>
+          </div></div>
       </div>
     </section>
 

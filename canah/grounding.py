@@ -59,6 +59,36 @@ def _norm(token: str) -> str:
     return token.replace(",", "").lower()
 
 
+_FLOAT = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _derived(value: str, given: str, numbers: Optional[List[float]] = None) -> bool:
+    """A value that is a tool's number written another way: rounded to the precision the answer gives
+    (4.83 for 4.83265), or as a percentage (95.8 for 0.958, 0.25 for 25). Nothing else: a sum, a ratio
+    or a unit change still has to come from a tool (or the sandbox)."""
+    try:
+        v = float(_norm(value))
+    except ValueError:
+        return False
+    mantissa = _norm(value).split("e")[0]
+    places = len(mantissa.split(".")[1]) if "." in mantissa else 0
+    for g in numbers if numbers is not None else _numbers(given):
+        for f in (1.0, 100.0, 0.01):
+            if abs(round(g * f, places) - v) < 10 ** -(places + 6):
+                return True
+    return False
+
+
+def _numbers(text: str) -> List[float]:
+    out = []
+    for t in _FLOAT.findall(text or "")[:20000]:
+        try:
+            out.append(float(t))
+        except ValueError:
+            pass
+    return out
+
+
 def specifics(text: str) -> List[str]:
     """The checkable values in a text: long numbers and long hex strings."""
     found = [t for t in _NUMBER.findall(text or "") if _significant(t)]
@@ -128,7 +158,8 @@ class GroundingGuard(AgentMiddleware):
         given = _norm(" ".join(tools_said + [str(turn[0].content)] + [_calls(turn)]))
         known = _norm(" ".join([str(m.content) for m in msgs if isinstance(m, (ToolMessage, HumanMessage))
                                 and _GUARD not in str(m.content)] + [_calls(msgs)]))
-        missing = [v for v in specifics(answer) if _norm(v) not in given]
+        nums = _numbers(given)
+        missing = [v for v in specifics(answer) if _norm(v) not in given and not _derived(v, given, nums)]
         # A count must appear as a number in what the tools returned (a count the sandbox computed is in
         # execute's output); a count read off a clipped list does not.
         numbers = set(re.findall(r"(?<![\w.])\d+(?![\w.])", given))
@@ -138,7 +169,8 @@ class GroundingGuard(AgentMiddleware):
             return None
         return {"jump_to": "model", "messages": [HumanMessage(content=(
             f"{_GUARD} Your answer states {', '.join(missing[:8])}, which no tool returned. "
-            f"Report only what the tools returned, as they returned it. If a command did not print what you "
+            f"Report only what the tools returned (rounding a figure, or giving it as a percentage, is fine). "
+            f"If a command did not print what you "
             f"expected (for example `$(...)` inside single quotes is not expanded), fix it and run it again; "
             f"otherwise drop the value and say it was not obtained."))]}
 

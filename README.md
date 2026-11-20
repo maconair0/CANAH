@@ -5,7 +5,8 @@
 - sign-in, with approval for every change, and an audit log of every decision;
 - a sandbox to compute in;
 - an HTTP service with a web console;
-- checks that keep the agent to what its tools returned.
+- checks that keep the agent to what its tools returned;
+- digital twins behind one contract: a change is tried in a twin before it reaches the network.
 
 ## Start and stop
 
@@ -29,7 +30,7 @@ console):
   *names* of the variables holding its credentials on the agentic MCP's host (never the secrets). A kind it does
   not know can be added from a manifest or drafted from a user guide. **Reload CANAH** gives every controller held
   now its subagent; **Remove** (root) unseats one.
-- **Chat**, in the style of LangGraph's agent chat UI: thread history on the left; every tool call (subagents'
+- **Chat**, in the style of LangGraph's agent chat UI, with the agent's call flow on the right (as edgeLM's console has it: who took each step, the tool, its arguments, what came back, how long it took; click any answer for its flow): thread history on the left; every tool call (subagents'
   included) as a card of its arguments with its result beneath; a change as an interrupt to **accept, edit** (the
   arguments as JSON) **or reject**, offered at the level it needs; a switch to hide tool calls. **Attach files**
   (button, drag and drop, or paste; up to 25 MB): kept per user, read by the agent as `/uploads/<thread>/<file>`,
@@ -139,6 +140,30 @@ In every subagent too:
 - **Read-back:** after an approved change, the agent is told to read the object back before reporting success.
 - **Budgets:** each request has a time budget (`max_seconds`) and an optional token budget, across the main agent and all subagents.
 
+## Digital twins
+
+A digital twin predicts what a change or a failure will do to a network before the network sees it. CANAH can use **any** twin that speaks one contract, `canah.twin/1` ([docs/TWIN_CONTRACT.md](docs/TWIN_CONTRACT.md)): four calls (describe, validate, predict, and optionally check a controller write), in-process or over HTTP, with one standard shape for the answer.
+- **The answer:**
+  - a decision: propose, reject, gather more data, met, not met;
+  - the probability that the requirements hold, and its interval;
+  - a trust tier;
+  - the figures with and without the change;
+  - exactly what change ran, and what the twin does not model.
+- **One set of tools for the agent,** whichever twin is in use: `twin_list`, `twin_schema`, `twin_validate`, `twin_predict`, `twin_check_write`, `twin_override`, `twin_extra`.
+- **A gate on controller writes:** when the twin in use can check writes, a write goes ahead only if the twin supports it or an operator overrides its check, with their reason; the override is itself approved and audited.
+- **Chosen on the web page:** **Digital twins** lists the twins, tests them, adds a custom one (an HTTP URL, or a Python `module:factory`) and switches the one in use, with no restart.
+
+```yaml
+# canah.yaml
+twins:
+  - {name: netwins, kind: python, spec: netwins.contract:twin, path: ~/netwins}   # https://github.com/maconair0/NetTwin
+  # - {name: lab-twin, kind: http, url: "http://10.0.0.9:8420", token_env: LAB_TWIN_TOKEN}
+twin_active: netwins
+twin_gate: true
+```
+
+[`examples/custom_twin.py`](examples/custom_twin.py) is a complete custom twin in about fifty lines of model, with only the standard library. Start from it to plug in your own.
+
 ## The sandbox
 
 A Docker container starts with the agent, so `execute` is there from the first message. It's removed when the agent exits; files in `/workspace` are kept in a volume.
@@ -216,6 +241,11 @@ They meet at declared hand-offs: a packet link rides an optical lightpath, and a
 - **across domains:** chains, impact of a fault, a tenant's path out, a build under a cross-domain rule, an observer refusal.
 
 Each case is checked against the answer and against the domain's state afterwards. Results go to `testbed/results/`, with a score per domain, the model and the harness commit. The domain-specific material (the emulator, its `AGENTS.md`, skills and design rules) lives only in `testbed/`.
+
+## Authors
+
+- **[maconair0](https://github.com/maconair0)**: owner and author.
+- **Claude (Anthropic)**: co-contributor: code, tests and documentation, written with the author.
 
 ## License
 

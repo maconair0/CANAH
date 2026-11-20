@@ -178,3 +178,14 @@ class Grounding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Derived(unittest.TestCase):
+    def test_a_rounded_figure_or_a_percentage_of_a_tool_number_is_grounded(self):
+        from canah.grounding import _derived
+        said = '{"p": 0.958, "margin_db": 4.83265, "loss": 25}'
+        self.assertTrue(_derived("95.8", said))          # 0.958 as a percentage
+        self.assertTrue(_derived("4.83", said))          # rounded to what the answer shows
+        self.assertTrue(_derived("0.25", said))          # 25 % as a fraction
+        self.assertFalse(_derived("4.84", said))         # not a rounding of anything returned
+        self.assertFalse(_derived("96.1", said))

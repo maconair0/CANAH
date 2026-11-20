@@ -27,6 +27,12 @@ The agent over HTTP.
   DELETE /network/controllers/{key}   remove one (root)
   POST   /network/manifests, /network/guides   a manifest, or a user guide drafted into one (admin)
   POST   /admin/reload            rebuild the agent from the settings, so new controllers get subagents (admin)
+  GET    /twins                   the digital twins configured, which one is in use, what each covers
+  PUT    /twins/active            {"name"}: use this twin (admin); "none" for no twin
+  POST   /twins                   {"name", "kind": "http", "url", "token_env"} or {"name", "kind": "python",
+                                  "spec", "path"}: add a twin (admin)
+  DELETE /twins/{name}            remove an added twin (root)
+  POST   /twins/{name}/test       describe it now: is it there, does it answer in the contract
   GET    /topology[?refresh=1]    each controller's devices and links (read through the contract), relations
   GET    /health
   GET    /                        the web console (static/: index.html, app.css, app.js, logos, fonts)
@@ -187,6 +193,16 @@ class Activity:
                     "used": dict(self.used), "recent": recent}
 
 
+def _status(e: Exception) -> tuple:
+    """A failed request's HTTP status: waiting on a decision is a conflict, bad input is the caller's, and a
+    model or tool that fell over is upstream's, not a bad request."""
+    if "waiting" in str(e):
+        return 409, str(e)
+    if isinstance(e, ValueError):
+        return 400, str(e)
+    return 502, f"the model or a tool failed: {e}"
+
+
 def _reply_json(r: Reply) -> Dict[str, Any]:
     return {"thread_id": r.thread_id, "text": r.text, "pending": r.pending, "tool_calls": r.tool_calls}
 
@@ -235,7 +251,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         except PermissionError as e:
             raise HTTPException(403, str(e))
         except (RuntimeError, ValueError) as e:
-            raise HTTPException(409 if "waiting" in str(e) else 400, str(e))
+            raise HTTPException(*_status(e))
         finally:
             lock.release()
 
@@ -256,7 +272,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             raise HTTPException(403, str(e))
         except (RuntimeError, ValueError) as e:
             lock.release()
-            raise HTTPException(409 if "waiting" in str(e) else 400, str(e))
+            raise HTTPException(*_status(e))
 
         def body():
             try:
@@ -527,8 +543,11 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         headers = dict(svc._headers())
         if content_type:
             headers["Content-Type"] = content_type
-        r = svc.http.request(method, svc.url + path, json=json_body, data=data or None, params=params,
-                             headers=headers, timeout=timeout)
+        try:
+            r = svc.http.request(method, svc.url + path, json=json_body, data=data or None, params=params,
+                                 headers=headers, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 - the agentic MCP is down or unreachable: say so, not 500
+            raise HTTPException(502, f"the agentic MCP at {svc.url} did not answer: {type(e).__name__}: {str(e)[:200]}")
         if r.status_code >= 400:
             raise HTTPException(r.status_code if r.status_code in (400, 401, 403, 404, 409, 422) else 502,
                                 f"agentic MCP {path}: {r.text[:400]}")
@@ -597,6 +616,70 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                        content_type="application/octet-stream", timeout=300)
         changed(who, "guide installed", {"kind": kind, "name": name})
         return got
+
+    # ----- digital twins -----
+
+    def twins_or_409():
+        reg = A().twins
+        if reg is None:
+            raise HTTPException(409, "this agent was built without twins")
+        return reg
+
+    @app.get("/twins")
+    def twins(c=Depends(caller)):
+        reg = twins_or_409()
+        from .twins.contract import CONTRACT
+        return {"contract": CONTRACT, "active": reg.active_name(), "twins": reg.status()}
+
+    @app.put("/twins/active")
+    def use_twin(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        who = admin(c)
+        reg = twins_or_409()
+        try:
+            reg.set_active(str(body.get("name") or ""))
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+        if A().ops:
+            A().ops.audit("twin chosen", who.user, who.level, "", "twins", {"name": body.get("name")})
+        return {"active": reg.active_name()}
+
+    @app.post("/twins")
+    def add_twin(body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        who = admin(c)
+        reg = twins_or_409()
+        try:
+            e = reg.add(body)
+        except ValueError as e2:
+            raise HTTPException(400, str(e2))
+        if A().ops:
+            A().ops.audit("twin added", who.user, who.level, "", "twins", {k: v for k, v in e.items() if k != "token_env"})
+        status = next((x for x in reg.status() if x["name"] == e["name"]), {})
+        return {"added": e, "status": status}
+
+    @app.delete("/twins/{name}")
+    def remove_twin(name: str, c=Depends(caller)):
+        if not c["who"].can("root"):
+            raise HTTPException(403, "removing a twin needs root")
+        reg = twins_or_409()
+        try:
+            reg.remove(name)
+        except (KeyError, ValueError) as e:
+            raise HTTPException(400, str(e))
+        if A().ops:
+            A().ops.audit("twin removed", c["who"].user, c["who"].level, "", "twins", {"name": name})
+        return {"removed": name, "active": reg.active_name()}
+
+    @app.post("/twins/{name}/test")
+    def test_twin(name: str, c=Depends(caller)):
+        reg = twins_or_409()
+        try:
+            d = reg.get(name).describe(fresh=True)
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+        except Exception as e:  # noqa: BLE001 - the answer is the test's result
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:400]}"}
+        return {"ok": True, "name": d.name, "version": d.version, "contract": d.contract,
+                "domains": [x.domain for x in d.domains], "capabilities": d.capabilities}
 
     @app.post("/admin/reload")
     def reload(c=Depends(caller)):
