@@ -295,6 +295,7 @@ class Watcher:
         self.polls += 1
         got = self.findings()
         changes = self.store.update(got["findings"], self.resolve_after)
+        group: List[Dict[str, Any]] = []
         for inc in changes["opened"]:
             rb = match(self.runbooks(), inc)
             if rb:
@@ -302,11 +303,15 @@ class Watcher:
             self.notifier.send("incident_opened", inc["severity"], inc["title"],
                                (inc.get("details") or "")[:600] + (f"\nRunbook: {rb['name']} ({rb['mode']})" if rb else ""),
                                link=f"/#incident-{inc['id']}", data={"incident": inc["id"], "controller": inc["controller"]})
-            if rb and rb["mode"] in ("investigate", "propose") and self.respond:
-                try:
-                    self.respond({**self.store.get(inc["id"]), "runbook_spec": rb})
-                except Exception:  # noqa: BLE001
-                    logger.exception("responding to incident %s failed", inc["id"])
+            if rb and rb["mode"] in ("investigate", "propose"):
+                group.append({**self.store.get(inc["id"]), "runbook_spec": rb})
+        # What opened together is one event until shown otherwise (a fibre cut opens the fibre, the lightpath on it,
+        # the packet link it carries and the service over that): one investigation, with the evidence gathered here.
+        if group and self.respond:
+            try:
+                self.respond(group, self.evidence(group, got))
+            except Exception:  # noqa: BLE001
+                logger.exception("responding to incidents %s failed", [i["id"] for i in group])
         for inc in changes["resolved"]:
             if inc:
                 self.notifier.send("incident_resolved", inc["severity"], f"Resolved: {inc['title']}",
@@ -329,6 +334,27 @@ class Watcher:
         self.last = {"at": time.time(), "findings": len(got["findings"]), "opened": len(changes["opened"]),
                      "resolved": len(changes["resolved"]), "history": recorded}
         return self.last
+
+    def evidence(self, group: List[Dict[str, Any]], got: Dict[str, Any]) -> Dict[str, Any]:
+        """What the watcher already knows about these incidents, so the investigation starts from facts rather than
+        from reading everything again: the objects, what depends on them, what changed in the last hour, health now."""
+        objects = sorted({i["fp"].split(":", 2)[-1] for i in group if i["fp"].count(":") >= 2})
+        ctls = sorted({i["controller"] for i in group})
+        rel = [r for r in (got["topology"].get("relations") or [])
+               if any(o and (o in str(r.get("from", "")) or o in str(r.get("to", ""))) for o in objects)][:40]
+        changes = []
+        if self.history is not None:
+            for c in ctls:
+                for ch in self.history.changes(c, 3600)[:5]:
+                    changes.append({"controller": c, "at": time.strftime("%H:%M:%S", time.localtime(ch["at"])),
+                                    "changes": ch["changes"][:12]})
+        health = {}
+        from .health import sample
+        for r in sample(got["topology"], got["services"]):
+            if r["controller"] in ctls:
+                health[r["controller"]] = {k: r[k] for k in ("reachable", "devices", "devices_down", "links", "links_down",
+                                                             "services", "services_down")}
+        return {"objects": objects, "controllers": ctls, "relations": rel, "recent_changes": changes, "health_now": health}
 
     def start(self) -> "Watcher":
         def loop():

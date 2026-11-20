@@ -219,6 +219,7 @@ def main(argv=None) -> int:
     ap.add_argument("--watch", type=int, default=8)
     ap.add_argument("--chats", default="8,16")
     ap.add_argument("--out", default=str(HERE / "results"))
+    ap.add_argument("--only", default="ops,api,chat,twin", help="which layers: ops, api, chat, twin")
     a = ap.parse_args(argv)
     from testbed.emulator import Running
     emu = Running()
@@ -226,20 +227,24 @@ def main(argv=None) -> int:
     proc, url, home = start_canah(a.port, emu.url, catcher.url, a.watch)
     report: Dict[str, Any] = {"at": time.time(), "canah": url, "home": str(home)}
     try:
-        print("operations ...", flush=True)
-        report["operations"] = operations(url, emu.url, catcher, a.watch)
-        print(json.dumps(report["operations"], indent=1)[:3000], flush=True)
-        print("api load ...", flush=True)
-        report["api"] = api_load(url)
-        print(json.dumps(report["api"], indent=1), flush=True)
+        only = set(a.only.split(","))
+        if "ops" in only:
+            print("operations ...", flush=True)
+            report["operations"] = operations(url, emu.url, catcher, a.watch)
+            print(json.dumps(report["operations"], indent=1)[:4000], flush=True)
+        if "api" in only:
+            print("api load ...", flush=True)
+            report["api"] = api_load(url)
+            print(json.dumps(report["api"], indent=1), flush=True)
         report["chat"] = []
-        for n in [int(x) for x in a.chats.split(",") if x]:
+        for n in ([int(x) for x in a.chats.split(",") if x] if "chat" in only else []):
             print(f"{n} conversations at once ...", flush=True)
             report["chat"].append(chats(url, n))
             print(json.dumps(report["chat"][-1], indent=1)[:1500], flush=True)
-        print("twin ...", flush=True)
-        report["twin"] = twin(url)
-        print(json.dumps(report["twin"], indent=1)[:2000], flush=True)
+        if "twin" in only:
+            print("twin ...", flush=True)
+            report["twin"] = twin(url)
+            print(json.dumps(report["twin"], indent=1)[:2000], flush=True)
     finally:
         proc.terminate()
         try:

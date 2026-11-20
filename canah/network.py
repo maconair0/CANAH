@@ -599,7 +599,9 @@ class AgenticMCPProvider:
                                   f"the real arguments: the call pauses for the operator's approval, which is the "
                                   f"confirmation (never ask in text). After it runs, read the object back and report "
                                   f"what you did and what you read. A change you were not given, or one in another "
-                                  f"domain, you do not make: say so."),
+                                  f"domain, you do not make: say so. Your write is checked in the digital twin before it "
+                                  f"is sent: if it is held (reject, gather_more_data, ask_operator), do not retry it or "
+                                  f"work around it; report the twin's reasons and questions as given, and stop."),
                 "tools": tools})
 
     def agent_roles(self) -> Dict[str, Dict[str, Any]]:
@@ -658,10 +660,11 @@ class AgenticMCPProvider:
                     f"- the config agents, one per network domain: {agents}. A change in a domain is made only by its config "
                     f"agent: give it the exact change (controller, verb or tool, values) and what qot's rehearsal found. Its "
                     f"call waits for the operator's approval.\n"
-                    f"For a change: qot first (rehearse and propose), then the domain's config agent (apply), then report "
-                    f"what both said. If qot says the twin rejects it, do not apply it; if the twin cannot model it, it "
-                    f"still goes to the config agent, and the operator's approval decides. A change across domains goes "
-                    f"to each domain's config agent in turn.")
+                    f"For a change: hand it straight to the domain's config agent with the exact change. Its write is "
+                    f"rehearsed in the digital twin automatically before it is sent (the write gate) and then waits for "
+                    f"the operator's approval, so do not ask qot to rehearse it as well. Ask qot only for what-ifs, 'is it "
+                    f"safe', quality questions, or when the gate held a write and the operator wants to know more. A "
+                    f"change across domains goes to each domain's config agent in turn.")
         return (f"Networks are reached through the agentic MCP, which holds these SDN controllers: "
                 f"{', '.join(rows) or 'none'}. You work them all yourself, with the same tools for every controller: "
                 f"a net_<verb> tool per contract verb (net_read_devices, net_read_links, net_provision, ...), with the "

@@ -571,12 +571,20 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         st = A().settings
         return load_runbooks([BUILTIN_RUNBOOKS, *st.runbooks_dirs, st.home_path / "runbooks"])
 
-    def respond(inc: Dict[str, Any], mode: str = "", by: str = "") -> Dict[str, Any]:
-        """CANAH looks into an incident in a thread of its own (canah-watch.incident-<id>), as its runbook says:
-        a report, and for `propose` a fix rehearsed in the twin and proposed (it waits for approval)."""
+    import queue as _queue
+    from .notify import rank as _sev_rank
+    work: "_queue.PriorityQueue" = _queue.PriorityQueue()
+    seq = [0]
+
+    def respond(group: Any, evidence: Optional[Dict[str, Any]] = None, mode: str = "", by: str = "") -> Dict[str, Any]:
+        """Queue one investigation of incidents that belong together (one event): the worst first, one at a time, in a
+        thread of its own (canah-watch.incident-<first id>). `propose`: a fix rehearsed and handed to the domain's
+        config agent, which waits for approval."""
+        group = [group] if isinstance(group, dict) else list(group)
         st = A().settings
-        rb = inc.get("runbook_spec") or next((r for r in runbooks() if r["name"] == inc.get("runbook")), None) or {}
-        mode = mode or inc.get("mode") or rb.get("mode") or "investigate"
+        specs = [g.get("runbook_spec") or next((r for r in runbooks() if r["name"] == g.get("runbook")), None) or {} for g in group]
+        modes = [mode or g.get("mode") or sp.get("mode") or "investigate" for g, sp in zip(group, specs)]
+        mode = "propose" if "propose" in modes else "investigate"
         now = time.time()
         if not by:
             if not st.respond:
@@ -584,40 +592,67 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             recent = [t for t in responded if now - t < 3600]
             responded[:] = recent
             if len(recent) >= st.respond_per_hour:
-                incidents.set(inc["id"], note=f"not investigated: {st.respond_per_hour} investigations in the last hour already")
+                for g in group:
+                    incidents.set(g["id"], note=f"not investigated: {st.respond_per_hour} investigations in the last hour already")
                 return {"started": False, "why": "the hourly limit of investigations is reached"}
             responded.append(now)
-        key = f"{WATCH_WHO.user}.incident-{inc['id']}"
-        prompt = (f"[incident {inc['id']}] The watcher opened an incident.\n"
-                  f"- what: {inc['title']}\n- controller: {inc['controller']}\n- kind: {inc['kind']}\n- severity: {inc['severity']}\n"
-                  f"- first seen: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(inc['first_seen']))}\n"
-                  f"- details: {(inc.get('details') or '')[:1200]}\n\n"
-                  + (f"Runbook {rb.get('name')}:\n{rb.get('instructions', '').strip()}\n\n" if rb else "")
-                  + ("Investigate and report. Do not change anything." if mode == "investigate" else
-                     "Investigate, rehearse a fix in the digital twin, and propose it with the tool that makes it: it waits "
-                     "for an operator's approval. Do not claim it is done.")
-                  + " End with a short report: what happened, what it affects, what you found, what you propose.")
-        incidents.set(inc["id"], thread=key, investigated_at=now, mode=mode)
+        key = f"{WATCH_WHO.user}.incident-{group[0]['id']}"
+        for g in group:
+            incidents.set(g["id"], thread=key, mode=mode, note="queued for investigation")
+        worst = max((_sev_rank(g["severity"]) for g in group), default=0)
+        seq[0] += 1
+        work.put((-worst, seq[0], {"group": group, "specs": specs, "mode": mode, "key": key, "evidence": evidence or {}}))
+        return {"started": True, "queued": work.qsize(), "mode": mode, "thread": key}
 
-        def go():
-            lock = lock_for(key)
-            if not lock.acquire(blocking=False):
-                return
+    def investigate(job: Dict[str, Any]) -> None:
+        group, mode, key = job["group"], job["mode"], job["key"]
+        ids = ", ".join(str(g["id"]) for g in group)
+        books = {sp.get("name"): sp.get("instructions", "").strip() for sp in job["specs"] if sp.get("name")}
+        lines = "\n".join(f"- #{g['id']} [{g['severity']}] {g['title']} (controller {g['controller']}, {g['kind']}): "
+                          f"{(g.get('details') or '')[:300]}" for g in group)
+        prompt = (f"[incidents {ids}] The watcher opened {'these together' if len(group) > 1 else 'this incident'}"
+                  f"{'; they may share one cause' if len(group) > 1 else ''}.\n{lines}\n\n"
+                  f"Evidence the watcher already gathered (do not read it again):\n"
+                  f"{json.dumps(job['evidence'], default=str)[:4000]}\n\n"
+                  + "".join(f"Runbook {n}:\n{t}\n\n" for n, t in books.items())
+                  + ("First find the likely cause: one object whose failure explains the others (a fibre under a lightpath "
+                     "under a link under a service). Read only what the evidence does not already say. "
+                     + ("Do not change anything. " if mode == "investigate" else
+                        "Then propose the fix: hand it to the domain's config agent with the exact change; its write is "
+                        "checked in the digital twin before it is sent and waits for an operator's approval. If no fix can "
+                        "be made by a tool, say what the operator should do. ")
+                     + "End with four lines:\nCAUSE: ...\nAFFECTS: ...\nFIX: ... (waiting for approval, for the operator to "
+                       "do, or none)\nCONFIDENCE: high, medium or low, and why."))
+        for g in group:
+            incidents.set(g["id"], investigated_at=time.time(), note="being investigated")
+        lock = lock_for(key)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            r = A().ask(prompt, key, WATCH_WHO, max_seconds=A().settings.investigate_seconds)
+            note = f"a fix waits for approval: {', '.join(p['name'] for p in r.pending)}" if r.pending else ""
+            for g in group:
+                incidents.set(g["id"], report=r.text, note=note)
+            if r.pending:
+                worst = max(group, key=lambda g: _sev_rank(g["severity"]))
+                A().notifier.send("approval_waiting", worst["severity"], f"Incident {group[0]['id']}: a fix waits for approval",
+                                  f"{worst['title']}\n\n{(r.text or '')[:800]}", link=f"/#incident-{group[0]['id']}",
+                                  data={"incidents": [g["id"] for g in group]})
+        except Exception as e:  # noqa: BLE001 - said on the incident
+            logger.exception("investigating incidents %s failed", ids)
+            for g in group:
+                incidents.set(g["id"], report=f"The investigation failed: {type(e).__name__}: {e}")
+        finally:
+            lock.release()
+
+    def worker():
+        while True:
+            _, _, job = work.get()
             try:
-                r = A().ask(prompt, key, WATCH_WHO)
-                note = f"a fix waits for approval: {', '.join(p['name'] for p in r.pending)}" if r.pending else ""
-                incidents.set(inc["id"], report=r.text, note=note)
-                if r.pending:
-                    A().notifier.send("approval_waiting", inc["severity"], f"Incident {inc['id']}: a fix waits for approval",
-                                      f"{inc['title']}\n\n{(r.text or '')[:800]}", link=f"/#incident-{inc['id']}",
-                                      data={"incident": inc["id"]})
-            except Exception as e:  # noqa: BLE001 - said on the incident
-                logger.exception("investigating incident %s failed", inc["id"])
-                incidents.set(inc["id"], report=f"The investigation failed: {type(e).__name__}: {e}")
-            finally:
-                lock.release()
-        threading.Thread(target=go, name=f"canah-incident-{inc['id']}", daemon=True).start()
-        return {"started": True, "mode": mode, "thread": key}
+                investigate(job)
+            except Exception:  # noqa: BLE001 - the next one still runs
+                logger.exception("an investigation failed")
+    threading.Thread(target=worker, name="canah-investigations", daemon=True).start()
 
     watcher = Watcher(topology, incidents, agent.notifier or __import__("canah.notify", fromlist=["Notifier"]).Notifier([]),
                       net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s,
@@ -664,7 +699,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         elif what == "note":
             got = incidents.set(iid, note=str(body.get("note") or "")[:1000])
         elif what == "investigate":
-            started = respond(inc, mode=str(body.get("mode") or ""), by=who.user)
+            started = respond([inc], {}, mode=str(body.get("mode") or ""), by=who.user)
             got = {**incidents.get(iid), "started": started}
         elif what == "decide":
             if not inc.get("thread"):

@@ -106,14 +106,16 @@ class CanahAgent:
         """How a tool call pauses (allowed decisions, description), or None if it does not."""
         return self.interrupts.get(tool)
 
-    def config(self, thread_id: str, who: Identity = OBSERVER, deadline: bool = False) -> Dict[str, Any]:
+    def config(self, thread_id: str, who: Identity = OBSERVER, deadline: bool = False,
+               max_seconds: Optional[float] = None) -> Dict[str, Any]:
         c = {"configurable": {"thread_id": thread_id, "user_id": who.user, "level": who.level,
                               "scope": list(getattr(who, "controllers", ()) or ())},
              "recursion_limit": self.settings.recursion_limit}
         if deadline:
             import time
-            if self.settings.max_seconds:
-                c["configurable"]["deadline"] = time.time() + float(self.settings.max_seconds)
+            budget = max_seconds or self.settings.max_seconds
+            if budget:
+                c["configurable"]["deadline"] = time.time() + float(budget)
             # This request's counters (safety.RunTracker); subagents add to the same ones.
             c["configurable"]["run"] = {"t0": time.time()}
         return c
@@ -216,11 +218,12 @@ class CanahAgent:
         """The level a tool needs: observer, admin or root."""
         return identity.required(tool, self.writes, self.settings.root_tools)
 
-    def ask(self, text: str, thread_id: Optional[str] = None, who: Identity = OBSERVER) -> Reply:
+    def ask(self, text: str, thread_id: Optional[str] = None, who: Identity = OBSERVER,
+            max_seconds: Optional[float] = None) -> Reply:
         """One message from `who`; returns when the agent answers or pauses for an approval.
         An observer's run is never offered a tool that changes anything."""
         thread_id = thread_id or uuid.uuid4().hex[:12]
-        cfg = self.config(thread_id, who, deadline=True)
+        cfg = self.config(thread_id, who, deadline=True, max_seconds=max_seconds)
         if approval.pending(self.graph, cfg):
             raise RuntimeError(f"thread {thread_id} is waiting for a decision on a change; decide() first")
         start = self._seen(cfg)
@@ -587,7 +590,10 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
                                "incidents, health_over_time, network_changes) and report the figures as read. For a what-if "
                                "or a change: build the twin's scenario from what you read (twin_schema for its format), "
                                "twin_validate, twin_predict; for a write to a controller, twin_check_write with exactly the "
-                               "arguments it would send. End with:\n"
+                               "arguments it would send. Build every scenario from what you read now with the net_read_ "
+                               "tools, never from a stored snapshot (twin_extra snapshots, inspect and subnetwork may be "
+                               "hours old, and the twin refuses a stale one; for a packet controller, twin_extra mirror "
+                               "reads it fresh). End with:\n"
                                "PROPOSAL: the exact configuration (domain, controller, verb or tool, arguments), or none\n"
                                "TWIN: the decision, probability with its interval, trust tier, and what it does not model\n"
                                "If the twin cannot model the change (not_modelled, or no twin for that domain), say so in "

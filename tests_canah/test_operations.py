@@ -86,13 +86,17 @@ class Watching(Base):
 
     def test_a_poll_opens_incidents_matches_runbooks_and_investigates(self):
         asked = []
-        w, sent = self.watcher(respond=asked.append)
+        w, sent = self.watcher(respond=lambda group, evidence: asked.append((group, evidence)))
         w.poll()
         rows = {r["kind"]: r for r in w.store.list("active")}
         self.assertEqual(rows["link_down"]["runbook"], "link-down")
         self.assertEqual(rows["link_down"]["mode"], "propose")
         self.assertEqual(rows["device_down"]["mode"], "investigate")
-        self.assertEqual({a["kind"] for a in asked}, {"link_down", "service_down", "device_down", "controller_unreachable", "alarm"})
+        self.assertEqual(len(asked), 1)                                   # what opened together: one investigation
+        group, evidence = asked[0]
+        self.assertEqual({a["kind"] for a in group}, {"link_down", "service_down", "device_down", "controller_unreachable", "alarm"})
+        self.assertIn("L1", evidence["objects"])
+        self.assertEqual(evidence["health_now"]["opt"]["links_down"], 1)
         self.assertEqual(len([s for s in sent if s[0] == "incident_opened"]), 6)       # the degraded one too (no runbook)
         w.poll()
         self.assertEqual(len([s for s in sent if s[0] == "incident_opened"]), 6)       # nothing new: nothing sent
