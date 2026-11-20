@@ -171,7 +171,8 @@ const DOMAIN_COLOR = { packet: "var(--d-packet)", optical: "var(--d-optical)", d
 const agentsDetail = () => state.info?.subagent_detail || (state.info?.subagents || []).map((n) => ({ name: n }));
 const agentFor = (ctlKey) => (agentsDetail().find((a) => a.controller === ctlKey) || {}).name;
 const ctlOfAgent = (name) => (agentsDetail().find((a) => a.name === name) || {}).controller;
-const AGENT_KIND = { controller: "controller agent", knowledge: "knowledge", general: "general", custom: "agent" };
+const AGENT_KIND = { controller: "controller agent", knowledge: "knowledge", general: "general", custom: "agent",
+                     qot: "quality of transmission", config: "configuration" };
 
 // A row that scrolls sideways: arrows when it overflows, faded edges, the wheel scrolls it, nothing hidden.
 function hscroll(el, extra = "") {
@@ -256,6 +257,8 @@ function buildGraph(t) {
     nodes.push({ id: sid, kind: "sub", label: sd.name, parent: "canah", ok: true, sd });
     links.push({ kind: "subdeleg", source: "canah", target: sid, ok: true, sub: sd.name });
     if (sd.controller && keys.has(sd.controller)) links.push({ kind: "drives", source: sid, target: "mcp", ok: true, sub: sd.name, ctl: sd.controller });
+    if ((sd.controllers || []).length) links.push({ kind: "drives", source: sid, target: "mcp", ok: true, sub: sd.name, ctl: sd.controllers.join(", ") });
+    if (sd.kind === "qot" && state.twin) links.push({ kind: "drives", source: sid, target: "twin", ok: true, sub: sd.name, ctl: "the digital twin" });
   }
   topo.nodes = nodes; topo.links = [...links, ...cross.values()];
   layout();
@@ -391,7 +394,8 @@ function renderTopology() {
     } else if (n.kind === "sub") {
       const on = activeAgents().has(n.label), w = 136, h = 30;
       const ctlKey = n.sd?.controller, ctlRow = (state.topology?.controllers || []).find((c) => c.key === ctlKey);
-      const col = ctlRow ? DOMAIN_COLOR[domainClass(ctlRow.domain)] : n.sd?.kind === "knowledge" ? "var(--accent2)" : "var(--faint)";
+      const col = ctlRow ? DOMAIN_COLOR[domainClass(ctlRow.domain)] : n.sd?.kind === "config" ? DOMAIN_COLOR[domainClass(n.sd.domain)]
+        : n.sd?.kind === "qot" ? "#2fd3c1" : n.sd?.kind === "knowledge" ? "var(--accent2)" : "var(--faint)";
       g.setAttribute("class", `nd sub${on ? " on" : ""}${state.selected === n.id ? " sel" : ""}`);
       g.append(S("rect", { x: -w / 2 - 4, y: -h / 2 - 4, width: w + 8, height: h + 8, rx: 19, class: "halo" }));
       g.append(S("rect", { x: -w / 2, y: -h / 2, width: w, height: h, rx: 15, fill: "var(--panel)", stroke: on ? "var(--accent)" : col, class: "body" }));
@@ -530,10 +534,12 @@ function hubAgents() {
   const row = (sd) => { const on = act.has(sd.name), u = used[sd.name];
       const ctl = sd.controller ? (state.topology?.controllers || []).find((c) => c.key === sd.controller) : null;
       return `<div class="act-row"><span class="dot ${on ? "busy" : u ? "ok" : ""}"></span><div><b>${esc(sd.name)}</b>${sd.tools != null ? ` <span class="faint">${sd.tools} tools</span>` : ""}
-        <div class="faint">${ctl || sd.controller ? `works ${esc(ctl?.label || sd.controller)} through the agentic MCP` : esc((sd.description || "").slice(0, 110))}</div></div><span class="faint">${on ? "<b style='color:var(--accent)'>at work</b>" : u ? `${u.calls} calls · ${ago(u.last)}` : "idle"}</span></div>`; };
+        <div class="faint">${sd.kind === "config" ? `changes ${esc((sd.controllers || []).join(", "))} (${esc(sd.domain)}) through the agentic MCP` : ctl || sd.controller ? `works ${esc(ctl?.label || sd.controller)} through the agentic MCP` : esc((sd.description || "").slice(0, 110))}</div></div><span class="faint">${on ? "<b style='color:var(--accent)'>at work</b>" : u ? `${u.calls} calls · ${ago(u.last)}` : "idle"}</span></div>`; };
   const group = (title, list) => list.length ? `<div class="act-group">${title}</div>` + list.map(row).join("") : "";
-  return group("Knowledge", subs.filter((x) => x.kind === "knowledge"))
-    + group("General", subs.filter((x) => x.kind !== "controller" && x.kind !== "knowledge"))
+  return group("Quality of transmission · works the digital twin", subs.filter((x) => x.kind === "qot"))
+    + group("Configuration · one per network domain", subs.filter((x) => x.kind === "config"))
+    + group("Knowledge", subs.filter((x) => x.kind === "knowledge"))
+    + group("General", subs.filter((x) => !["controller", "knowledge", "qot", "config"].includes(x.kind)))
     + `<h4>Running now</h4>${runs.length ? runs.map((r) => `<div class="act-row"><span class="dot busy"></span><div>${esc(r.user || "a request")} · <span class="mono">${esc(r.step || "thinking")}</span><div class="faint">${esc(r.agents.join(", "))}</div></div><span class="faint">${Math.round(Date.now() / 1000 - r.since)} s</span></div>`).join("") : `<div class="faint" style="font-size:12px">nothing</div>`}`
     + ((state.activity?.recent || []).length ? `<h4>Last steps</h4>${state.activity.recent.slice(-8).reverse().map((e) => `<div class="act-row"><span class="dot"></span><div><span class="mono">${esc(e.tool)}</span> <span class="faint">by ${esc(e.agent)}</span></div><span class="faint">${ago(e.at)}</span></div>`).join("")}` : "");
 }
@@ -1005,6 +1011,9 @@ function agentColor(a) {
   const ck = ctlOfAgent(a), ctl = ck && (state.topology?.controllers || []).find((c) => c.key === ck);
   if (ctl) return DOMAIN_COLOR[domainClass(ctl.domain)];
   if (ck) return DOMAIN_COLOR[domainClass(agentsDetail().find((x) => x.name === a)?.domain || "other")];
+  const sd = agentsDetail().find((x) => x.name === a);
+  if (sd?.kind === "config") return DOMAIN_COLOR[domainClass(sd.domain)];
+  if (sd?.kind === "qot") return "#2fd3c1";
   const subs = state.info?.subagents || [];
   return AGENT_COLORS[(subs.indexOf(a) + 1) % AGENT_COLORS.length];
 }

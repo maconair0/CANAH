@@ -218,6 +218,23 @@ sudo systemctl restart ollama
 
 For qwen3 30B-A3B at 32k tokens, one slot at 16-bit takes about 3.2 GB, and two slots at 8-bit take the same. Ollama sends each request to the slot whose cache matches it best.
 
+## The team of agents
+
+With `team: true` (the default), CANAH works as a supervisor with agents of its own. They are all built from the
+same tools; what differs is who holds which.
+
+| Agent | Holds | Does |
+|---|---|---|
+| **CANAH (supervisor)** | every read (`net_read_*`, `network_tools`, `controller_read`), knowledge, operations | answers, plans, delegates; changes nothing itself |
+| **qot** (quality of transmission) | every read, the digital twin (`twin_validate`, `twin_predict`, `twin_check_write`, `twin_extra`), incidents, history, health over time | watches quality and health, rehearses what-ifs and changes in the twin, ends with a `PROPOSAL` and the `TWIN` verdict |
+| **<domain>-config** (one per network domain: `packet-config`, `optical-config`, `data-centre-config` …) | the same tools, cut to that domain's controllers, writes included (`net_provision`, `net_adjust`, `controller_write` …) | makes exactly the change it was given, which waits for approval, then reads it back |
+| librarian, general-purpose | documents; the supervisor's tools | as before |
+
+A change goes from the supervisor to `qot` (rehearse and propose), then to the domain's config agent (apply). The
+approval, the twin's write gate and the scopes apply in every agent, because they are middleware on every
+agent. The domains come from what each controller declares to the agentic MCP, so a new domain gets its config
+agent at the next reload. `team: false` goes back to one agent doing it all.
+
 ## Operations: incidents, runbooks, history, notifications, scopes
 
 Everything here runs on the common contract's verbs and the normalised topology, so any controller the agentic

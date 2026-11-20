@@ -15,6 +15,7 @@ and `CanahAgent` is the small surface a service, a CLI or a test uses:
 from __future__ import annotations
 
 import json
+import os
 import re
 import logging
 import uuid
@@ -28,7 +29,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
 from .notify import Notifier
-from .grounding import FollowThrough, GroundingGuard, KeepAnswer, LookFirst, TimeBudget
+from .grounding import DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, TimeBudget
 from .identity import OBSERVER, Identity
 from . import memory as mem
 from .config import Settings, load
@@ -346,6 +347,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     # The agentic MCP's address and token as set on the web page, when they were.
     from .network import load_connection
     load_connection(settings.home_path)
+    # The multi-agent team (supervisor, qot, a config agent per domain): the network provider reads this.
+    os.environ["CANAH_TEAM"] = "1" if settings.team else "0"
     # The model chosen on the web page, and the providers' keys kept there.
     models.load_page_choice(settings.home_path)
     sandbox_note = ""
@@ -414,7 +417,11 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     # A tool paused on request is approved like a change: it needs admin (identity.required).
     approvals = sorted(set(writes) | {n for n in interrupts})
 
-    specs = sub.resolve(list(got["subagents"]) + list(extra_subagents) + sub.from_yaml(settings.subagents_file),
+    team_specs = _qot_spec(tools, set(writes)) if settings.team and any(getattr(pv, "team", False) for pv in all_providers) else []
+    if team_specs and twin_provider:
+        # The twin's own instructions are qot's to follow.
+        team_specs[0]["system_prompt"] += "\n\n" + twin_provider[0].instructions()
+    specs = sub.resolve(team_specs + list(got["subagents"]) + list(extra_subagents) + sub.from_yaml(settings.subagents_file),
                         tools)
     # Who may do what: on the main agent and in every subagent (identity.py).
     # deepagents adds a "general-purpose" subagent holding the main agent's
@@ -482,8 +489,16 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                    + ": you cannot run commands, only call your tools.")
     if got["instructions"]:
         prompt += "\n\n" + got["instructions"]
+    if team_specs:
+        prompt += ("\n\nWith your team, rehearsing in the digital twin is qot's: you do not hold twin_schema, twin_validate, "
+                   "twin_predict, twin_check_write or twin_extra. Hand every what-if, and every change before it is made, to "
+                   "qot with `task`; where the twin instructions above say to call those tools, qot does.")
 
     hidden = set(got.get("subagent_only") or [])
+    if team_specs:
+        # With the team, rehearsing in the twin is qot's: the supervisor keeps which twin is in use (twin_list) and
+        # the operator's override (twin_override), and hands every what-if to qot.
+        hidden |= {"twin_schema", "twin_validate", "twin_predict", "twin_check_write", "twin_extra"}
     main_tools = [t for t in tools if t.name not in hidden]
     main_model = model or models.get("model")
     # The window in the model's profile, so compaction happens at compact_at of the real window.
@@ -502,7 +517,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             tools=main_tools,
             system_prompt=prompt,
             middleware=[budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                        KeepAnswer(), *_fallback(),
+                        KeepAnswer(), *([DelegationGuard()] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
                         *compact_mw],
             subagents=specs or None,
@@ -525,7 +540,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                 roles.update(prov.agent_roles() or {})
             except Exception:  # noqa: BLE001
                 pass
-    known = {"librarian": "knowledge", "general-purpose": "general"}
+    known = {"librarian": "knowledge", "general-purpose": "general", "qot": "qot"}
     detail = [{"name": sp["name"], "description": str(sp.get("description") or "")[:400],
                "tools": len(sp["tools"]) if sp.get("tools") is not None else None,
                "kind": (roles.get(sp["name"]) or {}).get("kind") or known.get(sp["name"], "custom"),
@@ -546,6 +561,37 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                       interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
                       providers=all_providers, model=main_model,
                       notifier=Notifier(settings.notify_channels, settings.notify_url, settings.console_url))
+
+
+QOT_TOOLS = ("net_read_*", "net_health", "net_compute_path", "net_check_feasibility", "network_controllers", "network_health",
+             "follow_relations", "network_tools", "controller_read", "twin_list", "twin_schema", "twin_validate",
+             "twin_predict", "twin_check_write", "twin_extra", "incidents", "network_changes", "health_over_time",
+             "canah_status", "search_knowledge", "draw_diagram", "get_diagram")
+
+
+def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
+    """The quality-of-transmission agent: watches quality and health across every domain, works the digital twin,
+    proposes configurations. Reads only: it holds no tool that changes a network."""
+    import fnmatch
+    chosen = [t for t in tools if t.name not in writes and any(fnmatch.fnmatch(t.name, p) for p in QOT_TOOLS)]
+    if not chosen:
+        return []
+    return [{"name": "qot",
+             "description": ("The quality-of-transmission agent. Watches the networks' quality and health (margins, OSNR, "
+                             "pre-FEC BER, availability, delay, loss, incidents, trends), rehearses what-ifs and changes in "
+                             "the digital twin, and proposes the exact configuration to apply with the twin's decision, "
+                             "probability and trust. Give it any what-if, any 'is it safe', any degradation, and every "
+                             "change before a config agent makes it. It changes nothing itself."),
+             "system_prompt": ("You are CANAH's quality-of-transmission agent. You read every domain and you work the digital "
+                               "twin; you change nothing. For a question about quality or health: read it (net_read_ tools, "
+                               "incidents, health_over_time, network_changes) and report the figures as read. For a what-if "
+                               "or a change: build the twin's scenario from what you read (twin_schema for its format), "
+                               "twin_validate, twin_predict; for a write to a controller, twin_check_write with exactly the "
+                               "arguments it would send. End with:\n"
+                               "PROPOSAL: the exact configuration (domain, controller, verb or tool, arguments), or none\n"
+                               "TWIN: the decision, probability with its interval, trust tier, and what it does not model\n"
+                               "Never say a change is made: the supervisor hands your proposal to the domain's config agent."),
+             "tools": chosen}]
 
 
 def _fallback() -> List[Any]:

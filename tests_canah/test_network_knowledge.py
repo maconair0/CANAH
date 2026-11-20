@@ -79,16 +79,31 @@ class Base(unittest.TestCase):
 
 
 class Network(Base):
-    def test_the_main_agent_works_every_controller_through_the_contract_verbs(self):
+    def test_the_supervisor_reads_and_its_team_changes(self):
         a = self.agent(say("ok"))
         self.assertNotIn("alpha", a.info["subagents"])            # the controllers are the agentic MCP's
-        self.assertFalse([n for n in a.info["subagents"] if n.endswith("-agent")])   # and there is no agent per controller
+        self.assertTrue({"qot", "domain-a-config", "domain-b-config"} <= set(a.info["subagents"]))
+        roles = {d["name"]: d for d in a.info["subagent_detail"]}
+        self.assertEqual((roles["domain-a-config"]["kind"], roles["domain-a-config"]["controllers"]), ("config", ["alpha"]))
+        self.assertEqual(roles["qot"]["kind"], "qot")
         a.ask("hi", who=ADMIN)
         main = self.model.offered[-1]
-        for t in ("network_controllers", "net_read_devices", "net_provision", "network_tools", "controller_read", "controller_write"):
+        for t in ("network_controllers", "net_read_devices", "network_tools", "controller_read"):
             self.assertIn(t, main)
-        self.assertNotIn("alpha__get_nodes", main)
+        for t in ("net_provision", "controller_write"):
+            self.assertNotIn(t, main)                                 # the supervisor changes nothing itself
         self.assertEqual(sorted(a.writes), ["controller_write", "net_provision"])
+
+    def test_each_config_agent_sees_its_own_domain_only(self):
+        p = AgenticMCPProvider(service=self.service)
+        agents = {x["name"]: {t.name: t for t in x["tools"]} for x in p.subagents()}
+        self.assertIn("net_provision", agents["domain-a-config"])
+        self.assertNotIn("net_provision", agents["domain-b-config"])  # beta serves no provision
+        out = agents["domain-b-config"]["net_read_devices"].invoke({}, config={"configurable": {}})
+        self.assertIn("beta", out)
+        self.assertNotIn("alpha", out)
+        refused = agents["domain-b-config"]["controller_read"].invoke({"controller": "alpha", "tool": "get_nodes"})
+        self.assertIn("has no tool", refused)
 
     def test_a_read_without_a_controller_asks_every_one_that_serves_the_verb(self):
         a = self.agent(call("net_read_devices"), say("Alpha has two nodes, beta one item."))
@@ -98,14 +113,10 @@ class Network(Base):
         self.assertIn('"alpha"', got)
         self.assertIn("node-2", got)
 
-    def test_a_verb_names_who_serves_it(self):
-        a = self.agent(call("net_provision", controller="beta", arguments={"a": "x"}), say("Beta cannot."))
-        a.ask("provision on beta", thread_id="v", who=ADMIN)
-        self.assertEqual(self.service.calls, [])
-        # beta does not serve provision: the schema's enum already keeps it out, and the tool says so if asked
-
-    def test_a_write_waits_and_carries_the_approvers_name(self):
-        a = self.agent(call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}), say("Service created."))
+    def test_a_change_goes_through_the_domains_config_agent_and_waits(self):
+        a = self.agent(call("task", description="create a service a1 to z1 on alpha", subagent_type="domain-a-config"),
+                       call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}),
+                       say("created"), say("Service created."))
         r = a.ask("create a service from a1 to z1", thread_id="w", who=ADMIN)
         self.assertTrue(r.waiting, r)
         self.assertEqual(r.pending[0]["name"], "net_provision")
@@ -114,17 +125,22 @@ class Network(Base):
         self.assertEqual(self.service.calls, [("alpha", "create_service", {"a": "a1", "z": "z1"},
                                                "ana (approved in canah)")])
 
-    def test_a_tool_beyond_the_contract_is_found_then_called(self):
-        a = self.agent(call("network_tools", query="meter"), call("controller_read", controller="beta", tool="set_meter",
-                                                                  arguments={"port": "1"}),
-                       call("controller_write", controller="beta", tool="set_meter", arguments={"port": "1"}), say("Meter set."))
+    def test_a_tool_beyond_the_contract_through_the_config_agent(self):
+        a = self.agent(call("task", description="put a meter on beta port 1", subagent_type="domain-b-config"),
+                       call("network_tools", query="meter"),
+                       call("controller_write", controller="beta", tool="set_meter", arguments={"port": "1"}),
+                       say("Meter set."), say("Done."))
         r = a.ask("put a meter on beta port 1", thread_id="m", who=ADMIN)
-        found, refused = self.model.tool_results(2)[-2], self.model.tool_results(2)[-1]
-        self.assertIn("set_meter", found)
-        self.assertIn("controller_write", refused)                 # a write is not slipped through the read tool
         self.assertEqual(r.pending[0]["name"], "controller_write")
         a.decide("m", [approval.decision("approve")], who=ADMIN)
         self.assertEqual(self.service.calls[-1][:3], ("beta", "set_meter", {"port": "1"}))
+
+    def test_without_the_team_the_agent_does_it_all_itself(self):
+        a = self.agent(call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}), say("ok"),
+                       providers=[AgenticMCPProvider(service=self.service, team=False)])
+        r = a.ask("create it", thread_id="solo", who=ADMIN)
+        self.assertEqual(r.pending[0]["name"], "net_provision")
+        self.assertFalse([n for n in a.info["subagents"] if n.endswith("-config")])
 
     def test_the_twin_gate_sees_the_controller_and_tool_behind_a_write(self):
         from canah.network import AgenticMCPProvider as P

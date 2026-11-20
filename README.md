@@ -9,6 +9,9 @@ person's approval.
 
 - **Every controller, the same way:** one tool per verb of a common contract (read devices, provision, …), with
   the controller as an argument.
+- **A team of agents:** CANAH supervises. `qot` watches quality and health, rehearses changes in the twin and
+  proposes configurations. A config agent per network domain (`packet-config`, `optical-config`, …) makes the
+  changes. Each calls the same tools, and only config agents can write.
 - **Digital twin first:** what-ifs and writes are tried in NetTwin, or any twin that speaks
   [`canah.twin/1`](docs/TWIN_CONTRACT.md).
 - **Approval and audit:** every change waits for an operator; every decision is logged.

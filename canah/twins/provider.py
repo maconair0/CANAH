@@ -335,7 +335,9 @@ def make_gate(registry: Registry, checks: Checks, writes: Callable[[], Set[str]]
                 return ToolMessage(tool_call_id=request.tool_call["id"], name=name, status="error",
                                    content=f"Not sent: the digital twin {t.name!r} could not check this write: {e}"), None
             rec = checks.keep(c, t.name)
-            if c.action in C.GO or c.action == "no_twin":
+            # A twin that cannot represent the change has no grounds to hold it: like no twin, it goes to the
+            # operator's approval alone, and the result says the twin could not check it.
+            if c.action in C.GO or c.action in ("no_twin", "not_modelled"):
                 return None, rec
             ov = checks.overridden(controller, tool, args, c.change_ran)
             if ov:
@@ -347,6 +349,10 @@ def make_gate(registry: Registry, checks: Checks, writes: Callable[[], Set[str]]
         def _after(self, rec, result):
             if rec is None or not isinstance(result, ToolMessage):
                 return result
+            if rec.get("action") == "not_modelled":
+                text = result.content if isinstance(result.content, str) else str(result.content)
+                return result.model_copy(update={"content": text + f"\n\n[Not checked: the digital twin {rec['twin']!r} cannot "
+                                                 f"model this kind of change (check {rec['check_id']}); it went to approval alone.]"})
             note = (f"\n\n[Checked in the digital twin {rec['twin']!r} first: check {rec['check_id']}, {rec['action']}"
                     + (f", overridden by {rec['override']['by']}: {rec['override']['reason']}" if rec.get("override") else "") + ".]")
             text = result.content if isinstance(result.content, str) else str(result.content)

@@ -270,3 +270,13 @@ class Paging(unittest.TestCase):
         a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
         a.ask("read it all")
         self.assertIn("Stop paging", model.tool_results(-1)[-1])
+
+
+class Delegation(unittest.TestCase):
+    def test_the_whatif_pattern(self):
+        from canah.grounding import _WHATIF
+        for q in ["What if fibre F-ab is cut?", "If the fibre carrying LP3 were cut, would LP3 keep a 3 dB margin?",
+                  "Rehearse it in the digital twin.", "Is it safe to raise the rate to 400G?"]:
+            self.assertTrue(_WHATIF.search(q), q)
+        for q in ["Which routers are down?", "List the lightpaths.", "describe yourself"]:
+            self.assertFalse(_WHATIF.search(q), q)

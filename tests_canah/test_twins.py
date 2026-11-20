@@ -48,7 +48,7 @@ class Toy:
 
     def check_write(self, controller, tool, arguments, answers):
         rate = float(arguments.get("rate") or 0)
-        action = "reject" if rate > 100 else "propose"
+        action = "not_modelled" if rate == 7 else "reject" if rate > 100 else "propose"
         return {"check_id": f"c{rate:g}", "controller": controller, "tool": tool, "action": action, "arguments": arguments,
                 "reasons": [f"rate {rate:g}"], "next": "do it" if action == "propose" else "do not",
                 "change_ran": {"rate": rate}}
@@ -182,6 +182,12 @@ class Twins(unittest.TestCase):
         said = self.send_write(a, "g3", "set it to 50")
         self.assertEqual(SENT, [50])
         self.assertIn("Checked in the digital twin 'toy' first: check c50, propose", said)
+
+    def test_a_write_the_twin_cannot_model_goes_to_approval_alone(self):
+        a, _ = self.agent(call("ctl__set_rate", rate=7), say("done"))
+        said = self.send_write(a, "g4", "set it to 7")
+        self.assertEqual(SENT, [7])
+        self.assertIn("Not checked: the digital twin 'toy' cannot model this kind of change", said)
 
     # -- the service
     def test_the_twins_page_api(self):

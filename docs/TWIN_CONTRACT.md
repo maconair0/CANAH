@@ -153,14 +153,14 @@ CANAH's write gate calls this when the agent is about to send a write to a contr
 | `reject` | it may not |
 | `gather_more_data` | the twin cannot settle it |
 | `ask_operator` | the write leaves out something the twin needs; `questions` says what |
-| `not_modelled` | the twin cannot represent this kind of change |
+| `not_modelled` | the twin cannot represent this kind of change: it goes to approval alone, and the result says the twin could not check it |
 | `no_twin` | this controller's domain is not the twin's: the write goes through approval alone |
 | `unknown_tool` | not one of the controller's tools |
 
 `result` is the prediction behind the check (a Result), when one ran.
 
 What the gate does with a check:
-- A write runs if its check is `propose`, `auto_apply_eligible` or `no_twin`, or if an operator overrode a check of the same call. "The same call" includes the same change written differently, judged by `change_ran`.
+- A write runs if its check is `propose`, `auto_apply_eligible`, `no_twin` or `not_modelled` (the last two go to approval alone), or if an operator overrode a check of the same call. "The same call" includes the same change written differently, judged by `change_ran`.
 - Otherwise the gate returns the check to the agent instead of sending the write.
 - An override is a tool the agent calls on the operator's word (`twin_override`, with the operator's reason). That override itself waits for approval.
 

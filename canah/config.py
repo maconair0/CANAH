@@ -52,6 +52,9 @@ class Settings:
     interrupt_on: Dict[str, Any] = field(default_factory=dict)
     # Send back, once, a substantial answer given without any lookup in its turn (grounding.LookFirst).
     look_first: bool = True
+    # The multi-agent team: CANAH supervises; `qot` watches quality and works the digital twin; one config agent per
+    # network domain (packet-config, optical-config, ...) makes the changes. false: CANAH does everything itself.
+    team: bool = True
     # draw_diagram: Mermaid pictures, rendered and kept under CANAH_HOME/diagrams (canah/diagrams.py).
     diagrams: bool = True
     # The watcher (canah/incidents.py): reads every controller through the contract every watch_interval_s;
@@ -151,7 +154,7 @@ ENV = {
     "CANAH_SYSTEM_PROMPT_FILE": "system_prompt_file", "CANAH_SANDBOX": "sandbox",
     "CANAH_RECURSION_LIMIT": "recursion_limit", "CANAH_MAX_SECONDS": "max_seconds", "CANAH_NOTIFY_URL": "notify_url",
     "CANAH_APPROVAL_TTL_S": "approval_ttl_s", "CANAH_MAX_TOKENS_PER_REQUEST": "max_tokens_per_request", "CANAH_DEBUG": "debug", "CANAH_CONTEXT_WINDOW": "context_window", "CANAH_COMPACT_AT": "compact_at",
-    "CANAH_COMPACT_KEEP": "compact_keep", "CANAH_PROVIDERS": "providers", "CANAH_TWIN": "twin_active",
+    "CANAH_COMPACT_KEEP": "compact_keep", "CANAH_TEAM_ON": "team", "CANAH_PROVIDERS": "providers", "CANAH_TWIN": "twin_active",
 }
 
 

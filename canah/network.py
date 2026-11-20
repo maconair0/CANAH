@@ -452,9 +452,13 @@ class AgenticMCPProvider:
     couple of dozen tools rather than every controller's hundreds."""
 
     def __init__(self, url: str = "", token: str = "", controllers: Optional[List[str]] = None,
-                 service: Optional[AgenticMCP] = None):
+                 service: Optional[AgenticMCP] = None, team: Optional[bool] = None):
         self.service = service or AgenticMCP(url, token)
         self.only = controllers
+        # The multi-agent team: the supervisor reads and delegates, a config agent per network domain changes it.
+        self.team = (os.getenv("CANAH_TEAM", "1") == "1") if team is None else team
+        self.config_agents: List[Dict[str, Any]] = []
+        self.roles: Dict[str, Dict[str, Any]] = {}
         self._tools: List[BaseTool] = []
         self._writes: List[str] = []
         self.catalog: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -549,6 +553,62 @@ class AgenticMCPProvider:
                              "for how something reaches somewhere.")))
         if seats:
             self.status = {"ok": True, "url": self.service.url, "controllers": held}
+        if self.team:
+            self._build_team(held, served, rules)
+
+    def _build_team(self, held: Dict[str, Any], served: Dict[str, Dict[str, Dict[str, Any]]], rules: Dict[str, Any]) -> None:
+        """One config agent per network domain (packet, optical, data centre, ...), from the domain each controller
+        declares: the same tools as the supervisor's, cut to that domain's controllers, writes included."""
+        by_domain: Dict[str, List[str]] = {}
+        for k, v in held.items():
+            if v.get("ok"):
+                by_domain.setdefault(str(v.get("domain") or "network").lower(), []).append(k)
+        for domain, keys in sorted(by_domain.items()):
+            name = re.sub(r"[^a-z0-9]+", "-", domain).strip("-") + "-config"
+            cat = {k: self.catalog[k] for k in keys}
+            tools: List[BaseTool] = []
+            for verb, by in sorted(served.items()):
+                mine = {k: r for k, r in by.items() if k in keys}
+                if not mine:
+                    continue
+                full = self.verb_tools[f"net_{verb}"]
+                tools.append(VerbTool(service=self.service, catalog=cat, verb=verb, write=full.write,
+                                      served={k: r["name"] for k, r in mine.items()}, name=full.name,
+                                      args_schema=_verb_schema(verb, full.write, mine), description=full.description))
+            tools += [
+                _SearchTool(service=self.service, catalog=cat, name="network_tools",
+                            description=f"Find a {domain} controller's own tools beyond the contract verbs."),
+                _ControllerCall(service=self.service, catalog=cat, name="controller_read",
+                                description=f"Call one of a {domain} controller's own tools that reads."),
+                _ControllerCall(service=self.service, catalog=cat, write=True, name="controller_write",
+                                description=f"Call one of a {domain} controller's own tools that changes the network. "
+                                            f"It waits for the operator's approval."),
+            ]
+            labels = ", ".join(f"{held[k].get('label') or k} ({k})" for k in keys)
+            self.roles[name] = {"kind": "config", "domain": domain, "controllers": keys, "label": f"{domain} configuration"}
+            self.config_agents.append({
+                "name": name,
+                "description": (f"The {domain} configuration agent: makes changes on the {domain} controllers ({labels}) "
+                                f"through the agentic MCP with the contract's verbs (provision, teardown, adjust, reroute, "
+                                f"configure a device) or a controller's own write tool, and reads them back. Delegate to it "
+                                f"every change in the {domain} domain: say exactly what (controller, verb or tool, values) "
+                                f"and what the QoT agent's rehearsal in the digital twin found."),
+                "system_prompt": (f"You are CANAH's {domain} configuration agent. You change the {domain} network ({labels}) "
+                                  f"through the agentic MCP and nothing else. Read the current state first (the net_read_ "
+                                  f"tools), then make exactly the change you were given with the tool that does it, with "
+                                  f"the real arguments: the call pauses for the operator's approval, which is the "
+                                  f"confirmation (never ask in text). After it runs, read the object back and report "
+                                  f"what you did and what you read. A change you were not given, or one in another "
+                                  f"domain, you do not make: say so."),
+                "tools": tools})
+
+    def agent_roles(self) -> Dict[str, Dict[str, Any]]:
+        self._load()
+        return dict(self.roles)
+
+    def subagents(self) -> List[Dict[str, Any]]:
+        self._load()
+        return list(self.config_agents)
 
     def write_target(self, name: str, args: Dict[str, Any]) -> Optional[tuple]:
         """(controller, tool, arguments) a write call will send, for the digital twin's write gate."""
@@ -573,7 +633,10 @@ class AgenticMCPProvider:
         return list(self._writes)
 
     def main_tools(self) -> List[str]:
+        """With the team, the supervisor keeps every read and no write: changes are its config agents'."""
         self._load()
+        if self.team and self.config_agents:
+            return [t.name for t in self._tools if t.name not in self._writes]
         return [t.name for t in self._tools]
 
     def instructions(self) -> str:
@@ -583,6 +646,20 @@ class AgenticMCPProvider:
                     f"now ({self.status.get('error')}). Say so when a request needs the network.")
         rows = [f"{k} ({v.get('label')}, {v.get('domain') or 'network'})" for k, v in self.status.get("controllers", {}).items()
                 if v.get("ok")]
+        if self.team and self.config_agents:
+            agents = "; ".join(f"{a['name']} for {', '.join(self.roles[a['name']]['controllers'])}" for a in self.config_agents)
+            return (f"Networks are reached through the agentic MCP, which holds these SDN controllers: {', '.join(rows) or 'none'}. "
+                    f"You are the supervisor of a team. You read the networks yourself (the net_read_ tools, a read without a "
+                    f"controller asks every one) and you do not change them. Your agents, each called with `task`:\n"
+                    f"- qot: the quality-of-transmission agent. It watches quality and health (margins, OSNR, availability, "
+                    f"delay, loss, incidents, trends), rehearses what-ifs and changes in the digital twin, and proposes the "
+                    f"exact configuration to apply, with the twin's decision. Give it any what-if, any 'is this safe', any "
+                    f"degradation, and any change before it is made.\n"
+                    f"- the config agents, one per network domain: {agents}. A change in a domain is made only by its config "
+                    f"agent: give it the exact change (controller, verb or tool, values) and what qot's rehearsal found. Its "
+                    f"call waits for the operator's approval.\n"
+                    f"For a change: qot first (rehearse and propose), then the domain's config agent (apply), then report "
+                    f"what both said. A change across domains goes to each domain's config agent in turn.")
         return (f"Networks are reached through the agentic MCP, which holds these SDN controllers: "
                 f"{', '.join(rows) or 'none'}. You work them all yourself, with the same tools for every controller: "
                 f"a net_<verb> tool per contract verb (net_read_devices, net_read_links, net_provision, ...), with the "

@@ -358,3 +358,40 @@ class TimeBudget(AgentMiddleware):
         return {"jump_to": "end", "messages": [AIMessage(content=(
             "I ran out of time for this request before finishing it, so I stopped. Nothing more will run for it. "
             "Ask again more narrowly, or say which part to do first."))]}
+
+
+_DELEGATE = "[delegation check]"
+_WHATIF = re.compile(r"\b(what if|what happens|what would|rehears\w*|simulat\w*|digital twin|the twin|is it safe|safe to|"
+                     r"feasib\w*|would \w+(?: \w+){0,6} (keep|survive|hold|still|stay|lose|break|drop))\b|"
+                     r"\bif\b[^.?]{0,80}\b(were|was|is|gets?|got) (cut|down|lost|removed|added|failed|broken|degraded)\b", re.I)
+
+
+class DelegationGuard(AgentMiddleware):
+    """With the team, a what-if is qot's: an answer to one, given without asking qot this turn, is sent back once.
+    (Without it, the supervisor read the twin's name and wrote what "the twin predicts" with no prediction run.)"""
+
+    def __init__(self, qot: str = "qot"):
+        super().__init__()
+        self.qot = qot
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+            return None
+        q = current_question(msgs)
+        if not _WHATIF.search(q or ""):
+            return None
+        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage) and "check]" not in str(m.content)[:40]), default=0)
+        turn = msgs[start:]
+        if any(isinstance(m, HumanMessage) and _DELEGATE in str(m.content) for m in turn):
+            return None
+        asked = any(isinstance(m, AIMessage) and any(c.get("name") == "task" and (c.get("args") or {}).get("subagent_type") == self.qot
+                                                     for c in (m.tool_calls or [])) for m in turn)
+        if asked:
+            return None
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+            f"{_DELEGATE} This is a what-if: it is answered by rehearsing it in the digital twin, which is qot's work, "
+            f"not yours. Call task(subagent_type='{self.qot}', description=<the what-if, with what you read>) and "
+            f"answer from its report: its PROPOSAL and TWIN lines. Never say what the twin predicts without that.", msgs,
+            keep=False))]}
