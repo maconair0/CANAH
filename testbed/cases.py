@@ -32,6 +32,18 @@ def lacks(*words):
     return lambda t, r, d: not any(w.lower() in t.lower() for w in words)
 
 
+def not_at_risk(*words):
+    """Each word appears only where the answer says it is not affected (or not at all)."""
+    neg = re.compile(r"\b(not|no|unaffected|isn't|aren't|neither|nor|unrelated|different|separate|safe|other)\b", re.I)
+
+    def check(t, r, d):
+        for part in re.split(r"(?<=[.!?\n])\s+|\n", t):
+            if any(w.lower() in part.lower() for w in words) and not neg.search(part):
+                return False
+        return True
+    return check
+
+
 def matches(pattern):
     return lambda t, r, d: bool(re.search(pattern, t, re.I))
 
@@ -101,7 +113,7 @@ CASES: List[Case] = [
          all_of(has("LP-1", "21.4"))),
     Case("cross-impact", "cross", OBSERVER,
          "LP-1's OSNR has dropped. Which packet services and which customers are at risk?",
-         all_of(has("VS-100", "acme"), lacks("globex")),
+         all_of(has("VS-100", "acme"), not_at_risk("globex", "VS-200")),
          setup=lambda d: d["optical"].degrade("LP-1", 13.0)),
     Case("cross-dc-path", "cross", OBSERVER,
          "How does tenant green reach outside the data centre? Name each piece and the domain it is in.",

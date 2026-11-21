@@ -301,6 +301,7 @@ class _CatalogTool(BaseTool):
     """Shared by the tools below: the controllers' tools as the agentic MCP offers them."""
     service: Any
     catalog: Dict[str, Dict[str, Dict[str, Any]]] = {}     # controller -> tool name -> record
+    changes_by: Dict[str, str] = {}                        # controller -> the config agent that changes it (team)
 
     def _find(self, controller: str, tool: str) -> Optional[Dict[str, Any]]:
         return _find(self.catalog, controller, tool)
@@ -328,6 +329,70 @@ class _CatalogTool(BaseTool):
         return _clip(("Error: " if got.get("is_error") and not text.lower().startswith("error") else "") + text)
 
 
+def _terms(match: Any) -> List[str]:
+    if isinstance(match, (list, tuple)):
+        return [str(x).strip().lower() for x in match if str(x).strip()]
+    return [x.strip().lower() for x in str(match or "").split(",") if x.strip()]
+
+
+def _names_it(d: Dict[str, Any], terms: List[str]) -> bool:
+    """The object itself carries one of the terms in its own fields (its name, id, router...), not only deeper."""
+    return any(not isinstance(v, (dict, list)) and any(t in str(v).lower() for t in terms) for v in d.values())
+
+
+def _mentions(x: Any, terms: List[str]) -> bool:
+    """A term in the values (never in the keys: "lightpaths" is not a lightpath)."""
+    if isinstance(x, dict):
+        return any(_mentions(v, terms) for v in x.values())
+    if isinstance(x, list):
+        return any(_mentions(v, terms) for v in x)
+    return x is not None and any(t in str(x).lower() for t in terms)
+
+
+def _keep(value: Any, terms: List[str], tally: List[int]) -> Any:
+    """Every list in a controller's answer cut to the items that mention one of the terms. An object that names a
+    term itself is kept whole: {"router": "pe-b", "interfaces": [...]} asked for pe-b keeps all its interfaces.
+    tally: [items kept, items looked at], over the outermost lists."""
+    if isinstance(value, list):
+        if value and all(isinstance(x, (dict, list, str)) for x in value):
+            kept = [x if isinstance(x, dict) and _names_it(x, terms) else _keep(x, terms, [0, 0]) for x in value
+                    if _mentions(x, terms)]
+            tally[0] += len(kept)
+            tally[1] += len(value)
+            return kept
+        return value
+    if isinstance(value, dict):
+        if _names_it(value, terms):
+            tally[0] += 1
+            tally[1] += 1
+            return value
+        return {k: _keep(v, terms, tally) for k, v in value.items()}
+    return value
+
+
+def filter_answer(text: str, match: Any) -> str:
+    """A read's answer cut to what `match` names (comma-separated words: names, ids, a site, a type), done by the
+    harness, so it works the same on every controller: a long device list becomes the devices asked about. The
+    first line says how many items were kept of how many, so a cut list is never read as the whole."""
+    terms = _terms(match)
+    if not terms or text.startswith("Error"):
+        return text
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        lines = text.splitlines()
+        hit = [x for x in lines if any(t in x.lower() for t in terms)]
+        if not hit:
+            return f"Nothing in the answer mentions {', '.join(terms)}."
+        return f"[match {', '.join(terms)}: {len(hit)} of {len(lines)} lines kept]\n" + "\n".join(hit)
+    tally = [0, 0]
+    cut = _keep(data, terms, tally)
+    if not tally[0]:
+        return f"Nothing in the answer mentions {', '.join(terms)}."
+    return (f"[match {', '.join(terms)}: {tally[0]} of {tally[1]} items kept; the others do not mention it]\n"
+            + json.dumps(cut, indent=1, default=str))
+
+
 class VerbTool(_CatalogTool):
     """One verb of the common contract, on whichever controller serves it: the same tool for every controller.
     A read with no controller named asks every controller that serves the verb, and answers per controller."""
@@ -337,8 +402,36 @@ class VerbTool(_CatalogTool):
     args_schema: Any = None
 
     def _run(self, config: RunnableConfig, controller: str = "", arguments: Optional[Dict[str, Any]] = None,
-             run_manager: Any = None, **kwargs: Any) -> str:
+             match: Any = None, run_manager: Any = None, **kwargs: Any) -> str:
         arguments = dict(arguments or {}, **{k: v for k, v in kwargs.items() if k not in ("callbacks",)})
+        if match and not self.write and controller:
+            got = filter_answer(self._read(config, controller, arguments, None), match)
+            if got.startswith("Nothing in the answer mentions") and len(self.served) > 1:
+                # The object may be another controller's (a packet service asked of the optical controller).
+                from .identity import scope_of
+                scope = scope_of(config)
+                elsewhere = {}
+                for k in self.served:
+                    if k == controller or (scope and k not in scope):
+                        continue
+                    found = filter_answer(self._call(k, self.catalog[k][self.served[k]], {}, config), match)
+                    if not found.startswith(("Nothing in the answer mentions", "Error")):
+                        elsewhere[k] = _maybe_json(found)
+                if elsewhere:
+                    return (f"Nothing on {controller} mentions {match}. Found on "
+                            f"{', '.join(elsewhere)}:\n" + _clip(json.dumps(elsewhere, indent=1, default=str)))
+            if got.startswith("Nothing in the answer mentions"):
+                others = sorted(v for v in ("read_devices", "read_links", "read_services", "read_alarms") if v != self.verb)
+                got += (f" match looks in the values (names, ids, states, types), not in field names; to see "
+                        f"everything, call it without match. It may also be another kind of object: try "
+                        f"{', '.join('net_' + v for v in others)} (a lightpath or a tunnel is a service), or "
+                        f"follow_relations from it.")
+            return got
+        if match and not self.write:
+            return self._read(config, controller, arguments, match)
+        return self._read(config, controller, arguments, None)
+
+    def _read(self, config: Any, controller: str, arguments: Dict[str, Any], match: Any) -> str:
         if controller and controller not in self.served:
             return (f"Error: {controller} does not serve {self.verb} through the agentic MCP. It is served by: "
                     f"{', '.join(self.served) or 'no controller'}. network_tools(controller=...) lists what "
@@ -354,6 +447,8 @@ class VerbTool(_CatalogTool):
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=min(8, len(keys) or 1)) as pool:
                 got = list(pool.map(lambda k: self._call(k, self.catalog[k][self.served[k]], arguments, config), keys))
+            if match:
+                got = [filter_answer(v, match) for v in got]
             per = int(os.getenv("CANAH_FANOUT_CHARS", "3000"))
 
             def short(k: str, v: str) -> Any:
@@ -405,24 +500,42 @@ class _SearchTool(_CatalogTool):
         return json.dumps(out, indent=1, default=str)
 
 
+_CALL_WRITE_SCHEMA = {"type": "object", "properties": {
+    "controller": {"type": "string", "description": "the controller's key"},
+    "tool": {"type": "string", "description": "the tool's name, as network_tools gives it"},
+    "arguments": {"type": "object", "description": "the tool's arguments, as its schema says"}},
+    "required": ["controller", "tool"]}
+
+
 class _ControllerCall(_CatalogTool):
     write: bool = False
     args_schema: Any = {"type": "object", "properties": {
         "controller": {"type": "string", "description": "the controller's key"},
         "tool": {"type": "string", "description": "the tool's name, as network_tools gives it"},
-        "arguments": {"type": "object", "description": "the tool's arguments, as its schema says"}},
+        "arguments": {"type": "object", "description": "the tool's arguments, as its schema says"},
+        "match": {"type": "string", "description": "a read only: keep only the items that mention these words, "
+                                                   "comma-separated (names, ids)"}},
         "required": ["controller", "tool"]}
 
     def _run(self, config: RunnableConfig, controller: str = "", tool: str = "",
-             arguments: Optional[Dict[str, Any]] = None, run_manager: Any = None, **kwargs: Any) -> str:
+             arguments: Optional[Dict[str, Any]] = None, match: Any = None, run_manager: Any = None,
+             **kwargs: Any) -> str:
         rec = self._find(controller, tool)
         if rec is None:
+            if self.changes_by.get(controller) and (tool.startswith("net_") or tool in ("controller_write", "write", "provision")):
+                return (f"Error: {tool!r} is not a {controller} tool, and changes are not yours: hand the change to "
+                        f"{self.changes_by[controller]} with `task`.")
             return (f"Error: {controller or '(no controller)'} has no tool {tool!r}. network_tools(controller="
                     f"{controller!r}, query=...) finds it.")
         if rec.get("write") and not self.write:
+            if self.changes_by.get(controller):
+                return (f"Error: {rec['name']} changes the network, and you do not make changes: hand it to "
+                        f"{self.changes_by[controller]} with `task`, saying exactly: call {rec['name']} on {controller} "
+                        f"with {json.dumps(arguments or {})}. Do not try other tool names.")
             return (f"Error: {rec['name']} changes the network: call controller_write with the same arguments, "
                     f"so it waits for the operator's approval.")
-        return self._call(controller, rec, arguments or {}, config)
+        got = self._call(controller, rec, arguments or {}, config)
+        return filter_answer(got, match) if match and not rec.get("write") else got
 
 
 def _verb_schema(verb: str, write: bool, served: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -432,7 +545,10 @@ def _verb_schema(verb: str, write: bool, served: Dict[str, Dict[str, Any]]) -> D
                        "description": ("the controller to change" if write else
                                        "the controller to read; leave it out to ask every controller that serves it")},
         "arguments": {"type": "object", "description": "the controller's own arguments for it, by controller: " +
-                      "; ".join(f"{k}: {_arg_summary(served[k].get('schema'))}" for k in keys)}},
+                      "; ".join(f"{k}: {_arg_summary(served[k].get('schema'))}" for k in keys)},
+        **({} if write else {"match": {"type": "string", "description": (
+            "only the items that mention these words, comma-separated (names, ids, a site, a type): "
+            "for example 'xpdr-b2, xpdr-c2'. Use it to find the objects a question or change names in a long list.")}})},
         "required": ["controller"] if write else []}
 
 
@@ -521,7 +637,10 @@ class AgenticMCPProvider:
                          served={k: r["name"] for k, r in by.items()}, name=name,
                          args_schema=_verb_schema(verb, write, by),
                          description=(f"Contract verb {verb.replace('_', ' ')}: {what}. On any controller that serves "
-                                      f"it ({', '.join(sorted(by))}), through the agentic MCP."
+                                      f"it, through the agentic MCP; on each it is that controller's own tool: "
+                                      + "; ".join(f"{k}: {r['name']}({_arg_summary(r.get('schema'))})"
+                                                  + (f" - {str(r.get('description') or '')[:90].rstrip('.')}" if write else "")
+                                                  for k, r in sorted(by.items())) + "."
                                       + (" It changes the network: it waits for the operator's approval." if write else
                                          " Without a controller it asks every one that serves it.")))
             self.verb_tools[name] = t
@@ -537,7 +656,7 @@ class AgenticMCPProvider:
                 _ControllerCall(service=self.service, catalog=self.catalog, name="controller_read",
                                 description="Call one of a controller's own tools that reads (as network_tools found "
                                             "it), through the agentic MCP."),
-                _ControllerCall(service=self.service, catalog=self.catalog, write=True, name="controller_write",
+                _ControllerCall(service=self.service, catalog=self.catalog, write=True, args_schema=_CALL_WRITE_SCHEMA, name="controller_write",
                                 description="Call one of a controller's own tools that changes the network (as "
                                             "network_tools found it), through the agentic MCP. It waits for the "
                                             "operator's approval."),
@@ -555,6 +674,10 @@ class AgenticMCPProvider:
             self.status = {"ok": True, "url": self.service.url, "controllers": held}
         if self.team:
             self._build_team(held, served, rules)
+            by = {k: a["name"] for a in self.config_agents for k in self.roles[a["name"]]["controllers"]}
+            for t in self._tools:
+                if isinstance(t, _CatalogTool):
+                    t.changes_by = by
 
     def _build_team(self, held: Dict[str, Any], served: Dict[str, Dict[str, Dict[str, Any]]], rules: Dict[str, Any]) -> None:
         """One config agent per network domain (packet, optical, data centre, ...), from the domain each controller
@@ -572,15 +695,20 @@ class AgenticMCPProvider:
                 if not mine:
                     continue
                 full = self.verb_tools[f"net_{verb}"]
+                desc = (f"Contract verb {verb.replace('_', ' ')}; on each controller it is its own tool: "
+                        + "; ".join(f"{k}: {r['name']}({_arg_summary(r.get('schema'))})"
+                                    + (f" - {str(r.get('description') or '')[:120].rstrip('.')}" if full.write else "")
+                                    for k, r in sorted(mine.items())) + "."
+                        + (" It changes the network: it waits for the operator's approval." if full.write else ""))
                 tools.append(VerbTool(service=self.service, catalog=cat, verb=verb, write=full.write,
                                       served={k: r["name"] for k, r in mine.items()}, name=full.name,
-                                      args_schema=_verb_schema(verb, full.write, mine), description=full.description))
+                                      args_schema=_verb_schema(verb, full.write, mine), description=desc))
             tools += [
                 _SearchTool(service=self.service, catalog=cat, name="network_tools",
                             description=f"Find a {domain} controller's own tools beyond the contract verbs."),
                 _ControllerCall(service=self.service, catalog=cat, name="controller_read",
                                 description=f"Call one of a {domain} controller's own tools that reads."),
-                _ControllerCall(service=self.service, catalog=cat, write=True, name="controller_write",
+                _ControllerCall(service=self.service, catalog=cat, write=True, args_schema=_CALL_WRITE_SCHEMA, name="controller_write",
                                 description=f"Call one of a {domain} controller's own tools that changes the network. "
                                             f"It waits for the operator's approval."),
             ]
@@ -591,17 +719,26 @@ class AgenticMCPProvider:
                 "description": (f"The {domain} configuration agent: makes changes on the {domain} controllers ({labels}) "
                                 f"through the agentic MCP with the contract's verbs (provision, teardown, adjust, reroute, "
                                 f"configure a device) or a controller's own write tool, and reads them back. Delegate to it "
-                                f"every change in the {domain} domain: say exactly what (controller, verb or tool, values) "
-                                f"and what the QoT agent's rehearsal in the digital twin found."),
+                                f"every change in the {domain} domain: say exactly what (controller, tool, each argument's "
+                                f"value)."),
                 "system_prompt": (f"You are CANAH's {domain} configuration agent. You change the {domain} network ({labels}) "
-                                  f"through the agentic MCP and nothing else. Read the current state first (the net_read_ "
-                                  f"tools), then make exactly the change you were given with the tool that does it, with "
-                                  f"the real arguments: the call pauses for the operator's approval, which is the "
+                                  f"through the agentic MCP and nothing else. First read only the objects the change names, "
+                                  f"with match (for example net_read_devices(controller=..., match='xpdr-b2, xpdr-c2')): "
+                                  f"an object of another domain that the change names (a packet service a tenant is to "
+                                  f"reach, say) you will not find in yours: use its name as given. "
+                                  f"a whole device list is long and you do not need it. Then make exactly the change you "
+                                  f"were given with the tool that does it (network_tools(verb=...) when unsure which), "
+                                  f"with the real arguments in the controller's own names, and every value the change names among them, the "
+                                  f"optional ones too (a link or path to ride, a rate, a port): the call pauses for the operator's approval, which is the "
                                   f"confirmation (never ask in text). After it runs, read the object back and report "
                                   f"what you did and what you read. A change you were not given, or one in another "
                                   f"domain, you do not make: say so. Your write is checked in the digital twin before it "
                                   f"is sent: if it is held (reject, gather_more_data, ask_operator), do not retry it or "
-                                  f"work around it; report the twin's reasons and questions as given, and stop."),
+                                  f"work around it; report the twin's reasons and questions as given, and stop. If the controller "
+                                  f"answers that another step in your domain must come first (attach to a border leaf "
+                                  f"first, say), do that step, then the change, each with its own approval. A change "
+                                  f"may take several calls (attach a tenant, then connect it): make every one until the "
+                                  f"change you were given is complete, then read it back."),
                 "tools": tools})
 
     def agent_roles(self) -> Dict[str, Dict[str, Any]]:
@@ -649,18 +786,29 @@ class AgenticMCPProvider:
         rows = [f"{k} ({v.get('label')}, {v.get('domain') or 'network'})" for k, v in self.status.get("controllers", {}).items()
                 if v.get("ok")]
         if self.team and self.config_agents:
-            agents = "; ".join(f"{a['name']} for {', '.join(self.roles[a['name']]['controllers'])}" for a in self.config_agents)
+            def changes(name: str) -> str:
+                keys = self.roles[name]["controllers"]
+                tools = sorted({t for k in keys for t, r in self.catalog.get(k, {}).items() if r.get("write")})
+                return f" (its changes: {', '.join(tools[:14])}{' …' if len(tools) > 14 else ''})" if tools else ""
+            agents = "; ".join(f"{a['name']} for {', '.join(self.roles[a['name']]['controllers'])}{changes(a['name'])}"
+                               for a in self.config_agents)
             return (f"Networks are reached through the agentic MCP, which holds these SDN controllers: {', '.join(rows) or 'none'}. "
-                    f"You are the supervisor of a team. You read the networks yourself (the net_read_ tools, a read without a "
-                    f"controller asks every one) and you do not change them. Your agents, each called with `task`:\n"
+                    f"You are the supervisor of a team. You read the networks yourself (the net_read_ tools; a read without a "
+                    f"controller asks every one, and match='name, name' keeps only the objects you are after) and you do not change them. Your agents, each called with `task`:\n"
                     f"- qot: the quality-of-transmission agent. It watches quality and health (margins, OSNR, availability, "
                     f"delay, loss, incidents, trends), rehearses what-ifs and changes in the digital twin, and proposes the "
                     f"exact configuration to apply, with the twin's decision. Give it any what-if, any 'is this safe', any "
-                    f"degradation, and any change before it is made.\n"
+                    f"degradation and quality question; not a plain change (the write gate rehearses that).\n"
                     f"- the config agents, one per network domain: {agents}. A change in a domain is made only by its config "
-                    f"agent: give it the exact change (controller, verb or tool, values) and what qot's rehearsal found. Its "
-                    f"call waits for the operator's approval.\n"
-                    f"For a change: hand it straight to the domain's config agent with the exact change. Its write is "
+                    f"agent: give it the exact change as the controller's tool takes it (controller, tool, each argument's "
+                    f"value, e.g. over='L-ab'), not a description. Its call waits for the operator's approval.\n"
+                    f"For a change: first find whose it is. The domain is the one whose controller has the tool that does it: "
+                    f"network_tools(query=<the change's words>) with no controller searches them all (attaching a tenant is "
+                    f"the data centre's, a lightpath the optical one's, a VLAN service the packet one's). A change that "
+                    f"needs steps in two domains goes to each in turn, in the order the design rules give. When the "
+                    f"operator names the change exactly, hand it on at once: the config agent reads what it needs, and "
+                    f"the controller and the twin's gate check resources (spectrum, ports, rates), so you do not. "
+                    f"Hand it to the domain's config agent with the exact change. Its write is "
                     f"rehearsed in the digital twin automatically before it is sent (the write gate) and then waits for "
                     f"the operator's approval, so do not ask qot to rehearse it as well. Ask qot only for what-ifs, 'is it "
                     f"safe', quality questions, or when the gate held a write and the operator wants to know more. A "
@@ -669,7 +817,7 @@ class AgenticMCPProvider:
                 f"{', '.join(rows) or 'none'}. You work them all yourself, with the same tools for every controller: "
                 f"a net_<verb> tool per contract verb (net_read_devices, net_read_links, net_provision, ...), with the "
                 f"controller as an argument; a read without a controller asks every controller that serves it, which "
-                f"is how to answer across controllers. For anything beyond the contract verbs, find the controller's "
+                f"is how to answer across controllers; match='name, name' keeps only the objects you are after in a long list. For anything beyond the contract verbs, find the controller's "
                 f"own tool with network_tools, then call it with controller_read, or controller_write for a change. "
                 f"Read before you answer and quote what the controllers returned. A change (a net_ write verb or "
                 f"controller_write) waits for the operator's approval: call it with the exact arguments and the "

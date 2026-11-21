@@ -47,6 +47,13 @@ class DockerSandbox(unittest.TestCase):
         self.assertIn("ü line", self.sb.read("/workspace/t/x.txt").file_data["content"])
         self.assertEqual(self.sb.download_files(["/workspace/nope"])[0].error, "file_not_found")
 
+    def test_a_large_one_line_result_reads_whole(self):
+        big = '{"rows": [' + ", ".join(f'{{"i": {i}, "pad": "{"x" * 100}"}}' for i in range(600)) + "]}"
+        self.assertIsNone(self.sb.upload_files([("/workspace/t/big.json", big.encode())])[0].error)
+        got = self.sb.read("/workspace/t/big.json")
+        self.assertIsNone(got.error)                      # was "unexpected server response": execute's cap cut it
+        self.assertIn('"i": 599', got.file_data["content"])
+
     def test_a_long_command_is_killed(self):
         self.assertEqual(self.sb.execute("sleep 20", timeout=2).exit_code, 124)
 

@@ -92,9 +92,13 @@ class Watching(Base):
         self.assertEqual(rows["link_down"]["runbook"], "link-down")
         self.assertEqual(rows["link_down"]["mode"], "propose")
         self.assertEqual(rows["device_down"]["mode"], "investigate")
-        self.assertEqual(len(asked), 1)                                   # what opened together: one investigation
-        group, evidence = asked[0]
-        self.assertEqual({a["kind"] for a in group}, {"link_down", "service_down", "device_down", "controller_unreachable", "alarm"})
+        # What depends on each other is one investigation (the link and the device at its end); a controller that
+        # stopped answering, and faults linked to nothing here, are each their own.
+        kinds = sorted(sorted(a["kind"] for a in g) for g, _ in asked)
+        self.assertIn(["device_down", "link_down"], kinds)
+        self.assertIn(["controller_unreachable"], kinds)
+        self.assertEqual(sum(len(k) for k in kinds), 5)
+        group, evidence = next((g, e) for g, e in asked if any(a["kind"] == "link_down" for a in g))
         self.assertIn("L1", evidence["objects"])
         self.assertEqual(evidence["health_now"]["opt"]["links_down"], 1)
         self.assertEqual(len([s for s in sent if s[0] == "incident_opened"]), 6)       # the degraded one too (no runbook)

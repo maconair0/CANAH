@@ -117,6 +117,23 @@ class Passages(unittest.TestCase):
         out = KnowledgeProvider(retriever=R()).tools()[0].invoke({"query": "What does Spec-X2 allow?"})
         self.assertIn("does not mention: Spec-X2", out)
 
+    def test_a_keyword_search_that_finds_nothing_tries_the_operators_question(self):
+        class R:
+            asked = []
+
+            def retrieve(self, q, top_k=5):
+                self.asked.append(q)
+                if "rules" in q:
+                    return {"abstained": True, "best_relevance": 0.01, "near_misses": [], "rewrites": []}
+                return {"abstained": False, "hits": [{"text": "VLAN ids 1000 and above are reserved", "source": "rules.md",
+                                                      "metadata": {}}]}
+        model = ScriptedModel(script=[call("search_knowledge", query="VLAN design rules 1200"), say("Reserved [rules.md].")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [KnowledgeProvider(retriever=R())], model=model,
+                        memory=open_memory(in_memory=True))
+        a.ask("Can I use VLAN 1200 for a customer?", who=Identity("ana", "admin"))
+        self.assertEqual(R.asked, ["VLAN design rules 1200", "Can I use VLAN 1200 for a customer?"])
+        self.assertIn("1000 and above are reserved", model.tool_results()[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

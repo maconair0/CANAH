@@ -104,6 +104,7 @@ class Settings:
     max_tokens_per_request: int = 0
     # The longest one request may run, in seconds, across the main agent and every subagent (0: no limit).
     max_seconds: int = 600
+    task_seconds: int = 0              # one delegated task's share of it; 0: a third of what is left
     # The model's input window in tokens (0: from the model: its profile, or Ollama's num_ctx less num_predict).
     context_window: int = 0
     # Compact the conversation at this share of the window: the older part summarised (and saved under

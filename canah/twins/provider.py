@@ -207,7 +207,9 @@ class TwinsProvider:
             now = time.time()
             seen = [x for x in self._asked.get(domain, []) if now - x < 120]
             self._asked[domain] = seen + [now]
-            out = {"domain": domain, "twin": d.name, "example": info.example, "kpis": info.kpis, "answers": info.answers}
+            out = {"domain": domain, "twin": d.name, "example": info.example, "kpis": info.kpis, "answers": info.answers,
+                   "snapshot_id": ("leave it empty for a network the operator described or you built from live reads; set it "
+                                   "only to a snapshot you took just now: a stored one over an hour old is rejected")}
             if seen:
                 out["note"] = "You already have this example. Build the scenario now and call twin_validate; do not ask again."
             return json.dumps(out)
@@ -237,8 +239,8 @@ class TwinsProvider:
 
         def twin_check_write(controller: str, tool: str, arguments: Dict[str, Any] = None, answers: Dict[str, Any] = None) -> str:
             """Try a controller write in the twin in use BEFORE sending it, with exactly the arguments you will send.
-            Do what `next` says: propose, send it (the operator approves it); reject, do not; ask_operator,
-            gather_more_data or not_modelled, ask the operator. A write without a passing check is held back."""
+            Do what `next` says: propose, send it (the operator approves it); reject, do not; ask_operator or
+            gather_more_data, ask the operator; not_modelled, send it (it goes to approval alone)."""
             try:
                 t = self._twin()
                 if not t.can_check_writes():
@@ -249,6 +251,10 @@ class TwinsProvider:
                 return f"Error: {e}"
             rec = self.checks.keep(c, t.name)
             out = c.model_dump(exclude={"result"})
+            if c.action == "not_modelled":
+                # The same rule as the write gate: a change the twin cannot represent is not held by it.
+                out["next"] = ("The twin cannot check this kind of change. Send the write as planned: it goes to the "
+                               "operator's approval alone, and the result says it was not checked.")
             if c.result is not None and c.result.ok:
                 out["prediction"] = compact(c.result)
             out["twin"] = rec["twin"]
@@ -262,14 +268,19 @@ class TwinsProvider:
             try:
                 rec = self.checks.override(check_id, reason, _user())
             except KeyError as e:
-                return f"Error: {e}"
+                return (f"Error: {e}. An override is only for a check the write gate held: its id is in the 'Not sent' "
+                        f"message of the held write, and the operator must have said to go ahead anyway. To make a "
+                        f"change, send it (or hand it to the domain's config agent): the gate checks it in the twin "
+                        f"by itself.")
             call = f"{rec['controller']}__{rec['tool']}"
             return json.dumps({"ok": True, "check_id": check_id, "override": rec["override"], "send_as": call,
                                "arguments": rec["arguments"],
-                               "next": f"Send the write now: call {call} with exactly {json.dumps(rec['arguments'])}. If you do not "
-                                       f"hold that tool, delegate to the {rec['controller']} subagent with these words: \"Call {call} "
-                                       f"now with arguments {json.dumps(rec['arguments'])}; the twin's check {check_id} was "
-                                       f"overridden by the operator.\" Then read the result back."})
+                               "next": f"Send the write now, once: {rec['tool']} on {rec['controller']} with exactly "
+                                       f"{json.dumps(rec['arguments'])}. If you do not hold the write, hand it with `task` to "
+                                       f"the config agent for {rec['controller']}'s domain, in these words: \"Make this change "
+                                       f"now: {rec['tool']} on {rec['controller']} with {json.dumps(rec['arguments'])}; the "
+                                       f"twin's check {check_id} was overridden by the operator.\" Do not override again: "
+                                       f"the gate lets this exact write through now."})
 
         def twin_extra(name: str, arguments: Dict[str, Any] = None) -> str:
             """Call one of the twin's own read-only helpers by name (twin_list lists them with their arguments):

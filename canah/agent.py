@@ -29,7 +29,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
 from .notify import Notifier
-from .grounding import DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, TimeBudget
+from .grounding import DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, TimeBudget
 from .identity import OBSERVER, Identity
 from . import memory as mem
 from .config import Settings, load
@@ -455,7 +455,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                       "system_prompt": ("You do one self-contained piece of work for the main agent and report the "
                                         "result briefly. Read before you conclude; a change is paused for approval.")})
     shared = [t for t in tools if t.name in set(got.get("shared") or [])]
-    budget = TimeBudget()
+    budget = TimeBudget(settings.task_seconds)
     from .ops import Ops
     from .safety import GuardMemory, RecordWrites, RepeatGuard, RunTracker, ScreenOutput
     ops = Ops(settings.home_path / "ops.sqlite") if settings.audit else None
@@ -465,12 +465,16 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     for spec in specs:
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
-        spec["middleware"] = [budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
+        spec["middleware"] = [*_retry(), budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
                               *list(spec.get("middleware") or []),
+                              *([MakeTheChange(writes)] if team_specs and spec["name"].endswith("-config") else []),
                               *extra_mw]
         if spec.get("tools") is not None and shared:
             have = {t.name for t in spec["tools"]}
-            spec["tools"] = [*spec["tools"], *[t for t in shared if t.name not in have]]
+            give = shared
+            if team_specs and spec["name"] != "qot":
+                give = [t for t in shared if t.name not in ("twin_check_write", "twin_override")]
+            spec["tools"] = [*spec["tools"], *[t for t in give if t.name not in have]]
     backend, skill_paths, memory_paths = backends.build(settings, sandbox)
     memory = memory or mem.open_memory(settings.home_path)
     if settings.memory_ttl_days:
@@ -490,12 +494,20 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     else:
         prompt += ("\n\nThere is no sandbox in this session" + (f" ({sandbox_note})" if sandbox_note else "")
                    + ": you cannot run commands, only call your tools.")
-    if got["instructions"]:
-        prompt += "\n\n" + got["instructions"]
+    notes = got["instructions"]
+    if team_specs and twin_provider:
+        # The twin's how-to is qot's (it is in qot's prompt); the supervisor gets what is its own.
+        notes = notes.replace(twin_provider[0].instructions().strip(), "").strip()
+    if notes:
+        prompt += "\n\n" + notes
     if team_specs:
-        prompt += ("\n\nWith your team, rehearsing in the digital twin is qot's: you do not hold twin_schema, twin_validate, "
-                   "twin_predict, twin_check_write or twin_extra. Hand every what-if, and every change before it is made, to "
-                   "qot with `task`; where the twin instructions above say to call those tools, qot does.")
+        prompt += ("\n\nThe digital twin, with your team: twin_list says which twin is in use. Rehearsing in it is qot's: "
+                   "hand every what-if, 'is it safe' and quality question to qot with `task`, and answer from its "
+                   "PROPOSAL and TWIN lines. A change you hand straight to the domain's config agent: its write is "
+                   "checked in the twin automatically before it is sent (the write gate), so you do not check it "
+                   "yourself. If the gate holds a write, the config agent reports the check id and the twin's reasons: "
+                   "tell the operator. twin_override is only for that held check, by its real id, after the operator "
+                   "said in words to go ahead anyway; never on your own judgement and never with an id you made up.")
 
     hidden = set(got.get("subagent_only") or [])
     if team_specs:
@@ -520,7 +532,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             tools=main_tools,
             system_prompt=prompt,
             middleware=[budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                        KeepAnswer(), *([DelegationGuard()] if team_specs else []), *_fallback(),
+                        KeepAnswer(), *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")])] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
                         *compact_mw],
             subagents=specs or None,
@@ -583,23 +595,40 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
              "description": ("The quality-of-transmission agent. Watches the networks' quality and health (margins, OSNR, "
                              "pre-FEC BER, availability, delay, loss, incidents, trends), rehearses what-ifs and changes in "
                              "the digital twin, and proposes the exact configuration to apply with the twin's decision, "
-                             "probability and trust. Give it any what-if, any 'is it safe', any degradation, and every "
-                             "change before a config agent makes it. It changes nothing itself."),
+                             "probability and trust. Give it any what-if, any 'is it safe', any degradation, and the "
+                             "fix for an incident. A plain change goes straight to the config agent (the write gate "
+                             "rehearses it). It changes nothing itself."),
              "system_prompt": ("You are CANAH's quality-of-transmission agent. You read every domain and you work the digital "
                                "twin; you change nothing. For a question about quality or health: read it (net_read_ tools, "
                                "incidents, health_over_time, network_changes) and report the figures as read. For a what-if "
                                "or a change: build the twin's scenario from what you read (twin_schema for its format), "
                                "twin_validate, twin_predict; for a write to a controller, twin_check_write with exactly the "
-                               "arguments it would send. Build every scenario from what you read now with the net_read_ "
-                               "tools, never from a stored snapshot (twin_extra snapshots, inspect and subnetwork may be "
+                               "arguments it would send. A network the operator describes, or the twin's own example when "
+                               "they ask for it (twin_schema), is used as given. Otherwise build the scenario from what "
+                               "you read now with the net_read_ tools, never from a stored snapshot (twin_extra snapshots, inspect and subnetwork may be "
                                "hours old, and the twin refuses a stale one; for a packet controller, twin_extra mirror "
                                "reads it fresh). End with:\n"
                                "PROPOSAL: the exact configuration (domain, controller, verb or tool, arguments), or none\n"
                                "TWIN: the decision, probability with its interval, trust tier, and what it does not model\n"
                                "If the twin cannot model the change (not_modelled, or no twin for that domain), say so in "
                                "TWIN: the PROPOSAL still stands, and the operator's approval alone decides.\n"
+                               "If the twin says gather_more_data only because its trust is low (tier C, uncalibrated) "
+                               "or the probability interval is wide, that is a warning, not a stop: still give the "
+                               "PROPOSAL, and say in TWIN that its trust is low. Only a reject (the change predicted to "
+                               "fail) makes the PROPOSAL none; then say what was rejected and why. For a failure in the "
+                               "network, the PROPOSAL is the fix that restores the service (reroute, restore, move), "
+                               "as an exact change.\n"
                                "Never say a change is made: the supervisor hands your proposal to the domain's config agent."),
              "tools": chosen}]
+
+
+def _retry() -> List[Any]:
+    """A failed model call is tried again (twice, short backoff) before the run fails: a local model now and then
+    returns a tool call whose JSON is cut short (llama-server: "invalid tool call arguments ... unexpected end of
+    JSON input", HTTP 500), and one such reply ended a whole incident investigation. After the retries, the error
+    comes back as the agent's reply instead of an exception, so the run says what failed."""
+    from langchain.agents.middleware import ModelRetryMiddleware
+    return [ModelRetryMiddleware(max_retries=2, initial_delay=0.5, max_delay=4.0, on_failure="continue")]
 
 
 def _fallback() -> List[Any]:

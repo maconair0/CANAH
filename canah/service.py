@@ -618,9 +618,11 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                   + ("First find the likely cause: one object whose failure explains the others (a fibre under a lightpath "
                      "under a link under a service). Read only what the evidence does not already say. "
                      + ("Do not change anything. " if mode == "investigate" else
-                        "Then propose the fix: hand it to the domain's config agent with the exact change; its write is "
-                        "checked in the digital twin before it is sent and waits for an operator's approval. If no fix can "
-                        "be made by a tool, say what the operator should do. ")
+                        "Then propose the fix: hand it to the domain's config agent with the exact change (a reroute, "
+                        "a restore, a move to a backup path); its write is checked in the digital twin before it is sent "
+                        "and waits for an operator's approval, which is where the operator decides. Low trust in the twin "
+                        "(gather_more_data, tier C) is a caveat to report, not a reason to hold back the proposal; "
+                        "only a twin reject is. If no fix can be made by a tool, say what the operator should do. ")
                      + "End with four lines:\nCAUSE: ...\nAFFECTS: ...\nFIX: ... (waiting for approval, for the operator to "
                        "do, or none)\nCONFIDENCE: high, medium or low, and why."))
         for g in group:
@@ -630,6 +632,19 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             return
         try:
             r = A().ask(prompt, key, WATCH_WHO, max_seconds=A().settings.investigate_seconds)
+            fix = next((ln.split(":", 1)[1].strip() for ln in (r.text or "").splitlines()
+                        if ln.strip().upper().startswith("FIX:")), "")
+            if mode == "propose" and not r.pending and fix and not re.search(
+                    r"^(none|no fix|nothing)\b|for the operator|operator (should|must|to)|replace|physical|on site|"
+                    r"technician|vendor|check the", fix, re.I):
+                # A fix a tool can make, written in the report but not handed on: hand it on now, once, so it
+                # waits for approval rather than for someone to read the report.
+                r2 = A().ask(f"Hand this FIX to the domain's config agent now, with the exact change, so it waits for the "
+                             f"operator's approval: {fix[:600]}. If no tool can make it, say so in one line.",
+                             key, WATCH_WHO, max_seconds=max(120, A().settings.investigate_seconds // 3))
+                if r2.pending:
+                    import dataclasses
+                    r = dataclasses.replace(r, pending=r2.pending, text=(r.text or "") + "\n\n" + (r2.text or ""))
             note = f"a fix waits for approval: {', '.join(p['name'] for p in r.pending)}" if r.pending else ""
             for g in group:
                 incidents.set(g["id"], report=r.text, note=note)

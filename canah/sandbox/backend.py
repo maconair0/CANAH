@@ -65,6 +65,22 @@ class SandboxBackend(BaseSandbox):
             text = text[:MAX_OUTPUT_CHARS] + f"\n... [{len(text) - MAX_OUTPUT_CHARS} more characters cut]"
         return ExecuteResponse(output=text, exit_code=code, truncated=truncated)
 
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000):
+        """read_file, without execute's output cap: deepagents returns a page of the file through the command's
+        output as JSON and caps it itself (about 500 KiB), so cutting it at MAX_OUTPUT_CHARS broke the JSON and
+        every read of a large one-line result failed ("unexpected server response")."""
+        from deepagents.backends.sandbox import _build_read_cmd, _parse_read_output
+        try:
+            out, err, code = self.runtime.run(["bash", "-c", _build_read_cmd(file_path, offset, limit)],
+                                              float(self.default_timeout))
+        except Exception as e:  # noqa: BLE001
+            out = f"Error: the sandbox did not run it: {type(e).__name__}: {e}"
+        return _parse_read_output(out, file_path)
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000):
+        import asyncio
+        return await asyncio.to_thread(self.read, file_path, offset, limit)
+
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         out = []
         for path, data in files:

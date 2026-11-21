@@ -27,7 +27,9 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Annotated, Any, Dict, List, Optional, Protocol, runtime_checkable
+
+from langgraph.prebuilt import InjectedState
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -194,7 +196,8 @@ class CitationGuard(AgentMiddleware):
         if not cited:
             return None
         # The current question's turn: from the last human message on.
-        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=0)
+        from ..grounding import turn_start
+        start = turn_start(msgs)
         turn = msgs[start:]
         if any(isinstance(m, HumanMessage) and _GUARD in str(m.content) for m in turn[1:]):
             return None                      # sent back once already this turn
@@ -209,6 +212,42 @@ class CitationGuard(AgentMiddleware):
             f"answer without any citation and say it is general knowledge, not from the documents."))]}
 
 
+_DOCS_GUARD = "[documents check]"
+_ASKS_DOCS = re.compile(r"\b(design rules?|the rules|the documents?|the docs|documentation|runbooks?|polic(y|ies)|"
+                        r"the standard|according to|the manual|the guide|as written)\b", re.I)
+_SEARCHES = {"search_knowledge", "research_knowledge", "knowledge_sources"}
+
+
+class DocsFirst(AgentMiddleware):
+    """A question that points at the documents ("use the design rules") answered without searching them is sent
+    back once: the rule is in the corpus, not in the network reads."""
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
+            return None
+        from ..grounding import anchored, current_question, is_keep
+        if is_keep(msgs[-1].content):
+            return None
+        q = current_question(msgs) or ""
+        if not _ASKS_DOCS.search(q) or len(q) > 600:
+            return None
+        from ..grounding import turn_start
+        start = turn_start(msgs)
+        turn = msgs[start:]
+        if any(isinstance(m, HumanMessage) and _DOCS_GUARD in str(m.content) for m in turn):
+            return None
+        looked = any(isinstance(m, AIMessage) and any(c.get("name") in _SEARCHES or (c.get("name") == "task" and
+                     (c.get("args") or {}).get("subagent_type") == "librarian") for c in (m.tool_calls or [])) for m in turn)
+        if looked:
+            return None
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+            f"{_DOCS_GUARD} The operator pointed you at the documents, and you have not searched them this turn. "
+            f"Call search_knowledge with the operator's question in their words, answer from what it returns, and "
+            f"cite it; if it returns nothing, say the documents do not cover it.", msgs, keep=False))]}
+
+
 class KnowledgeProvider:
     """The RAG as tools and a librarian subagent (a ToolProvider)."""
 
@@ -217,10 +256,17 @@ class KnowledgeProvider:
         self.librarian_model = librarian_model
         self._tools = self._make()
 
-    def _search(self, query: str, k: int, chars: int) -> str:
+    def _search(self, query: str, k: int, chars: int, question: str = "") -> str:
         try:
             if hasattr(self.retriever, "retrieve"):
                 got = self.retriever.retrieve(query, top_k=k)
+                if got.get("abstained") and question and question.strip().lower() != query.strip().lower():
+                    # A model searches in keywords ("VLAN design rules 1200 range restrictions"), which a
+                    # cross-encoder trained on questions scores near zero; the operator's own question is the
+                    # better query, so it is tried before saying the documents do not cover it.
+                    again = self.retriever.retrieve(question[:500], top_k=k)
+                    if not again.get("abstained"):
+                        return render(again["hits"][:k], chars, question)
                 if got.get("abstained"):
                     return render_abstention(got)
                 hits = got["hits"]
@@ -231,18 +277,26 @@ class KnowledgeProvider:
         return render(hits[:k], chars, query)
 
     def _make(self) -> List[BaseTool]:
-        def search_knowledge(query: str) -> str:
+        def asked(state: Any) -> str:
+            try:
+                from ..grounding import current_question
+                msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+                return current_question(msgs) or ""
+            except Exception:  # noqa: BLE001 - outside a run: no question to fall back to
+                return ""
+
+        def search_knowledge(query: str, state: Annotated[Any, InjectedState] = None) -> str:
             """Search the document corpus (standards, papers, manuals, the system's own docs) for a quick fact.
             Returns a few short passages, each with its citation [source p.N]. Use a passage only if it states the
             fact for exactly the thing asked (the same standard, product, version); a value from another setup is not
             an answer. If none does, say the corpus does not state it. For a question that needs reading and
             combining several documents, delegate to the librarian subagent instead."""
-            return self._search(query, QUICK_K, QUICK_CHARS)
+            return self._search(query, QUICK_K, QUICK_CHARS, asked(state))
 
-        def research_knowledge(query: str, k: int = DEEP_K) -> str:
+        def research_knowledge(query: str, k: int = DEEP_K, state: Annotated[Any, InjectedState] = None) -> str:
             """Search the corpus widely and return full passages with citations, for reading and combining.
             Search again with other words when the first passages do not answer the question."""
-            return self._search(query, max(1, min(int(k), 12)), DEEP_CHARS)
+            return self._search(query, max(1, min(int(k), 12)), DEEP_CHARS, asked(state))
 
         def knowledge_sources() -> str:
             """List the documents in the corpus, with how many indexed passages each has."""
@@ -288,7 +342,7 @@ class KnowledgeProvider:
         return ["search_knowledge"]
 
     def middleware(self) -> List[AgentMiddleware]:
-        return [CitationGuard()]
+        return [CitationGuard(), DocsFirst()]
 
     def instructions(self) -> str:
         return ("Documents (standards, papers, manuals, this system's own docs) are searched with search_knowledge "

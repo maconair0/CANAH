@@ -194,6 +194,65 @@ def alarms_of(data: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _object(inc: Dict[str, Any]) -> str:
+    fp = str(inc.get("fp") or "")
+    return fp.split(":", 2)[-1] if fp.count(":") >= 2 else ""
+
+
+def related_groups(group: List[Dict[str, Any]], relations: List[Dict[str, Any]],
+                   controllers: Optional[List[Dict[str, Any]]] = None) -> List[List[Dict[str, Any]]]:
+    """The incidents, split into the sets whose objects are linked through the published relations (what carries
+    what, across controllers) and the topology (a link and the devices at its ends). An incident with no network
+    object (a controller unreachable) stands alone."""
+    relations = list(relations)
+    for c in controllers or []:
+        for l in c.get("links") or []:
+            for end in (l.get("a"), l.get("z")):
+                if l.get("id") and end:
+                    relations.append({"from": f"{c.get('key')}:{l['id']}", "to": f"{c.get('key')}:{str(end).split(':')[0]}"})
+    if len(group) < 2:
+        return [group] if group else []
+    parent: Dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for r in relations:
+        a, b = str(r.get("from") or ""), str(r.get("to") or "")
+        if a and b:
+            parent[find(a)] = find(b)
+    nodes = list(parent)
+
+    def touches(obj: str) -> set:
+        if not obj:
+            return set()
+        hit = {find(n) for n in nodes if obj == n or n.endswith(":" + obj) or n.endswith(obj) or (":" + obj + ":") in n}
+        return hit or {"obj:" + obj}
+
+    sets = [(inc, touches(_object(inc)) if inc.get("kind") != "controller_unreachable" else set()) for inc in group]
+    out: List[List[Dict[str, Any]]] = []
+    used = [False] * len(sets)
+    for i, (inc, roots) in enumerate(sets):
+        if used[i]:
+            continue
+        used[i] = True
+        part, seen = [inc], set(roots)
+        if roots:
+            grew = True
+            while grew:
+                grew = False
+                for j, (other, r2) in enumerate(sets):
+                    if not used[j] and r2 and (r2 & seen):
+                        used[j], grew = True, True
+                        part.append(other)
+                        seen |= r2
+        out.append(part)
+    return out
+
+
 class Watcher:
     """Polls the networks through the contract; incidents, notifications, runbooks and history follow."""
 
@@ -305,13 +364,17 @@ class Watcher:
                                link=f"/#incident-{inc['id']}", data={"incident": inc["id"], "controller": inc["controller"]})
             if rb and rb["mode"] in ("investigate", "propose"):
                 group.append({**self.store.get(inc["id"]), "runbook_spec": rb})
-        # What opened together is one event until shown otherwise (a fibre cut opens the fibre, the lightpath on it,
-        # the packet link it carries and the service over that): one investigation, with the evidence gathered here.
-        if group and self.respond:
+        # What opened together and depends on each other is one event (a fibre cut opens the fibre, the lightpath on
+        # it, the packet link it carries and the service over that): one investigation, with the evidence gathered
+        # here. What is not linked (a controller that stops answering, an alarm elsewhere) is investigated on its own,
+        # so one cause is not read into unrelated faults.
+        for part in related_groups(group, got["topology"].get("relations") or [], got["topology"].get("controllers")):
+            if not self.respond:
+                break
             try:
-                self.respond(group, self.evidence(group, got))
+                self.respond(part, self.evidence(part, got))
             except Exception:  # noqa: BLE001
-                logger.exception("responding to incidents %s failed", [i["id"] for i in group])
+                logger.exception("responding to incidents %s failed", [i["id"] for i in part])
         for inc in changes["resolved"]:
             if inc:
                 self.notifier.send("incident_resolved", inc["severity"], f"Resolved: {inc['title']}",

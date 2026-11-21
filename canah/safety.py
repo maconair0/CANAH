@@ -15,10 +15,11 @@ same request's numbers.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, ToolMessage
@@ -88,7 +89,7 @@ class RepeatGuard(AgentMiddleware):
     """The same tool with the same arguments, a third time in one request, is not run: it answers the same.
     The model is told to use what it has (a model on a loop otherwise spends the whole request there)."""
 
-    def __init__(self, limit: int = 2, max_pages: int = 8):
+    def __init__(self, limit: int = 2, max_pages: int = 3):
         super().__init__()
         self.limit, self.max_pages = limit, max_pages
 
@@ -105,8 +106,10 @@ class RepeatGuard(AgentMiddleware):
             seen[pk] = seen.get(pk, 0) + 1
             if seen[pk] > self.max_pages:
                 return ToolMessage(tool_call_id=call["id"], name="read_file", status="error", content=(
-                    f"Not read: {seen[pk] - 1} pages of {args['file_path']} already in this request. Stop paging: grep it "
-                    f"for what the question needs, or answer now with what you have read."))
+                    f"Not read: {seen[pk] - 1} pages of {args['file_path']} already in this request. Paging a long result "
+                    f"page by page does not find a value in it. Compute it instead: with execute (python3 or jq, if you "
+                    f"have the sandbox), load the file and keep only what the question asks (for example the items whose "
+                    f"error count is above 0), or grep it for the field. Then answer from that."))
         key = f"{call.get('name')}:{json.dumps(args, sort_keys=True, default=str)}"
         seen[key] = seen.get(key, 0) + 1
         if seen[key] <= self.limit:
@@ -167,7 +170,14 @@ class ScreenOutput(AgentMiddleware):
         return self._screen(request, await handler(request))
 
 
+_SENT: "contextvars.ContextVar" = contextvars.ContextVar("canah_writes_sent", default=None)
+
+
 class RecordWrites(AgentMiddleware):
+    """Audits every write, asks for a read-back after it, and puts on a delegated task's report the exact writes
+    that were sent in it and what each returned: the supervisor sees what was done, not only what the subagent
+    says it did (a config agent once left out `over` and still reported the service over L-ab)."""
+
     def __init__(self, writes: Iterable[str], ops: Any = None):
         super().__init__()
         self.writes = set(writes)
@@ -179,6 +189,9 @@ class RecordWrites(AgentMiddleware):
             return result
         c = _cfg()
         text = result.content if isinstance(result.content, str) else str(result.content)
+        sent = _SENT.get()
+        if sent is not None:
+            sent.append({"tool": name, "args": request.tool_call.get("args"), "result": text.split("\n\n[")[0][:300]})
         if self.ops is not None:
             self.ops.audit("executed", c.get("user_id", ""), c.get("level", ""), c.get("thread_id", ""), name,
                            request.tool_call.get("args"), result=text)
@@ -189,10 +202,47 @@ class RecordWrites(AgentMiddleware):
             "\n\n[The change was sent. Before you report it as done, read the object back with a read tool and "
             "say what you found.]")})
 
+    @staticmethod
+    def _report(result, sent: List[Dict[str, Any]]):
+        if not sent:
+            return result
+        upd = getattr(result, "update", None)
+        if not isinstance(result, ToolMessage) and isinstance(upd, dict) and upd.get("messages"):
+            # The task tool answers with a Command whose last message is the subagent's report.
+            msgs = list(upd["messages"])
+            if isinstance(msgs[-1], ToolMessage):
+                msgs[-1] = RecordWrites._report(msgs[-1], sent)
+                from langgraph.types import Command
+                return Command(graph=result.graph, update={**upd, "messages": msgs}, resume=result.resume,
+                               goto=result.goto)
+            return result
+        if not isinstance(result, ToolMessage):
+            return result
+        text = result.content if isinstance(result.content, str) else str(result.content)
+        rows = "\n".join(f"- {w['tool']} {json.dumps(w['args'], default=str)[:600]} -> {w['result']}" for w in sent)
+        return result.model_copy(update={"content": text + (
+            "\n\n[Writes sent in this task, exactly as sent (from the harness, not the agent):\n" + rows +
+            "\nCompare them with the change you asked for. If a value you gave is missing or different, say so and "
+            "have it corrected; do not report it as done the way you asked.]")})
+
     def wrap_tool_call(self, request, handler: Callable):
+        if request.tool_call.get("name") == "task" and _SENT.get() is None:
+            tok = _SENT.set([])
+            try:
+                got = handler(request)
+                return self._report(got, _SENT.get())
+            finally:
+                _SENT.reset(tok)
         return self._after(request, handler(request))
 
     async def awrap_tool_call(self, request, handler: Callable):
+        if request.tool_call.get("name") == "task" and _SENT.get() is None:
+            tok = _SENT.set([])
+            try:
+                got = await handler(request)
+                return self._report(got, _SENT.get())
+            finally:
+                _SENT.reset(tok)
         return self._after(request, await handler(request))
 
 

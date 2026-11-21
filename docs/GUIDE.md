@@ -230,9 +230,17 @@ same tools; what differs is who holds which.
 | **<domain>-config** (one per network domain: `packet-config`, `optical-config`, `data-centre-config` …) | the same tools, cut to that domain's controllers, writes included (`net_provision`, `net_adjust`, `controller_write` …) | makes exactly the change it was given, which waits for approval, then reads it back |
 | librarian, general-purpose | documents; the supervisor's tools | as before |
 
-A change goes from the supervisor to `qot` (rehearse and propose), then to the domain's config agent (apply). The
+A change goes from the supervisor straight to the domain's config agent. Its write is rehearsed in the twin by the
+write gate before it is sent, then waits for approval, so nothing has to rehearse it twice. `qot` takes the what-ifs,
+"is it safe", quality questions, and incident fixes. A plain change ("create LP-3 …") handed to `qot` is turned back
+to the config agent (`DelegationGuard`). Config agents hold no twin tools of their own: the gate checks their writes,
+and an override (`twin_override`) is the operator's, through the supervisor, for a check the gate really held. The
 approval, the twin's write gate and the scopes apply in every agent, because they are middleware on every
-agent. The domains come from what each controller declares to the agentic MCP, so a new domain gets its config
+agent.
+
+Every read verb (and `controller_read`) takes `match`, comma-separated words such as `'xpdr-b2, xpdr-c2'`. The
+harness, not the controller, cuts every list in the answer to the items that mention them. A 13-node optical inventory
+with 24 ports each becomes the two transponders asked about. It works the same on every controller. The domains come from what each controller declares to the agentic MCP, so a new domain gets its config
 agent at the next reload. `team: false` goes back to one agent doing it all.
 
 ## Operations: incidents, runbooks, history, notifications, scopes
@@ -251,7 +259,9 @@ MCP accepts is covered with no new code.
   controller or text:
   - `notify` only sends the incident;
   - `investigate` has CANAH look into it in a thread of its own (`canah-watch.incident-<id>`) and write a report;
-  - `propose` also rehearses a fix in the digital twin and proposes it.
+  - `propose` also hands the fix to the domain's config agent. The write gate rehearses it in the twin, and the fix
+    waits for approval. Low trust in the twin (`gather_more_data`, tier C) is reported with the proposal; only a
+    twin `reject` holds it back.
 
   A fix always waits for a person: approve or reject it on the incident. At most `respond_per_hour`
   investigations start on their own; `respond: false` stops them.
@@ -296,12 +306,26 @@ Each check sends an answer back once, with the reason, for the model to correct 
 | grounding | values, counts and names in an answer (decimals, long numbers, ids, labelled or quoted values) that no tool returned and the operator didn't say |
 | citation | a `[source p.N]` citation of a source no tool returned |
 | follow-through | an answer that announces its next step, says it lacks data its tools can get, or (for someone who may approve) asks "shall I proceed?" in text instead of making the change for approval |
-| look first | a substantial answer given without looking anything up |
+| look first | a substantial answer given without looking anything up (not an observer's change, whose answer is that an admin must ask) |
+| documents | a question that points at the documents ("use the design rules") answered without searching them |
+| delegation | a what-if answered without `qot`; a plain change handed to `qot`; an admin's change ending in a plan or "shall I?" with nothing handed to a config agent; an observer's change sent to a config agent |
+| make the change | (config agents) a task report with no write tried |
+
+The checks share one notion of "this turn": every check's own messages are skipped, so one check's send-back is
+never taken by another for a new question with nothing read yet.
+
+Writes are reported by the harness, not only by the agent: a delegated task's result ends with every write sent in
+it, exactly as sent, and what each returned, so the supervisor compares what was done with what it asked for.
+
+A knowledge search that finds nothing for the model's keywords tries the operator's own question once before it
+says the documents do not cover it. A cross-encoder trained on questions scores keyword strings near zero.
 
 In every subagent too:
 - **Screening:** text from a tool that reads like instructions to the model is fenced as data.
 - **Read-back:** after an approved change, the agent is told to read the object back before reporting success.
 - **Budgets:** each request has a time budget (`max_seconds`) and an optional token budget, across the main agent and all subagents.
+  One delegated task gets a share of it (`task_seconds`, by default a third of what is left). A subagent that goes in
+  circles ends with what it had, and the supervisor still has time to act or say so.
 
 ## Digital twins
 
@@ -393,6 +417,7 @@ These go in `canah.yaml`, or in the environment as `CANAH_<NAME>` for the common
 | `interrupt_on` | none | more tool calls that pause for approval: `{pattern: true \| {allowed_decisions, description}}` |
 | `middleware` | none | extra LangChain middleware for every agent, as `package.module:Class` |
 | `max_seconds` | 600 | time budget per request |
+| `task_seconds` | 0 (a third of what is left) | one delegated task's share of it |
 | `max_tokens_per_request` | 0 (none) | token budget per request |
 | `approval_ttl_s` | 3600 | how long an approval stays open |
 | `notify_url` | none | webhook for changes waiting |

@@ -269,7 +269,7 @@ class Paging(unittest.TestCase):
         model = ScriptedModel(script=[call("read_file", file_path="/big.txt", offset=i * 100) for i in range(10)] + [say("Done.")])
         a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
         a.ask("read it all")
-        self.assertIn("Stop paging", model.tool_results(-1)[-1])
+        self.assertIn("Compute it instead", model.tool_results(-1)[-1])
 
 
 class Delegation(unittest.TestCase):
@@ -280,3 +280,117 @@ class Delegation(unittest.TestCase):
             self.assertTrue(_WHATIF.search(q), q)
         for q in ["Which routers are down?", "List the lightpaths.", "describe yourself"]:
             self.assertFalse(_WHATIF.search(q), q)
+
+    def test_a_plain_change_handed_to_qot_is_turned_back_to_the_config_agent(self):
+        from types import SimpleNamespace
+        from langchain_core.messages import HumanMessage
+        from canah.grounding import DelegationGuard
+        g = DelegationGuard(config_agents=["optical-config"])
+        ran = []
+
+        def ask(question, kind="qot"):
+            req = SimpleNamespace(tool_call={"name": "task", "id": "t1", "args": {"subagent_type": kind, "description": "x"}},
+                                  state={"messages": [HumanMessage(content=question)]})
+            return g.wrap_tool_call(req, lambda r: ran.append(question) or "ran")
+
+        out = ask("Create a 100G lightpath named LP-3 between xpdr-c2 and xpdr-b2.")
+        self.assertIn("optical-config", out.content)
+        self.assertEqual(ran, [])
+        self.assertEqual(ask("What if fibre F-ab is cut?"), "ran")                     # a what-if is qot's
+        self.assertEqual(ask("Is it safe to create LP-3 at 400G?"), "ran")
+        self.assertEqual(ask("Create LP-3.", kind="optical-config"), "ran")             # the right agent: untouched
+
+
+class TaskShare(unittest.TestCase):
+    def test_a_delegated_task_ends_at_its_share_of_the_time(self):
+        import time
+        from types import SimpleNamespace
+        from canah.grounding import TimeBudget, _TASK_DEADLINE
+        b = TimeBudget(task_seconds=0.01)
+        seen = []
+
+        def subagent(_):
+            time.sleep(0.03)
+            seen.append(b.before_model({"messages": []}, None))
+            return "done"
+
+        b.wrap_tool_call(SimpleNamespace(tool_call={"name": "task"}), subagent)
+        self.assertEqual(seen[0]["jump_to"], "end")
+        self.assertIn("share of time", seen[0]["messages"][0].content)
+        self.assertEqual(_TASK_DEADLINE.get(), 0.0)                                     # the supervisor's own steps go on
+        self.assertIsNone(b.before_model({"messages": []}, None))
+
+
+class ChangeAndDocs(unittest.TestCase):
+    def test_an_admins_change_answered_with_a_question_is_sent_back_once(self):
+        from unittest import mock
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import DelegationGuard
+        g = DelegationGuard(config_agents=["data-centre-config"])
+        msgs = [HumanMessage(content="Connect tenant blue to VS-100."), AIMessage(content="Would you like me to proceed?")]
+        got = {}
+        for level in ("admin", "observer"):
+            with mock.patch("langgraph.config.get_config", return_value={"configurable": {"level": level}}):
+                got[level] = g.after_model({"messages": msgs}, None)
+        self.assertIn("data-centre-config", got["admin"]["messages"][0].content)
+        self.assertIsNone(got["observer"])                       # an observer is told it needs an admin instead
+
+    def test_a_question_about_the_rules_answered_without_the_documents_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.knowledge import DocsFirst
+        d = DocsFirst()
+        q = HumanMessage(content="Can I use VLAN 1200 for a customer? Use the design rules.")
+        out = d.after_model({"messages": [q, AIMessage(content="Yes, it is free.")]}, None)
+        self.assertIn("search_knowledge", out["messages"][0].content)
+        searched = AIMessage(content="", tool_calls=[{"name": "search_knowledge", "args": {"query": "x"}, "id": "1"}])
+        self.assertIsNone(d.after_model({"messages": [q, searched, AIMessage(content="No: reserved.")]}, None))
+
+    def test_a_config_agent_that_made_no_write_is_sent_back_once(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import MakeTheChange
+        g = MakeTheChange(["net_provision", "controller_write"])
+        ask = HumanMessage(content="Connect tenant blue to VS-100.")
+        out = g.after_model({"messages": [ask, AIMessage(content="The fabric has connect_tenant_external for this.")]}, None)
+        self.assertIn("[config check]", out["messages"][0].content)
+        tried = AIMessage(content="", tool_calls=[{"name": "controller_write", "args": {}, "id": "1"}])
+        self.assertIsNone(g.after_model({"messages": [ask, tried, AIMessage(content="Held by the twin.")]}, None))
+
+    def test_an_observers_change_is_not_delegated(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from langchain_core.messages import HumanMessage
+        from canah.grounding import DelegationGuard
+        g = DelegationGuard(config_agents=["data-centre-config"])
+        req = SimpleNamespace(tool_call={"name": "task", "id": "t", "args": {"subagent_type": "data-centre-config"}},
+                              state={"messages": [HumanMessage(content="Attach tenant green to leaf-1.")]})
+        with mock.patch("langgraph.config.get_config", return_value={"configurable": {"level": "observer"}}):
+            out = g.wrap_tool_call(req, lambda r: "ran")
+        self.assertIn("admin", out.content)
+
+    def test_one_checks_send_back_is_not_a_new_turn_for_another(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import LookFirst
+        msgs = [HumanMessage(content="Create LP-4."),
+                AIMessage(content="", tool_calls=[{"name": "network_tools", "args": {}, "id": "1"}]),
+                ToolMessage(content="create_lightpath", tool_call_id="1"),
+                HumanMessage(content="[change check] hand it to the config agent"),
+                AIMessage(content="x" * 300)]
+        self.assertIsNone(LookFirst().after_model({"messages": msgs}, None))
+
+
+class ModelHiccup(unittest.TestCase):
+    def test_a_model_call_that_fails_once_is_tried_again(self):
+        class Flaky(ScriptedModel):
+            n: int = 0
+
+            def _generate(self, *a, **k):
+                self.n += 1
+                if self.n == 1:
+                    raise RuntimeError('llama-server returned invalid tool call arguments for "task": '
+                                       'unexpected end of JSON input (status code: 500)')
+                return super()._generate(*a, **k)
+        m = Flaky(script=[say("Recovered.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [FunctionProvider()], model=m,
+                        memory=open_memory(in_memory=True))
+        self.assertEqual(a.ask("hi").text, "Recovered.")
+        self.assertEqual(m.n, 2)

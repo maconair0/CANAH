@@ -149,6 +149,9 @@ class Packet(Domain):
             for end in (a, z):
                 if end.split(":")[0] not in st["routers"]:
                     return f"Error: no router {end}"
+            # Like a real controller: `over` is one of this controller's links, by name.
+            if over and over not in {l["name"] for l in st["links"]}:
+                return f"Error: no link {over} on this controller; links are {', '.join(l['name'] for l in st['links'])}"
             st["services"][name] = {"vlan": int(vlan), "a": a, "z": z, "over": over or "best path", "customer": "",
                                     "status": "up"}
             self._did("create_vlan_service", name=name, vlan=int(vlan), a=a, z=z)
@@ -303,6 +306,8 @@ class Optical(Domain):
             for name, lp in st["lightpaths"].items():
                 for end in (lp["a"], lp["z"]):
                     rel.append({"from": f"optical:{name}", "relation": "ends at", "to": f"optical:{end}"})
+                for fibre in lp.get("path") or []:
+                    rel.append({"from": f"optical:{fibre}", "relation": "carries", "to": f"optical:{name}"})
                 for xp, client in lp.get("client", {}).items():
                     dom, port = client.split(" ", 1)
                     rel.append({"from": f"optical:{xp}", "relation": "hands off to", "to": f"{dom}:{port}"})

@@ -28,6 +28,7 @@ model often derives correctly, and checking them would send back good answers.
 """
 from __future__ import annotations
 
+import contextvars
 import re
 from typing import Any, Dict, List, Optional
 
@@ -144,8 +145,7 @@ class GroundingGuard(AgentMiddleware):
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
             return None
-        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage) and _GUARD not in str(m.content)),
-                    default=0)
+        start = turn_start(msgs)
         turn = msgs[start:]
         if any(isinstance(m, HumanMessage) and _GUARD in str(m.content) for m in turn):
             return None                                   # sent back once already this turn
@@ -197,6 +197,17 @@ _ASKS = re.compile(r"\b(?:please confirm|confirm (?:if|that|whether) you|"
                    r"(?:shall|should) i (?:proceed|go ahead|continue|delete|create|remove|do|make|apply)|"
                    r"if so,? i(?:'ll| will) (?:need|proceed|go ahead)|i(?:'ll| will) need your (?:approval|confirmation)|"
                    r"before proceeding[^.]{0,60}confirm)", re.I)
+
+
+def is_check(m: Any) -> bool:
+    """One of the checks' own messages ("[look-first check] ..."), not the operator's."""
+    return isinstance(m, HumanMessage) and "check]" in str(m.content)[:40]
+
+
+def turn_start(msgs: List[Any]) -> int:
+    """Where this turn begins: the operator's last message. Every check skips every check's messages, so one
+    check's send-back does not look to another like a new question with nothing read yet."""
+    return max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage) and not is_check(m)), default=0)
 
 
 def current_question(msgs: List[Any]) -> str:
@@ -284,8 +295,7 @@ class FollowThrough(AgentMiddleware):
         # A stall ("I now have all the information...") sits at the start; an announced step at the end.
         if not (asks or _ANNOUNCE.search(text[-400:]) or _ANNOUNCE.search(text[:200]) or _LACKS.search(text)):
             return None
-        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
-                     and _NUDGE not in str(m.content) and _GUARD not in str(m.content)), default=0)
+        start = turn_start(msgs)
         if any(isinstance(m, HumanMessage) and _NUDGE in str(m.content) for m in msgs[start:]):
             return None
         if asks:
@@ -309,6 +319,14 @@ class FollowThrough(AgentMiddleware):
 
 
 
+def _observer() -> bool:
+    try:
+        from langgraph.config import get_config
+        return str(((get_config() or {}).get("configurable") or {}).get("level") or "") == "observer"
+    except Exception:  # noqa: BLE001 - outside a run
+        return False
+
+
 class LookFirst(AgentMiddleware):
     """An answer given in a turn where nothing was looked up is sent back once: look it up if it is
     about the system (its live state, its documents), or give the same answer again if it needs no
@@ -328,8 +346,9 @@ class LookFirst(AgentMiddleware):
             return None                 # KeepAnswer drops the check and the KEEP; a kept answer is not sent back
         if len(str(msgs[-1].content or "")) < self.min_chars:
             return None
-        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)
-                     and not any(g in str(m.content) for g in (_LOOK, _GUARD, _NUDGE))), default=0)
+        if _observer() and _CHANGE.search(current_question(msgs) or ""):
+            return None                 # an observer's change: the answer is that an admin must ask, no lookup needed
+        start = turn_start(msgs)
         turn = msgs[start:]
         if any(isinstance(m, ToolMessage) for m in turn):
             return None
@@ -340,10 +359,20 @@ class LookFirst(AgentMiddleware):
             f"state, its configuration, its documents), read it with your tools first and answer from that.", msgs))]}
 
 
+_TASK_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("canah_task_deadline", default=0.0)
+
+
 class TimeBudget(AgentMiddleware):
     """A request has a time budget (settings.max_seconds), across the main agent and every subagent:
     a subagent counts its own steps, so a run that keeps delegating can outlast any step limit.
-    Checked before each model call; once the deadline has passed, the run ends with a reply saying so."""
+    Checked before each model call; once the deadline has passed, the run ends with a reply saying so.
+
+    One delegated task also has its own share (`task_seconds`, default a third of the budget): a subagent that
+    goes round in circles ends with what it had, and the supervisor still has time to act on it or say so."""
+
+    def __init__(self, task_seconds: float = 0):
+        super().__init__()
+        self.task_seconds = float(task_seconds or 0)
 
     @hook_config(can_jump_to=["end"])
     def before_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
@@ -352,12 +381,50 @@ class TimeBudget(AgentMiddleware):
             from langgraph.config import get_config
             deadline = float(((get_config() or {}).get("configurable") or {}).get("deadline") or 0)
         except Exception:  # noqa: BLE001 - outside a run: no budget to hold to
-            return None
+            deadline = 0.0
+        sub = float(_TASK_DEADLINE.get() or 0)
+        if sub and time.time() >= sub and (not deadline or time.time() < deadline):
+            msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+            last = next((str(m.content) for m in reversed(msgs) if isinstance(m, AIMessage) and str(m.content).strip()), "")
+            return {"jump_to": "end", "messages": [AIMessage(content=(
+                "This task ran out of its share of time before finishing, so it stopped. Nothing more will run for it."
+                + (f" What it had last: {last[:800]}" if last else "")))]}
         if not deadline or time.time() < deadline:
             return None
         return {"jump_to": "end", "messages": [AIMessage(content=(
             "I ran out of time for this request before finishing it, so I stopped. Nothing more will run for it. "
             "Ask again more narrowly, or say which part to do first."))]}
+
+    def _share(self) -> float:
+        import time
+        try:
+            from langgraph.config import get_config
+            deadline = float(((get_config() or {}).get("configurable") or {}).get("deadline") or 0)
+        except Exception:  # noqa: BLE001
+            deadline = 0.0
+        share = self.task_seconds or (max(60.0, (deadline - time.time()) / 3) if deadline else 0.0)
+        if not share:
+            return 0.0
+        end = time.time() + share
+        return min(end, deadline) if deadline else end
+
+    def wrap_tool_call(self, request, handler):
+        if str(request.tool_call.get("name")) != "task" or _TASK_DEADLINE.get():
+            return handler(request)
+        tok = _TASK_DEADLINE.set(self._share())
+        try:
+            return handler(request)
+        finally:
+            _TASK_DEADLINE.reset(tok)
+
+    async def awrap_tool_call(self, request, handler):
+        if str(request.tool_call.get("name")) != "task" or _TASK_DEADLINE.get():
+            return await handler(request)
+        tok = _TASK_DEADLINE.set(self._share())
+        try:
+            return await handler(request)
+        finally:
+            _TASK_DEADLINE.reset(tok)
 
 
 _DELEGATE = "[delegation check]"
@@ -366,23 +433,124 @@ _WHATIF = re.compile(r"\b(what if|what happens|what would|rehears\w*|simulat\w*|
                      r"\bif\b[^.?]{0,80}\b(were|was|is|gets?|got) (cut|down|lost|removed|added|failed|broken|degraded)\b", re.I)
 
 
-class DelegationGuard(AgentMiddleware):
-    """With the team, a what-if is qot's: an answer to one, given without asking qot this turn, is sent back once.
-    (Without it, the supervisor read the twin's name and wrote what "the twin predicts" with no prediction run.)"""
+_CHANGE_GUARD = "[change check]"
+_CONFIG_GUARD = "[config check]"
 
-    def __init__(self, qot: str = "qot"):
+
+class MakeTheChange(AgentMiddleware):
+    """On a config agent: a task is a change to make, so a report with no write tried is sent back once (one
+    described the right tool, connect_tenant_external, and stopped). A write that was held, refused or failed
+    counts as tried: its report says why."""
+
+    def __init__(self, writes):
         super().__init__()
-        self.qot = qot
+        self.writes = set(writes)
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
             return None
+        if _observer() or any(isinstance(m, HumanMessage) and _CONFIG_GUARD in str(m.content) for m in msgs):
+            return None
+        tried = any(isinstance(m, AIMessage) and any(c.get("name") in self.writes for c in (m.tool_calls or []))
+                    for m in msgs)
+        if tried:
+            return None
+        return {"jump_to": "model", "messages": [HumanMessage(content=(
+            f"{_CONFIG_GUARD} You were given a change to make and you have not called a tool that makes it. Call it "
+            f"now with the exact arguments (net_ write verb or controller_write; network_tools finds which). Its "
+            f"approval pause is the confirmation. If the controller says another step must come first, do that "
+            f"step first. Only if no tool can make this change, say exactly why."))]}
+_CHANGE = re.compile(r"^\W*(?:please\s+|can you\s+|could you\s+|now\s+)*(create|delete|remove|connect|attach|detach|add|"
+                     r"set|provision|tear down|teardown|reroute|re-route|configure|enable|disable|shut|bring|change|"
+                     r"move|increase|decrease|raise|lower|update|apply|restore|disconnect)\b", re.I)
+
+
+class DelegationGuard(AgentMiddleware):
+    """With the team, a what-if is qot's: an answer to one, given without asking qot this turn, is sent back once.
+    (Without it, the supervisor read the twin's name and wrote what "the twin predicts" with no prediction run.)
+    And a plain change is its domain's config agent's: handed to qot instead, it is turned back with where it goes
+    (qot rehearsed a plain 'create LP-3' for ten minutes; the write gate rehearses it anyway)."""
+
+    def __init__(self, qot: str = "qot", config_agents: Optional[List[str]] = None):
+        super().__init__()
+        self.qot = qot
+        self.config_agents = list(config_agents or [])
+
+    def _misrouted(self, request) -> Optional[Any]:
+        tc = request.tool_call
+        args = tc.get("args") or {}
+        if tc.get("name") == "task" and str(args.get("subagent_type", "")).endswith("-config") and _observer():
+            from langchain_core.messages import ToolMessage
+            return ToolMessage(tool_call_id=tc["id"], name="task", status="error", content=(
+                "Not sent: the operator is signed in as an observer, so no change can be made or approved in this "
+                "session. Reply with the exact change that would be needed, and that someone signed in as admin has "
+                "to ask for it. Nothing else."))
+        if tc.get("name") != "task" or args.get("subagent_type") != self.qot or not self.config_agents:
+            return None
+        state = getattr(request, "state", None) or {}
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        q = current_question(msgs) or ""
+        if not _CHANGE.search(q) or _WHATIF.search(q) or len(q) > 400:
+            return None
+        from langchain_core.messages import ToolMessage
+        return ToolMessage(tool_call_id=tc["id"], name="task", status="error", content=(
+            "Not sent to qot: the operator asked for a change, not a what-if. Hand it straight to the config agent of "
+            f"its domain ({', '.join(self.config_agents)}) with the exact change. Its write is rehearsed in the "
+            "digital twin automatically before it is sent, and then waits for the operator's approval."))
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        return self._whatif(state) or self._undone_change(state)
+
+    def _undone_change(self, state: Any) -> Optional[Dict[str, Any]]:
+        """An admin asked for a change and the turn ends with a plan or a question, with nothing handed to a config
+        agent: sent back once. The approval pause is the confirmation; asking 'shall I?' in text is not."""
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not self.config_agents or not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls \
+                or is_keep(msgs[-1].content):
+            return None
+        try:
+            from langgraph.config import get_config
+            level = str(((get_config() or {}).get("configurable") or {}).get("level") or "")
+        except Exception:  # noqa: BLE001
+            level = ""
+        if level not in ("admin", "root"):
+            return None
+        q = current_question(msgs) or ""
+        if not _CHANGE.search(q) or _WHATIF.search(q) or len(q) > 400:
+            return None
+        start = turn_start(msgs)
+        turn = msgs[start:]
+        if any(isinstance(m, HumanMessage) and _CHANGE_GUARD in str(m.content) for m in turn):
+            return None
+        handed = any(isinstance(m, AIMessage) and any(c.get("name") == "task" and str((c.get("args") or {}).get(
+            "subagent_type", "")).endswith("-config") for c in (m.tool_calls or [])) for m in turn)
+        if handed:
+            return None
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+            f"{_CHANGE_GUARD} The operator, an admin, asked you to make this change, and nothing was handed to a "
+            f"config agent. Do it now: find whose it is (network_tools(query=<the change's words>) searches every "
+            f"controller; the design rules, with search_knowledge, say the order of steps across domains), then hand "
+            f"each step to its domain's config agent ({', '.join(self.config_agents)}) with `task`. The approval pause "
+            f"is the operator's confirmation: do not ask for it in text. Only if it cannot be done at all, say exactly "
+            f"why.", msgs, keep=False))]}
+
+    def wrap_tool_call(self, request, handler):
+        return self._misrouted(request) or handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        return self._misrouted(request) or await handler(request)
+
+    def _whatif(self, state: Any) -> Optional[Dict[str, Any]]:
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+            return None
         q = current_question(msgs)
         if not _WHATIF.search(q or ""):
             return None
-        start = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage) and "check]" not in str(m.content)[:40]), default=0)
+        start = turn_start(msgs)
         turn = msgs[start:]
         if any(isinstance(m, HumanMessage) and _DELEGATE in str(m.content) for m in turn):
             return None

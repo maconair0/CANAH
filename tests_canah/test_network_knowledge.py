@@ -105,6 +105,31 @@ class Network(Base):
         refused = agents["domain-b-config"]["controller_read"].invoke({"controller": "alpha", "tool": "get_nodes"})
         self.assertIn("has no tool", refused)
 
+    def test_match_keeps_only_the_objects_asked_about(self):
+        from canah.network import filter_answer
+        text = '{"nodes": [{"node-id": "xpdr-b2", "site": "site-b"}, {"node-id": "roadm-a"}, {"node-id": "xpdr-c2"}], "count": 3}'
+        got = filter_answer(text, "xpdr-b2, xpdr-c2")
+        self.assertIn("xpdr-b2", got)
+        self.assertIn("xpdr-c2", got)
+        self.assertNotIn("roadm-a", got)
+        self.assertIn('"count": 3', got)
+        self.assertIn("Nothing", filter_answer(text, "amp-9"))
+        self.assertEqual(filter_answer("Error: down", "x"), "Error: down")
+
+    def test_a_match_that_misses_on_one_controller_says_where_it_is(self):
+        p = AgenticMCPProvider(service=self.service)
+        out = {t.name: t for t in p.tools()}["net_read_devices"].invoke({"controller": "beta", "match": "node-2"},
+                                                                        config={"configurable": {}})
+        self.assertIn("Found on alpha", out)
+        self.assertIn("node-2", out)
+
+    def test_the_supervisor_is_told_where_a_change_goes(self):
+        p = AgenticMCPProvider(service=self.service)
+        read = {t.name: t for t in p.tools()}["controller_read"]
+        out = read.invoke({"controller": "alpha", "tool": "create_service", "arguments": {"a": "a1"}})
+        self.assertIn("domain-a-config", out)
+        self.assertEqual(self.service.calls, [])
+
     def test_a_read_without_a_controller_asks_every_one_that_serves_the_verb(self):
         a = self.agent(call("net_read_devices"), say("Alpha has two nodes, beta one item."))
         a.ask("what is in the network?", who=ADMIN)
@@ -124,6 +149,10 @@ class Network(Base):
         a.decide("w", [approval.decision("approve")], who=ADMIN)
         self.assertEqual(self.service.calls, [("alpha", "create_service", {"a": "a1", "z": "z1"},
                                                "ana (approved in canah)")])
+        report = [m for m in a.graph.get_state(a.config("w", ADMIN)).values["messages"]
+                  if m.type == "tool" and m.name == "task"][-1].content
+        self.assertIn("Writes sent in this task", report)                   # what was sent, from the harness
+        self.assertIn('"a": "a1"', report)
 
     def test_a_tool_beyond_the_contract_through_the_config_agent(self):
         a = self.agent(call("task", description="put a meter on beta port 1", subagent_type="domain-b-config"),

@@ -33,6 +33,7 @@ def main(argv=None) -> int:
     ap.add_argument("--only", default="")
     ap.add_argument("--no-sandbox", action="store_true")
     ap.add_argument("--out", default=str(HERE / "results"))
+    ap.add_argument("--trace", default="", help="a directory: write each case's messages there")
     a = ap.parse_args(argv)
 
     home = Path(tempfile.mkdtemp(prefix="canah-testbed-"))
@@ -107,6 +108,14 @@ def main(argv=None) -> int:
                    "sent_back": {k: humans.count(f"[{k} check]") for k in ("grounding", "citation", "follow-through")},
                    "answer": text[:600], "error": err}
             runs.append(row)
+            if a.trace:
+                Path(a.trace).mkdir(parents=True, exist_ok=True)
+                lines = []
+                for m in msgs:
+                    tc = getattr(m, "tool_calls", None) or []
+                    lines.append(f"--- {m.type} {getattr(m, 'name', '') or ''}\n{str(m.content)[:3000]}"
+                                 + "".join(f"\n  CALL {x['name']} {json.dumps(x.get('args'), default=str)[:1500]}" for x in tc))
+                (Path(a.trace) / f"r{rnd}-{c.id}.txt").write_text("\n".join(lines))
             emu.app.state.refused.clear()
             print(f"{'PASS' if ok else 'FAIL'} r{rnd} {c.group:8} {c.id:16} {dt:6.1f}s  approved={approved} "
                   f"writes={row['writes']}" + (f" ERR {err}" if err else ""), flush=True)
