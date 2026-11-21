@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Type
 
 import requests
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("canah.network")
@@ -657,6 +657,45 @@ class RelationsFirst:
         return _RelationsFirst()
 
 
+_PROBE_GUARD = "[probe check]"
+_REACHQ = re.compile(r"\b(can .{1,60} (reach|ping|talk to|get to|connect to)|ping\w*|reachab\w*|reach each other|"
+                     r"connectivity|traceroute|packet loss|(is|are) .{1,40} (reachable|connected))\b", re.I)
+
+
+class ProbeFirst:
+    """Built in AgenticMCPProvider.middleware() when a controller serves ping: a question about whether traffic gets
+    through, answered without sending any, is sent back once. Configured is not reachable: one run read the optical
+    inventory for two minutes instead of pinging."""
+
+    @staticmethod
+    def make():
+        from langchain.agents.middleware import AgentMiddleware, hook_config
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _ProbeFirst(AgentMiddleware):
+            @hook_config(can_jump_to=["model"])
+            def after_model(self, state, runtime):
+                from .grounding import anchored, current_question, is_keep, turn_start
+                msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+                if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+                    return None
+                q = current_question(msgs) or ""
+                if not _REACHQ.search(q) or len(q) > 500:
+                    return None
+                turn = msgs[turn_start(msgs):]
+                if any(isinstance(m, HumanMessage) and _PROBE_GUARD in str(m.content) for m in turn):
+                    return None
+                if any(isinstance(m, AIMessage) and any(c.get("name") in ("net_ping", "net_traceroute", "task")
+                                                        for c in (m.tool_calls or [])) for m in turn):
+                    return None
+                return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                    f"{_PROBE_GUARD} This asks whether traffic gets through, and nothing was sent. Read the hosts "
+                    f"(net_read_hosts), then net_ping from the host at one end to the other's address; if it is not "
+                    f"answered, net_traceroute to see the hop where it stops, and follow_relations from there for the "
+                    f"cause. Answer from what the probes returned.", msgs, keep=False))]}
+        return _ProbeFirst()
+
+
 class AgenticMCPProvider:
     """The networks, through the agentic MCP. The agentic MCP holds the controllers and checks each against the
     common contract; CANAH's main agent works them all through it with one set of tools, the same for every
@@ -777,6 +816,21 @@ class AgenticMCPProvider:
                              "for how something reaches somewhere.")))
         if seats:
             self.status = {"ok": True, "url": self.service.url, "controllers": held}
+        if any(str((v or {}).get("domain") or "").lower() in ("optical", "wdm", "photonic") for v in held.values()):
+            from .ip_optical import Planner
+            planner = Planner(self)
+
+            def ip_over_optical(a: str, z: str, rate_gbps: int = 100) -> str:
+                """IP connectivity between two sites (or routers) over the optical network: the chain that carries it
+                (routers, the ports that hand off to transponders, the lightpath, the IP link, the IP service, a host
+                at each end), what is missing, and the steps to make it in order, each for the agent that owns it,
+                then the ping that proves it. Reads only. Use it before setting up or troubleshooting IP between
+                sites; follow its steps as given."""
+                try:
+                    return json.dumps(planner.plan(a, z, rate_gbps), default=str, indent=1)
+                except Exception as e:  # noqa: BLE001
+                    return f"Error: the plan could not be read: {type(e).__name__}: {e}"
+            self._tools.append(StructuredTool.from_function(ip_over_optical))
         if self.team:
             self._build_team(held, served, rules)
             by = {k: a["name"] for a in self.config_agents for k in self.roles[a["name"]]["controllers"]}
@@ -849,7 +903,9 @@ class AgenticMCPProvider:
 
     def middleware(self) -> List[Any]:
         self._load()
-        return [RelationsFirst.make()] if any(t.name == "follow_relations" for t in self._tools) else []
+        names = {t.name for t in self._tools}
+        return ([RelationsFirst.make()] if "follow_relations" in names else []) + \
+               ([ProbeFirst.make()] if "net_ping" in names else [])
 
     _NAME_KEYS = ("name", "service", "service_id", "lightpath", "tenant", "id", "link", "device", "node", "node_id",
                   "router", "switch", "port", "interface")
@@ -1048,6 +1104,10 @@ class AgenticMCPProvider:
                     f"- the config agents, one per network domain: {agents}. A change in a domain is made only by its config "
                     f"agent: give it the exact change as the controller's tool takes it (controller, tool, each argument's "
                     f"value, e.g. over='L-ab'), not a description. Its call waits for the operator's approval.\n"
+                    f"To know whether traffic gets through, send some: net_ping and net_traceroute from the hosts the network "
+                    f"has (net_read_hosts), where a controller offers them; a service configured is not proof. IP between sites over "
+                    f"optical: ip_over_optical(a, z) gives the chain, what is missing and the steps in order (the lightpath "
+                    f"to the optical config agent first, then the IP service to the packet one, then the ping). "
                     f"For a change: first find whose it is. The domain is the one whose controller has the tool that does it: "
                     f"network_tools(query=<the change's words>) with no controller searches them all (attaching a tenant is "
                     f"the data centre's, a lightpath the optical one's, a VLAN service the packet one's). A change that "

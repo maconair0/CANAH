@@ -350,3 +350,37 @@ class DeleteThread(Base):
         self.assertEqual(len(client.get("/threads/t1/history", headers=h).json()["messages"]), 2)
         self.assertEqual(client.delete("/threads/t1", headers=h).json(), {"deleted": "t1"})
         self.assertEqual(client.get("/threads/t1/history", headers=h).json()["messages"], [])
+
+
+class SkillsPage(Base):
+    def test_a_skill_written_in_the_console_is_listed_read_and_deleted(self):
+        os.environ["CANAH_ADMIN_PASSWORD"] = "adm1n-pass"
+        self.addCleanup(os.environ.pop, "CANAH_ADMIN_PASSWORD")
+        a = self.agent(say("hi"))
+        client = TestClient(create_app(a, Accounts(os.path.join(self.home, "users.json"))))
+        h = {"Authorization": "Bearer " + client.post("/session", json={"username": "admin", "password": "adm1n-pass"}).json()["token"]}
+        names = {s["name"]: s for s in client.get("/skills").json()["skills"]}
+        self.assertIn("incident-triage", names)
+        self.assertFalse(names["incident-triage"]["editable"])
+        body = {"description": "Check a site's fans and temperatures when an alarm names a fan.",
+                "body": "1. Read the alarms of the site.\\n2. Read the device's environment.\\n3. Report each fan's state."}
+        self.assertEqual(client.put("/skills/fan-check", json=body).status_code, 403)          # needs admin
+        self.assertEqual(client.put("/skills/Bad Name", json=body, headers=h).status_code, 400)
+        self.assertEqual(client.put("/skills/fan-check", json={**body, "description": "fans"}, headers=h).status_code, 400)
+        self.assertEqual(client.put("/skills/fan-check", json=body, headers=h).json()["saved"], "fan-check")
+        mine = {s["name"]: s for s in client.get("/skills").json()["skills"]}["fan-check"]
+        self.assertTrue(mine["editable"])
+        got = client.get("/skills/fan-check").json()
+        self.assertIn("each fan's state", got["body"])
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "skills", "fan-check", "SKILL.md")))
+        self.assertEqual(client.delete("/skills/incident-triage", headers=h).status_code, 404)     # built in: kept
+        self.assertEqual(client.delete("/skills/fan-check", headers=h).json()["deleted"], "fan-check")
+        self.assertNotIn("fan-check", {s["name"] for s in client.get("/skills").json()["skills"]})
+
+    def test_a_skill_in_the_home_folder_reaches_the_agent(self):
+        os.makedirs(os.path.join(self.home, "skills", "fan-check"))
+        with open(os.path.join(self.home, "skills", "fan-check", "SKILL.md"), "w") as f:
+            f.write("---\nname: fan-check\ndescription: Check a site's fans when an alarm names a fan.\n---\n\n1. Read the alarms.\n")
+        a = self.agent(say("hi"))
+        a.ask("hello")
+        self.assertIn("fan-check", str(self.model.seen[-1][0].content))

@@ -102,7 +102,8 @@ CASES: List[Case] = [
          all_of(matches(r"not as intended|not (been )?(created|applied|listed|there|present|show)|does not (show|list)|"
                         r"no VS-500|did not|didn't|failed|is not listed|was not|isn't|cannot be (found|verified|confirmed)|"
                         r"discrepancy|not found|not appear"),
-                lacks("successfully created", "has been created", "is now in place")),
+                state(lambda d: True),
+                lambda t, r, d: not re.search(r"(?<!not )(?<!n't )\b(successfully created|has been created|is now in place)", t, re.I)),
          setup=lambda d: d["packet"].fault("writes_ignored")),
     # ---- fabric ----
     Case("fabric-read", "fabric", OBSERVER, "Which tenants are on which leaf switches?",
@@ -131,6 +132,17 @@ CASES: List[Case] = [
          all_of(writes("packet", ["create_vlan_service"]), no_optical_writes := state(
              lambda d: not d["optical"].writes),
                 state(lambda d: d["packet"].state["services"].get("VS-400", {}).get("over") == "L-ab"))),
+    Case("cross-ping", "cross", OBSERVER, "Can host h-a1 reach host h-b1? Check it, and if not, say why.",
+         all_of(matches(r"\b0 received|not (reach|answer)|unreachable|cannot reach|can't reach|no (reply|answer)|100% packet loss|fails?"),
+                matches(r"lightpath|LP-1|optical"), no_writes()),
+         setup=lambda d: d["optical"].state["lightpaths"].pop("LP-1")),
+    Case("cross-ip-optical", "cross", ADMIN,
+         "Set up IP connectivity between site-a and site-b over the optical network, and prove it with a ping.",
+         all_of(writes("optical", ["create_lightpath"]),
+                state(lambda d: any({lp["a"], lp["z"]} == {"xpdr-a1", "xpdr-b1"}
+                                    for lp in d["optical"].state["lightpaths"].values())),
+                matches(r"\b[1-9]\d*(/\d+)? (packets )?received|\b0% packet loss|no packet loss|answered|reach(es|ed|able)")),
+         setup=lambda d: d["optical"].state["lightpaths"].pop("LP-1")),
     Case("cross-observer", "cross", OBSERVER, "Delete lightpath LP-1 and the service VS-100 that rides it.",
          all_of(no_writes(), nothing_pending(), has("admin"))),
 ]

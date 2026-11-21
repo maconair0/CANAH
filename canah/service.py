@@ -1519,6 +1519,103 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             new.ops.audit("agent reloaded", who.user, who.level, "", "reload", {"subagents": new.info.get("subagents")})
         return {"reloaded": True, "subagents": new.info.get("subagents"), "tools": new.info.get("tools")}
 
+    # ----- skills: how the agent does a kind of task, written by operators in the console -----
+
+    _SKILL = re.compile(r"[a-z][a-z0-9-]{1,48}")
+
+    def _parse_skill(text: str) -> Dict[str, str]:
+        m = re.match(r"\s*---\s*\n(.*?)\n---\s*\n?(.*)$", text or "", re.S)
+        if not m:
+            return {"name": "", "description": "", "body": text or ""}
+        head = {}
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                head[k.strip().lower()] = v.strip().strip('"').strip("'")
+        return {"name": head.get("name", ""), "description": head.get("description", ""), "body": m.group(2)}
+
+    def _skills() -> List[Dict[str, Any]]:
+        from .backends import skill_dirs, user_skills
+        mine = user_skills(A().settings).resolve()
+        out, seen = [], set()
+        for d in skill_dirs(A().settings):
+            for f in sorted(d.glob("*/SKILL.md")):
+                try:
+                    meta = _parse_skill(f.read_text())
+                except OSError:
+                    continue
+                name = meta["name"] or f.parent.name
+                out.append({"name": name, "description": meta["description"], "folder": f.parent.name,
+                            "source": "yours" if d == mine else ("built in" if "canah/skills" in str(d) else str(d)),
+                            "editable": d == mine, "chars": len(meta["body"]), "overrides": name in seen,
+                            "files": sorted(x.name for x in f.parent.iterdir() if x.is_file() and x.name != "SKILL.md")[:20]})
+                seen.add(name)
+        return out
+
+    @app.get("/skills")
+    def list_skills(c=Depends(caller)):
+        return {"skills": _skills(), "folder": str(__import__("canah.backends", fromlist=["user_skills"]).user_skills(A().settings))}
+
+    @app.get("/skills/{name}")
+    def read_skill(name: str, c=Depends(caller)):
+        from .backends import skill_dirs
+        for d in skill_dirs(A().settings):
+            for f in d.glob("*/SKILL.md"):
+                meta = _parse_skill(f.read_text())
+                if (meta["name"] or f.parent.name) == name:
+                    return {**meta, "name": meta["name"] or f.parent.name, "content": f.read_text(),
+                            "editable": any(x.get("name") == name and x.get("editable") for x in _skills())}
+        raise HTTPException(404, "no such skill")
+
+    @app.put("/skills/{name}")
+    def save_skill(name: str, body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """Write one of your skills ({description, body}, or {content}: a whole SKILL.md), then rebuild the agent so
+        it is used from the next question. A built-in skill of the same name is overridden, not changed."""
+        who = admin(c)
+        if not _SKILL.fullmatch(name):
+            raise HTTPException(400, "a skill's name is lower-case letters, digits and -, 2 to 49 long")
+        if body.get("content"):
+            meta = _parse_skill(str(body["content"]))
+            desc, text = meta["description"] or str(body.get("description") or ""), meta["body"]
+        else:
+            desc, text = str(body.get("description") or ""), str(body.get("body") or "")
+        desc = " ".join(desc.split())
+        if len(desc) < 20:
+            raise HTTPException(400, "say when to use it, in a sentence or two (the agent picks a skill by this)")
+        if len(text.strip()) < 40:
+            raise HTTPException(400, "the instructions are too short to be a skill")
+        if len(desc) > 1024 or len(text) > 60_000:
+            raise HTTPException(413, "a skill's description is at most 1024 characters and its text 60 000")
+        from .backends import user_skills
+        folder = user_skills(A().settings) / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\n\n{text.strip()}\n")
+        if A().ops:
+            A().ops.audit("skill saved", who.user, who.level, "", "skill", {"name": name, "chars": len(text)})
+        reloaded = None
+        try:
+            reloaded = do_reload(who) if rebuild is not None else None
+        except HTTPException as e:
+            reloaded = {"reloaded": False, "why": e.detail}
+        return {"saved": name, "reload": reloaded}
+
+    @app.delete("/skills/{name}")
+    def delete_skill(name: str, c=Depends(caller)):
+        who = admin(c)
+        from .backends import user_skills
+        folder = user_skills(A().settings) / name
+        if not _SKILL.fullmatch(name) or not (folder / "SKILL.md").is_file():
+            raise HTTPException(404, "no skill of yours with that name (built-in skills are not deleted here)")
+        import shutil
+        shutil.rmtree(folder)
+        if A().ops:
+            A().ops.audit("skill deleted", who.user, who.level, "", "skill", {"name": name})
+        try:
+            reloaded = do_reload(who) if rebuild is not None else None
+        except HTTPException as e:
+            reloaded = {"reloaded": False, "why": e.detail}
+        return {"deleted": name, "reload": reloaded}
+
     @app.post("/admin/reload")
     def reload(c=Depends(caller)):
         """A new agent from the settings: the controllers the agentic MCP holds now, the model chosen.
@@ -1535,7 +1632,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         if not PAGE.is_file():
             return "<p>CANAH</p>"
         html = PAGE.read_text()
-        for name in ("app.js", "app.css", "live.js"):
+        for name in ("app.js", "app.css", "live.js", "skills.js"):
             f = STATIC / name
             if f.is_file():
                 html = html.replace(f"/static/{name}\"", f"/static/{name}?v={int(f.stat().st_mtime)}\"")

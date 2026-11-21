@@ -18,14 +18,15 @@
   <section class="login-hero">
     <img class="mark for-light" src="/static/logo-light.png" alt="CANAH">
     <img class="mark for-dark" src="/static/logo-dark.png" alt="CANAH">
-    <h1><span class="acr">CANAH</span>Controller Agnostic<br>Network Agent Harness</h1>
+    <div class="lines" aria-hidden="true"><i class="d-packet"></i><i class="d-optical"></i><i class="d-dc"></i><i class="d-other"></i></div>
+    <h1>Controller Agnostic<br>Network Agent Harness</h1>
     <p class="lead">One agent for every network you run. CANAH reaches each SDN controller through the agentic MCP,
       reads before it answers, and changes nothing without an operator's approval, whichever controller or domain it is.</p>
     <div class="login-feats">
       <div class="login-feat"><i class="shape ring"></i><div><b>Controller agnostic</b><span>ONOS, Ryu, TeraFlowSDN, TransportPCE, or yours, behind one contract.</span></div></div>
       <div class="login-feat"><i class="shape sq"></i><div><b>Grounded answers</b><span>Every figure comes from a tool result, checked before it reaches you.</span></div></div>
       <div class="login-feat"><i class="shape hex"></i><div><b>Approval first</b><span>A change waits for a human of the right level; root for the destructive ones.</span></div></div>
-      <div class="login-feat"><i class="shape tri"></i><div><b>Across domains</b><span>Packet, optical, data centre: subagents per controller, one conversation.</span></div></div>
+      <div class="login-feat"><i class="shape tri"></i><div><b>Across domains</b><span>Packet, optical, data centre: a config agent per domain, one conversation.</span></div></div>
     </div>
   </section>
   <section class="login-side">
@@ -430,6 +431,7 @@
         <button class="tab active" data-tab="map" role="tab">Second brain</button>
         <button class="tab" data-tab="docs" role="tab">Documents <span class="count" id="kn-count-docs"></span></button>
         <button class="tab" data-tab="search" role="tab">Try a search</button>
+        <button class="tab" data-tab="skills" role="tab">Skills <span class="count" id="kn-count-skills"></span></button>
         <button class="tab" data-tab="mem" role="tab">Long-term memories <span class="count" id="kn-count-mem"></span></button>
       </div>
 
@@ -471,6 +473,19 @@
               <div class="mesh-hint faint">scroll to zoom · drag to pan · click a document</div></div>
             <div class="mesh-side" id="mesh-detail"><span class="muted">A node per document, sized by how much of it was indexed and coloured by cluster; an edge joins documents about similar things.</span></div>
           </div><p class="faint" style="font-size:11.5px;margin:8px 0 0" id="mesh-means"></p></div></div>
+      </div>
+
+      <div class="kn-pane" data-pane="skills" hidden>
+        <div class="grid sk-grid">
+          <div class="card"><header><h3>Skills</h3><div class="spacer"></div>
+            <button class="btn sm primary" id="sk-new">New skill</button></header>
+            <div class="body" style="padding:8px 10px 0"><input id="sk-filter" class="kn-filter" placeholder="Filter" autocomplete="off" style="width:100%"></div>
+            <div class="body" style="padding:0" id="sk-list"></div></div>
+          <div class="card"><header><h3 id="sk-title">A skill</h3><div class="spacer"></div><span class="faint" id="sk-meta" style="font-size:11.5px"></span></header>
+            <div class="body" id="sk-detail"><div class="empty">A skill tells the agent how to do one kind of task: the steps, the tools, what to check
+              and what to report. It picks one by its description, so say when to use it. Choose a skill, or make a new one.</div></div></div>
+        </div>
+        <input type="file" id="sk-file" accept=".md,text/markdown,text/plain" hidden>
       </div>
 
       <div class="kn-pane" data-pane="mem" hidden>
@@ -532,5 +547,6 @@
 <div class="toasts" id="toasts"></div>
 <script src="/static/app.js"></script>
 <script src="/static/live.js"></script>
+<script src="/static/skills.js"></script>
 </body>
 </html>

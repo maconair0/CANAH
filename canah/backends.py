@@ -25,12 +25,25 @@ from . import memory as mem
 from .config import Settings
 
 
+def skill_dirs(settings: Settings) -> List[Path]:
+    """Every folder skills are read from: the configured ones, then the operators' own (<CANAH_HOME>/skills, where
+    the web console's Skills tab writes)."""
+    out: List[Path] = []
+    for d in [*settings.skills_dirs, str(user_skills(settings))]:
+        p = Path(d).expanduser().resolve()
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return out
+
+
+def user_skills(settings: Settings) -> Path:
+    return Path(settings.home_path) / "skills"
+
+
 def _mounts(settings: Settings) -> Tuple[Dict[str, Path], Dict[str, Path]]:
     skills, memories = {}, {}
-    for i, d in enumerate(settings.skills_dirs):
-        p = Path(d).expanduser().resolve()
-        if p.is_dir():
-            skills[f"/skills/{i}-{p.name}/"] = p
+    for i, p in enumerate(skill_dirs(settings)):
+        skills[f"/skills/{i}-{p.name}/"] = p
     for i, f in enumerate(settings.memory_files):
         p = Path(f).expanduser().resolve()
         if p.is_file():

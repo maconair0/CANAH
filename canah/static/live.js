@@ -9,7 +9,7 @@ async function renderTwinRuns() {
   $("#twr-list").innerHTML = twr.runs.length ? twr.runs.map((x) => `
     <div class="twr-row${twr.sel === x.run_id ? " sel" : ""}" data-id="${esc(x.run_id)}">
       <div class="q">${esc(x.question || "(no question)")}</div>
-      <div class="m"><span class="chip">${esc(x.domain || "?")}</span>${pill(x.decision)}${x.hypothetical ? `<span class="hypo" title="a route built for a question: nothing in it exists in a network">hypothetical</span>` : ""}
+      <div class="m"><span class="chip d-${esc(x.domain || "")}">${esc(x.domain || "?")}</span>${pill(x.decision)}${x.hypothetical ? `<span class="hypo" title="a route built for a question: nothing in it exists in a network">hypothetical</span>` : ""}
         <span class="faint">${x.at ? ago(x.at) : ""}${x.by ? ` · ${esc(x.by)}` : ""}</span></div></div>`).join("")
     : `<div class="empty">The twin has not run anything yet. Ask a what-if in the chat.</div>`;
   $$("#twr-list .twr-row").forEach((el) => el.addEventListener("click", () => showTwinRun(el.dataset.id)));
@@ -23,7 +23,7 @@ async function showTwinRun(id) {
   const sc = r.scenario || {}, res = r.result || {};
   const dec = (res.decision || {}).action, pr = res.probability || {};
   const head = `<div class="twr-head"><div class="q">${esc(sc.question || "")}</div>
-      <div class="m"><span class="chip">${esc(r.domain || sc.domain || "")}</span><span class="dec ${esc(dec || "none")}">${esc(String(dec || "?").replace(/_/g, " "))}</span>
+      <div class="m"><span class="chip d-${esc(r.domain || sc.domain || "")}">${esc(r.domain || sc.domain || "")}</span><span class="dec ${esc(dec || "none")}">${esc(String(dec || "?").replace(/_/g, " "))}</span>
         ${pr.p != null ? `<span>p ${Number(pr.p).toFixed(3)}${pr.interval ? ` <span class="faint">[${pr.interval.map((v) => Number(v).toFixed(3)).join(", ")}]</span>` : ""}</span>` : ""}
         ${(res.trust || {}).tier ? `<span class="faint">trust tier ${esc(res.trust.tier)}</span>` : ""}
         <span class="faint">${r.at ? new Date(r.at * 1000).toLocaleString() : ""}${r.by ? ` · asked by ${esc(r.by)}` : ""}</span></div>
@@ -138,7 +138,7 @@ function drawLive() {
     const twin = `<div class="lv-twin"><div class="label">In the digital twin</div>
         <div>${list.some((c) => c.twin_snapshot) ? `snapshot <span class="mono">${esc(list.find((c) => c.twin_snapshot).twin_snapshot)}</span>` : `<span class="faint">no snapshot of this domain (scenarios are built from live reads)</span>`}</div>
         <div>${last ? `last run ${ago(last.at)}: <span class="dec ${esc(last.decision || "none")}">${esc(String(last.decision || "?").replace(/_/g, " "))}</span> <a href="#" data-run="${esc(last.run_id)}">see it</a> · ${runs.length} run${runs.length === 1 ? "" : "s"}` : `<span class="faint">no run on ${esc(tdom)} yet</span>`}</div></div>`;
-    return `<div class="card lv-dom"><header><h3>${esc(dom)}</h3><div class="spacer"></div>
+    return `<div class="card lv-dom d-${esc(dom.toLowerCase().replace(/\s+/g, "-"))}"><header><h3>${esc(dom)}</h3><div class="spacer"></div>
         <span class="faint">${rows.length} of ${list.reduce((a, c) => a + c.services.length, 0)} services</span></header>
       <div class="body"><div class="lv-top"><div class="lv-ctls">${ctlChips}</div>${twin}</div>
       ${rows.length ? `<div class="lv-table"><table class="tbl"><thead><tr><th>service</th><th>state</th><th>from</th><th>to</th><th>size</th><th class="hide-sm">controller</th></tr></thead><tbody>

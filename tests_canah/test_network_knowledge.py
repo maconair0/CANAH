@@ -246,3 +246,15 @@ class GeneralPurpose(unittest.TestCase):
         names = gp.get("tool_names")
         self.assertIsNotNone(names)                                       # its own list, not the main agent's
         self.assertFalse([n for n in names if n.startswith(("net_", "controller_", "twin_")) or n == "twin_override"], names)
+
+
+class Probes(unittest.TestCase):
+    def test_a_reachability_question_answered_without_a_ping_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.network import ProbeFirst
+        g = ProbeFirst.make()
+        q = HumanMessage(content="Can host h-a1 reach host h-b1?")
+        out = g.after_model({"messages": [q, AIMessage(content="Yes, the service is configured.")]}, None)
+        self.assertIn("net_ping", out["messages"][0].content)
+        pinged = AIMessage(content="", tool_calls=[{"name": "net_ping", "args": {}, "id": "1"}])
+        self.assertIsNone(g.after_model({"messages": [q, pinged, AIMessage(content="0 of 3 answered.")]}, None))

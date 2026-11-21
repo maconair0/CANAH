@@ -442,6 +442,76 @@ class NumberCheck(AgentMiddleware):
             f"everything you concluded from it, then answer again.", msgs, keep=False))]}
 
 
+_STATE_GUARD = "[state check]"
+_UPW = {"up", "in-service", "inservice", "active", "available", "true", "enabled", "ok", "online"}
+_DOWNW = {"down", "out-of-service", "outofservice", "failed", "inactive", "unavailable", "false", "disabled", "offline"}
+_CLAIM_STATE = re.compile(r"\b([A-Za-z][\w.:-]*[\w])\s+(?:is|was|are|remains|stays)\s+(?:currently\s+|now\s+|also\s+)?"
+                          r"(down|up|out[- ]of[- ]service|in[- ]service|unavailable|available|failed|offline|online)\b", re.I)
+
+
+def read_states(msgs: List[Any]) -> Dict[str, str]:
+    """{object name: up|down} from every object the tools returned this turn (devices, links, services)."""
+    out: Dict[str, str] = {}
+
+    def walk(v):
+        if isinstance(v, dict):
+            name = v.get("name") or v.get("id") or v.get("node-id")
+            st = next((v[k] for k in ("status", "state", "oper-status", "available") if k in v), None)
+            if isinstance(name, str) and st is not None:
+                w = str(st).lower().replace(" ", "-")
+                if w in _UPW:
+                    out[name.lower()] = "up"
+                elif w in _DOWNW:
+                    out[name.lower()] = "down"
+            for x in v.values():
+                if isinstance(x, (dict, list)):
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    for m in msgs:
+        if isinstance(m, ToolMessage):
+            text = str(m.content)
+            start = text.find("{") if text.find("{") != -1 else text.find("[")
+            body = text[start:] if start >= 0 else ""
+            body = body.split("\n\n[")[0]
+            try:
+                walk(json.loads(body))
+            except (ValueError, TypeError):
+                continue
+    return out
+
+
+class StateCheck(AgentMiddleware):
+    """An answer that says an object is down (or up) when what the tools read this turn says otherwise is sent back
+    once, with what was read: one answer said pe-b was down when the read had pe-b up and p-2 down."""
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+            return None
+        turn = msgs[turn_start(msgs):]
+        if any(isinstance(m, HumanMessage) and _STATE_GUARD in str(m.content) for m in turn):
+            return None
+        seen = read_states(turn)
+        if not seen:
+            return None
+        wrong = []
+        for m in _CLAIM_STATE.finditer(str(msgs[-1].content)):
+            name, said = m.group(1).lower(), m.group(2).lower().replace(" ", "-")
+            said = "up" if said in _UPW or said == "in-service" else "down"
+            if name in seen and seen[name] != said and (name, said) not in [(w[0], w[1]) for w in wrong]:
+                wrong.append((name, said, seen[name]))
+        if not wrong:
+            return None
+        return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+            f"{_STATE_GUARD} Your answer contradicts what the tools read this turn: "
+            + "; ".join(f"you say {n} is {s}, the read says {r}" for n, s, r in wrong)
+            + ". Check which object is which (similar names), correct it and everything concluded from it.",
+            msgs, keep=False))]}
+
+
 _TASK_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("canah_task_deadline", default=0.0)
 
 
@@ -728,6 +798,21 @@ class DelegationGuard(AgentMiddleware):
         self.locate = locate                    # name -> the controllers whose reads mention it
         self.agent_of = dict(agent_of or {})    # controller -> its config agent
 
+    def _owner_of(self, q: str) -> Optional[str]:
+        """The one config agent whose controllers hold the objects the request names, if there is exactly one."""
+        if self.locate is None or not self.agent_of:
+            return None
+        names = set(re.findall(r"\b[A-Za-z][\w.-]*\d[\w.:-]*\b|\b[a-z]+-[a-z0-9-]+\b", q or ""))
+        owners = set()
+        for n in list(names)[:12]:
+            try:
+                for ctl in self.locate(n):
+                    if ctl in self.agent_of:
+                        owners.add(self.agent_of[ctl])
+            except Exception:  # noqa: BLE001
+                continue
+        return owners.pop() if len(owners) == 1 else None
+
     _SUBJECT = re.compile(r"^\W*(?:please\s+)?(?:connect|attach|detach|disconnect|move|reroute|re-route|restore|enable|"
                           r"disable|shut|bring|change|update|raise|lower|increase|decrease|set)\s+(?:the\s+)?"
                           r"(?:tenant|lightpath|service|router|switch|link|port|transponder|interface|customer|vlan)?\s*"
@@ -838,7 +923,9 @@ class DelegationGuard(AgentMiddleware):
         start = turn_start(msgs)
         turn = msgs[start:]
         claims = bool(re.search(r"\b(submitted|handed|delegated|sent (it|the change)|passed (it|the change)|asked "
-                                r"\w+-config|is (now )?(waiting|pending) for (your )?approval)\b", str(msgs[-1].content), re.I))
+                                r"\w+-config|is (now )?(waiting|pending) for (your )?approval|(using|with|via|to) the "
+                                r"[\w-]+-config( agent)?|I('ll| will) (now )?(create|make|set up|hand|delegate))\b",
+                                str(msgs[-1].content), re.I))
         sent_back = sum(isinstance(m, HumanMessage) and _CHANGE_GUARD in str(m.content) for m in turn)
         if sent_back >= (2 if claims else 1):
             return None
@@ -846,6 +933,13 @@ class DelegationGuard(AgentMiddleware):
             "subagent_type", "")).endswith("-config") for c in (m.tool_calls or [])) for m in turn)
         if handed:
             return None
+        target = self._owner_of(q)
+        if target:
+            return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                f"{_CHANGE_GUARD} The operator, an admin, asked for this change, and it was not handed on: saying you "
+                f"will is not doing it. What it names is {target}'s. Make this call now, as your next step: "
+                f"task(subagent_type='{target}', description=<the operator's request, word for word>). Its write waits "
+                f"for the operator's approval; do not ask in text.", msgs, keep=False))]}
         return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
             f"{_CHANGE_GUARD} The operator, an admin, asked you to make this change, and nothing was handed to a "
             f"config agent. Do it now: find whose it is (network_tools(query=<the change's words>) searches every "

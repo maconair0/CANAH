@@ -1981,6 +1981,7 @@ function knTab(t) {
   $$("#view-knowledge .kn-pane").forEach((p) => p.hidden = p.dataset.pane !== t);
   if (t === "map") loadMesh().then(() => mesh.data?.nodes?.length && meshDetail());
   if (t === "mem") renderMemories();
+  if (t === "skills" && typeof renderSkills === "function") renderSkills();
   if (t === "search") setTimeout(() => $("#kn-q").focus(), 30);
 }
 $$("#kn-tabs .tab").forEach((b) => b.addEventListener("click", () => knTab(b.dataset.tab)));

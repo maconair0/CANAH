@@ -81,3 +81,34 @@ class WhereItIs(unittest.TestCase):
             self.assertIn("only a value in this change", out)
         finally:
             e.stop()
+
+
+class IpOverOptical(unittest.TestCase):
+    def test_the_plan_names_the_missing_lightpath_and_the_ping_proves_the_chain(self):
+        import json
+        from canah.network import AgenticMCP, AgenticMCPProvider
+        from testbed.emulator import Running
+        e = Running()
+        try:
+            p = AgenticMCPProvider(service=AgenticMCP(e.url, token=""))
+            tools = {t.name: t for t in p.tools()}
+            self.assertTrue({"net_ping", "net_traceroute", "net_read_hosts", "ip_over_optical"} <= set(tools))
+            self.assertNotIn("net_ping", p.writes())                                  # a probe, not a change
+            ok = json.loads(tools["ip_over_optical"].invoke({"a": "site-a", "z": "site-b"}))
+            self.assertTrue(ok["already"])
+            e.domains["optical"].state["lightpaths"].pop("LP-1")
+            ping = tools["net_ping"].invoke({"controller": "packet", "arguments": {"src": "h-a1", "dst": "10.0.2.10"}},
+                                            config={"configurable": {}})
+            self.assertIn("0 received", ping)
+            self.assertIn("no lightpath", ping)
+            plan = json.loads(tools["ip_over_optical"].invoke({"a": "pe-a", "z": "pe-b"}))
+            first = plan["steps"][0]
+            self.assertEqual((first["agent"], first["arguments"]["a"], first["arguments"]["z"]),
+                             ("optical-config", "xpdr-a1", "xpdr-b1"))
+            e.domains["optical"].state["lightpaths"]["LP-9"] = {"a": "xpdr-a1", "z": "xpdr-b1", "rate_gbps": 100,
+                                                                "osnr_db": 22, "state": "in-service", "client": {}, "path": []}
+            ping = tools["net_ping"].invoke({"controller": "packet", "arguments": {"src": "h-a1", "dst": "10.0.2.10"}},
+                                            config={"configurable": {}})
+            self.assertIn("3 received", ping)
+        finally:
+            e.stop()

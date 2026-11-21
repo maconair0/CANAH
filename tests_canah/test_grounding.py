@@ -696,3 +696,16 @@ class Grounded(unittest.TestCase):
         msg = AIMessage(content="", tool_calls=[{"name": "create_link", "args": {"a": "x", "z": "y"}, "id": "1"}])
         with mock.patch("canah.safety._run", return_value={"hypothetical": True}):
             self.assertIn("hypothetical", g._review(SimpleNamespace(messages=[]), msg))
+
+
+class StateClaims(unittest.TestCase):
+    def test_a_state_the_read_contradicts_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import StateCheck
+        read = AIMessage(content="", tool_calls=[{"name": "net_read_devices", "args": {}, "id": "1"}])
+        rows = ToolMessage(content='{"routers": [{"name": "pe-b", "status": "up"}, {"name": "p-2", "status": "down"}]}',
+                           tool_call_id="1")
+        q = HumanMessage(content="Set up VS-400 from pe-a to pe-b.")
+        out = StateCheck().after_model({"messages": [q, read, rows, AIMessage(content="It cannot: pe-b is down.")]}, None)
+        self.assertIn("you say pe-b is down, the read says up", out["messages"][0].content)
+        self.assertIsNone(StateCheck().after_model({"messages": [q, read, rows, AIMessage(content="p-2 is down; pe-b is up.")]}, None))

@@ -30,7 +30,7 @@ from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
 from .notify import Notifier
 from .grounding import (DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, NumberCheck,
-                        QotRuns, TimeBudget)
+                        QotRuns, StateCheck, TimeBudget)
 from .identity import OBSERVER, Identity
 from . import memory as mem
 from .config import Settings, load
@@ -544,7 +544,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
         spec["middleware"] = [*_retry(), calls, scope, budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
-                              NumberCheck(),
+                              NumberCheck(), StateCheck(),
                               *list(spec.get("middleware") or []),
                               *(lessons_mw if spec["name"].endswith("-config") else []),
                               *([MakeTheChange(writes, controller_writes, write_tool_of)] if team_specs and spec["name"].endswith("-config") else []),
@@ -619,7 +619,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             tools=main_tools,
             system_prompt=prompt,
             middleware=[calls, scope, budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                        KeepAnswer(), NumberCheck(), *lessons_mw, *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
+                        KeepAnswer(), NumberCheck(), StateCheck(), *lessons_mw, *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
                                              agent_of=_agent_of)] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
                         *compact_mw],

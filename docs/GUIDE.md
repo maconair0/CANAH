@@ -353,6 +353,35 @@ In every subagent too:
   One delegated task gets a share of it (`task_seconds`, by default a third of what is left). A subagent that goes in
   circles ends with what it had, and the supervisor still has time to act or say so.
 
+## Probes and IP over optical
+
+**Ping and traceroute are contract verbs.** A controller (or a lab service registered with the agentic MCP)
+that serves `read_hosts`, `ping` and `traceroute` gives every agent `net_read_hosts`, `net_ping` and
+`net_traceroute`. They are reads: they send probes and change nothing, so they need no approval. A question
+about whether traffic gets through ("can A reach B") answered without a probe is sent back once (`ProbeFirst`),
+because a service configured is not a service that carries traffic. The `connectivity-troubleshooting` skill
+goes layer by layer: the host's gateway, then a traceroute to the hop where it stops, then `follow_relations`
+from that hop to the link, lightpath or fibre that is down.
+
+**IP over optical** (`ip_over_optical(a, z, rate_gbps)`, when the agentic MCP holds an optical controller) reads
+the chain between two sites or routers and returns what exists, what is missing and the steps in order:
+
+1. the lightpath between the transponders behind the routers' handoff ports (from "hands off to" relations), to
+   the optical config agent, if none is in service; it refuses if a transponder already carries another;
+2. the IP service between the routers over the packet link, to the packet config agent, if there is none (an
+   existing one comes up with the lightpath and is not made again);
+3. `net_ping` from a host at one end to the other, which is the proof.
+
+It changes nothing; after each change it is called again and gives what is left. The `ip-over-optical` skill
+holds the agent to that order. Where the controllers do not publish handoffs or sites, it says so rather than
+picking transponders itself.
+
+**The real lab.** The test bed's packet controller serves the three verbs. In the lab, the hosts are Mininet
+namespaces on the lab host (container `germany` on the ONOS host, or `ryu-lab` on tfs-vm), and edgeLM's central
+service already pings from them (`POST /api/lab/ping`, `central_llm/reachability.py`). Registering a "lab" entry
+with the agentic MCP whose tools serve `read_hosts`, `ping` and `traceroute` over those makes the same tools
+work on the real network, with no change in CANAH.
+
 ## Self-correction: checked changes and lessons
 
 Two parts, both done by the harness rather than by asking the model to judge itself (the same model shares its

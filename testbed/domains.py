@@ -25,7 +25,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -117,26 +117,146 @@ class Packet(Domain):
             {"port": "pe-b:eth3", "to": "optical xpdr-b1 client1"},
             {"port": "pe-b:eth4", "to": "fabric border-leaf-1 port48"},
         ],
+        "hosts": {"h-a1": {"site": "site-a", "ip": "10.0.1.10", "gateway": "10.0.1.1", "router": "pe-a", "port": "pe-a:eth2"},
+                  "h-b1": {"site": "site-b", "ip": "10.0.2.10", "gateway": "10.0.2.1", "router": "pe-b", "port": "pe-b:eth2"}},
+        "gateways": {"pe-a": "10.0.1.1", "pe-b": "10.0.2.1"},
         "services": {"VS-100": {"vlan": 100, "a": "pe-a", "z": "pe-b", "over": "L-ab", "customer": "acme",
                                 "status": "up"},
                      "VS-200": {"vlan": 200, "a": "pe-b", "z": "pe-b:eth4", "over": "local", "customer": "globex",
                                 "status": "up"}},
     }
 
+    optical: Any = None                  # the optical domain, for what carries a link (all_domains sets it)
+
+    def _carrier(self, link: Dict[str, Any]) -> Optional[str]:
+        """The lightpath in service that joins this link's two handoff transponders, if any; '' for a fibre link."""
+        if "lightpath" not in str(link.get("carried_by")) and not link.get("rides_optical"):
+            return ""
+        xp = {h["port"]: h["to"].split()[1] for h in self.state["handoffs"] if h["to"].startswith("optical ")}
+        a, z = xp.get(link["a"]), xp.get(link["z"])
+        if not a or not z or self.optical is None:
+            return None
+        for name, lp in self.optical.state["lightpaths"].items():
+            fibres_ok = all(f["status"] == "up" for f in self.optical.state["fibres"] if f["name"] in (lp.get("path") or []))
+            if {lp["a"], lp["z"]} == {a, z} and lp.get("state") == "in-service" and fibres_ok:
+                return name
+        return None
+
+    def _link_up(self, link: Dict[str, Any]) -> bool:
+        return link["status"] == "up" and self._carrier(link) is not None
+
+    def _view_link(self, link: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(link)
+        c = self._carrier(link)
+        if c == "":
+            return out
+        out["rides_optical"] = True
+        out["status"] = "up" if (link["status"] == "up" and c) else "down"
+        out["carried_by"] = (f"optical lightpath {c}" if c else
+                             "no lightpath: the transponders behind its ports are not joined by one in service")
+        return out
+
+    def _svc_up(self, svc: Dict[str, Any]) -> bool:
+        if svc.get("status") != "up":
+            return False
+        over = svc.get("over")
+        if over in (None, "", "local", "best path"):
+            return True
+        link = next((l for l in self.state["links"] if l["name"] == over), None)
+        return bool(link) and self._link_up(link)
+
+    def _route(self, src: str, dst: str) -> Dict[str, Any]:
+        """The hops a packet takes from one host to another, and where it stops if it does."""
+        st = self.state
+        hosts = st["hosts"]
+        by_ip = {h["ip"]: n for n, h in hosts.items()}
+        dst_name = dst if dst in hosts else by_ip.get(dst)
+        if src not in hosts:
+            return {"error": f"no host {src}; hosts are {', '.join(hosts)}"}
+        if not dst_name:
+            gw = {v: k for k, v in st["gateways"].items()}.get(dst)
+            if gw:
+                ok = st["routers"][gw]["status"] == "up" and hosts[src]["router"] == gw
+                return {"hops": [{"hop": 1, "at": f"{gw} ({dst})", "ok": ok}], "reached": ok,
+                        "why": "" if ok else "the gateway is not on this host's router, or its router is down"}
+            return {"error": f"no host or gateway at {dst}"}
+        a, b = hosts[src], hosts[dst_name]
+        hops = []
+        ra = st["routers"].get(a["router"], {})
+        hops.append({"hop": 1, "at": f"{a['router']} ({a['gateway']})", "ok": ra.get("status") == "up"})
+        if not hops[-1]["ok"]:
+            return {"hops": hops, "reached": False, "why": f"{a['router']}, the gateway of {src}, is down"}
+        if a["router"] == b["router"]:
+            hops.append({"hop": 2, "at": f"{dst_name} ({b['ip']})", "ok": True})
+            return {"hops": hops, "reached": True}
+        svcs = [(n, v) for n, v in st["services"].items()
+                if {str(v.get("a")).split(":")[0], str(v.get("z")).split(":")[0]} == {a["router"], b["router"]}]
+        up = [(n, v) for n, v in svcs if self._svc_up(v)]
+        if not up:
+            if not svcs:
+                why = f"no IP service joins {a['router']} and {b['router']}"
+            else:
+                n, v = svcs[0]
+                link = next((l for l in st["links"] if l["name"] == v.get("over")), None)
+                if link and not self._link_up(link):
+                    c = self._carrier(link)
+                    why = (f"{n} rides {link['name']}, which is down: " +
+                           ("no lightpath in service joins its transponders" if c is None else "the link itself is down"))
+                else:
+                    why = f"{n} is {v.get('status')}"
+            hops.append({"hop": 2, "at": "* * *", "ok": False})
+            return {"hops": hops, "reached": False, "why": why}
+        n, v = up[0]
+        link = next((l for l in st["links"] if l["name"] == v.get("over")), None)
+        via = f" over {link['name']}" + (f" on lightpath {self._carrier(link)}" if link and self._carrier(link) else "") if link else ""
+        rb = st["routers"].get(b["router"], {})
+        hops.append({"hop": 2, "at": f"{b['router']} ({b['gateway']}) via {n}{via}", "ok": rb.get("status") == "up"})
+        if not hops[-1]["ok"]:
+            return {"hops": hops, "reached": False, "why": f"{b['router']} is down"}
+        hops.append({"hop": 3, "at": f"{dst_name} ({b['ip']})", "ok": True})
+        return {"hops": hops, "reached": True, "service": n}
+
     def tools(self):
         st = self.state
+
+        def list_hosts():
+            return json.dumps({"hosts": [{"name": n, **h} for n, h in st["hosts"].items()]})
+
+        def ping(src: str, dst: str, count: int = 3):
+            r = self._route(src, dst)
+            if r.get("error"):
+                return f"Error: {r['error']}"
+            n = max(1, min(int(count or 3), 10))
+            got = n if r["reached"] else 0
+            lines = [f"PING {dst} from {src}: {n} packets"]
+            lines += [f"64 bytes from {dst}: icmp_seq={i + 1} ttl=62 time={1.8 + 0.1 * i:.1f} ms" for i in range(got)]
+            lines.append(f"{n} packets transmitted, {got} received, {100 - 100 * got // n}% packet loss")
+            if not r["reached"]:
+                lines.append(f"(unreachable: {r['why']})")
+            return "\n".join(lines)
+
+        def traceroute(src: str, dst: str):
+            r = self._route(src, dst)
+            if r.get("error"):
+                return f"Error: {r['error']}"
+            lines = [f"traceroute from {src} to {dst}"]
+            lines += [f"{h['hop']}  {h['at']}" + ("" if h["ok"] else "  (no answer)") for h in r["hops"]]
+            if not r["reached"]:
+                lines.append(f"stops: {r['why']}")
+            return "\n".join(lines)
 
         def list_routers():
             return json.dumps({"routers": [{"name": n, **r} for n, r in st["routers"].items()]})
 
         def list_links():
-            return json.dumps(st["links"])
+            return json.dumps([self._view_link(l) for l in st["links"]])
 
         def list_handoffs():
             return json.dumps(st["handoffs"])
 
         def list_services():
-            return json.dumps({"services": [{"name": n, **v} for n, v in st["services"].items()]})
+            return json.dumps({"services": [{"name": n, **v, "status": "up" if self._svc_up(v) else "down"}
+                                            for n, v in st["services"].items()]})
 
         def interface_counters(router: str):
             if router not in st["routers"]:
@@ -182,9 +302,11 @@ class Packet(Domain):
         def list_relations():
             rel = []
             for l in st["links"]:
-                if "lightpath" in l["carried_by"]:
-                    lp = l["carried_by"].split("lightpath ")[1].split()[0]
-                    rel.append({"from": f"optical:{lp}", "relation": "carries", "to": f"packet:{l['name']}"})
+                c = self._carrier(l)
+                if c:
+                    rel.append({"from": f"optical:{c}", "relation": "carries", "to": f"packet:{l['name']}"})
+                for end in (l["a"], l["z"]):
+                    rel.append({"from": f"packet:{l['name']}", "relation": "ends at", "to": f"packet:{end}"})
             for name, svc in st["services"].items():
                 if svc.get("over") and svc["over"] not in ("local", "best path"):
                     rel.append({"from": f"packet:{svc['over']}", "relation": "carries", "to": f"packet:{name}"})
@@ -195,6 +317,8 @@ class Packet(Domain):
             for h in st["handoffs"]:
                 dom, obj = h["to"].split(" ", 1)
                 rel.append({"from": f"packet:{h['port']}", "relation": "hands off to", "to": f"{dom}:{obj.split()[0]}"})
+            for n, h in st["hosts"].items():
+                rel.append({"from": f"packet:{n}", "relation": "is attached to", "to": f"packet:{h['port']}"})
             return json.dumps(rel)
 
         return [
@@ -204,6 +328,12 @@ class Packet(Domain):
             Tool("list_links", "List the links between routers, their status and what carries each.", list_links,
                  verb="read_links"),
             Tool("list_handoffs", "List the ports that hand off to other domains, and to what.", list_handoffs),
+            Tool("list_hosts", "The hosts at each site: name, site, IP address, gateway, the router and port they hang off.",
+                 list_hosts, verb="read_hosts"),
+            Tool("ping", "Ping from a host to another host (by name or IP address) or to a gateway: packets sent and "
+                 "answered.", ping, _obj(src=dict(S), dst=dict(S), count=dict(I, optional=True)), verb="ping"),
+            Tool("traceroute", "Trace the hops from a host to another host or address, and where they stop.",
+                 traceroute, _obj(src=dict(S), dst=dict(S)), verb="traceroute"),
             Tool("list_services", "List the VLAN services: vlan, ends, the link they use, customer, status.",
                  list_services, verb="read_services"),
             Tool("interface_counters", "Every interface's counters on one router (in/out octets, errors, state).",
@@ -443,4 +573,6 @@ class Fabric(Domain):
 
 
 def all_domains() -> Dict[str, Domain]:
-    return {d.key: d for d in (Packet(), Optical(), Fabric())}
+    p, o, f = Packet(), Optical(), Fabric()
+    p.optical = o
+    return {d.key: d for d in (p, o, f)}
