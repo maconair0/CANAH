@@ -421,6 +421,9 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         # In order, as the console draws them: what was asked, each tool the agent called (with its
         # arguments and what came back), and what it answered.
         results = {getattr(m, "tool_call_id", ""): m for m in msgs if m.type == "tool"}
+        # an answer a check sent back is a draft: the rewrite that follows is the answer (shown once, not twice)
+        drafts = {id(msgs[i]) for i in range(len(msgs) - 1) if msgs[i].type == "ai" and msgs[i + 1].type == "human"
+                  and "check]" in str(msgs[i + 1].content)[:40]}
         out = []
         for m in msgs:
             text = m.content if isinstance(m.content, str) else " ".join(
@@ -430,7 +433,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                     continue                      # a check's prompt to the model, not the user's words
                 out.append({"role": "user", "text": text})
             elif m.type == "ai":
-                if text.strip():
+                if text.strip() and id(m) not in drafts:
                     out.append({"role": "agent", "text": text})
                 for t in (getattr(m, "tool_calls", None) or []):
                     r = results.get(t.get("id"))
@@ -438,6 +441,25 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                                 "result": (str(r.content)[:4000] if r is not None else None),
                                 "ms": ((r.additional_kwargs or {}).get("ms") if r is not None else None)})
         return out, msgs
+
+    @app.delete("/threads/{thread_id}")
+    def delete_thread(thread_id: str, c=Depends(caller)):
+        """Delete a conversation: its messages and checkpoints, for good (yours only)."""
+        key = thread_key(c["who"], thread_id)
+        if approval_pending_for(key, c["who"]):
+            raise HTTPException(409, "a change in this thread is waiting for approval: decide it first")
+        cfg = A().config(key, c["who"])
+        A().memory.checkpointer.delete_thread(cfg["configurable"]["thread_id"])
+        if A().ops:
+            A().ops.audit("thread deleted", c["who"].user, c["who"].level, key, "thread")
+        return {"deleted": thread_id}
+
+    def approval_pending_for(key: str, who: Identity) -> bool:
+        try:
+            from . import approval as _ap
+            return bool(_ap.pending(A().graph, A().config(key, who)))
+        except Exception:  # noqa: BLE001
+            return False
 
     @app.get("/threads/{thread_id}/history")
     def history(thread_id: str, c=Depends(caller)):
@@ -888,7 +910,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         threading.Thread(target=worker, name=f"canah-investigations-{n}", daemon=True).start()
 
     watcher = Watcher(topology, incidents, agent.notifier or __import__("canah.notify", fromlist=["Notifier"]).Notifier([]),
-                      net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s,
+                      net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s, heartbeat_s=agent.settings.heartbeat_s,
                       resolve_after=agent.settings.resolve_after, history_every=agent.settings.history_every,
                       series=health_series)
     app.state.watcher = watcher
@@ -1263,6 +1285,83 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             raise HTTPException(409, "this agent was built without twins")
         return reg
 
+    @app.get("/twins/runs")
+    def twin_runs(limit: int = 30, c=Depends(caller)):
+        """What the twin has been working on: its recent runs, newest first, each with its question, domain, decision,
+        whether it was hypothetical (a route built for a question) and who asked."""
+        folder = A().settings.home_path / "twin_runs"
+        out = []
+        if folder.is_dir():
+            for f in sorted(folder.glob("*.scenario.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:max(1, min(limit, 200))]:
+                try:
+                    meta = json.loads(f.read_text())
+                    res = json.loads((folder / f"{meta['run_id']}.json").read_text())
+                except Exception:  # noqa: BLE001 - a run half written is skipped
+                    continue
+                out.append({"run_id": meta["run_id"], "at": meta.get("at"), "domain": meta.get("domain"),
+                            "question": (meta.get("scenario") or {}).get("question", ""), "hypothetical": meta.get("hypothetical"),
+                            "by": meta.get("by"), "user": meta.get("user"),
+                            "decision": ((res.get("decision") or {}).get("action")),
+                            "p": ((res.get("probability") or {}).get("p")), "trust": ((res.get("trust") or {}).get("tier"))})
+        return {"runs": out}
+
+    @app.get("/twins/runs/{run_id}")
+    def twin_run(run_id: str, c=Depends(caller)):
+        """One run: the scenario it ran (topology, traffic, the change, the requirements) and what it predicted."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", run_id):
+            raise HTTPException(404, "no such run")
+        folder = A().settings.home_path / "twin_runs"
+        try:
+            meta = json.loads((folder / f"{run_id}.scenario.json").read_text())
+            res = json.loads((folder / f"{run_id}.json").read_text())
+        except (OSError, ValueError):
+            raise HTTPException(404, "no such run")
+        return {**meta, "result": res}
+
+    live_cache: Dict[str, Any] = {"at": 0.0, "data": None}
+
+    @app.get("/live")
+    def live(c=Depends(caller)):
+        """The networks now, per domain: each controller's session, devices and links (how many down), its services
+        with their state, its alarms and open incidents, and what the digital twin holds of it (a snapshot, and its
+        age). Read through the agentic MCP, at most every 5 s however many pages ask."""
+        if time.time() - live_cache["at"] > 5 or live_cache["data"] is None:
+            got = watcher.findings()
+            live_cache.update({"at": time.time(), "data": got})
+        got = live_cache["data"]
+        t = got.get("topology") or {}
+        who = c["who"]
+        try:
+            snaps = A().twins.active().extra("snapshots", {}) if A().twins and A().twins.active() else []
+        except Exception:  # noqa: BLE001 - a twin without snapshots still has runs
+            snaps = []
+        snap_of = {}
+        for sn in snaps if isinstance(snaps, list) else []:
+            snap_of[str(sn.get("network"))] = sn.get("snapshot_id")
+        alarms: Dict[str, List[Dict[str, Any]]] = {}
+        for f in got.get("findings") or []:
+            if f.get("kind") == "alarm":
+                alarms.setdefault(f["controller"], []).append({"severity": f["severity"], "title": f["title"]})
+        open_by: Dict[str, int] = {}
+        for r in incidents.list("active", 2000, who.controllers):
+            open_by[r["controller"]] = open_by.get(r["controller"], 0) + 1
+        domains: Dict[str, List[Dict[str, Any]]] = {}
+        for ctl in t.get("controllers") or []:
+            key = ctl.get("key")
+            if not who.sees(key):
+                continue
+            devs, lks = ctl.get("devices") or [], ctl.get("links") or []
+            rows = got.get("services", {}).get(key) or []
+            domains.setdefault(str(ctl.get("domain") or "network"), []).append({
+                "key": key, "label": ctl.get("label") or key, "ok": bool(ctl.get("ok")), "error": ctl.get("error"),
+                "devices": len(devs), "devices_down": sum(1 for d in devs if d.get("status") == "down"),
+                "links": len(lks), "links_down": sum(1 for l in lks if l.get("state") == "down"),
+                "services": [{k: v for k, v in r.items() if k in ("id", "status", "up", "a", "z", "rate", "kind", "detail")}
+                             for r in rows][:300],
+                "alarms": alarms.get(key, [])[:50], "incidents": open_by.get(key, 0),
+                "twin_snapshot": snap_of.get(key) or snap_of.get(str(ctl.get("domain") or ""))})
+        return {"at": live_cache["at"], "domains": domains}
+
     @app.get("/twins")
     def twins(c=Depends(caller)):
         reg = twins_or_409()
@@ -1436,7 +1535,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         if not PAGE.is_file():
             return "<p>CANAH</p>"
         html = PAGE.read_text()
-        for name in ("app.js", "app.css"):
+        for name in ("app.js", "app.css", "live.js"):
             f = STATIC / name
             if f.is_file():
                 html = html.replace(f"/static/{name}\"", f"/static/{name}?v={int(f.stat().st_mtime)}\"")

@@ -74,6 +74,7 @@
     <div class="section">Monitor</div>
     <button data-view="topology"><span class="ico">◎</span>Topology</button>
     <button data-view="controllers"><span class="ico">⬡</span>SDN controllers</button>
+    <button data-view="live"><span class="ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span>Live network</button>
     <button data-view="incidents"><span class="ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>Incidents<span class="badge bad" id="inc-badge" hidden>0</span></button>
     <div class="section">Operate</div>
     <button data-view="chat"><span class="ico">✦</span>Chat</button>
@@ -281,6 +282,11 @@
         <button class="btn sm" id="tw-refresh">Refresh</button></div>
       <p class="muted page-lead">A digital twin predicts what a change or a failure does to a network before the network sees it. CANAH asks the twin in use through one contract, so any twin that speaks it can be used: netwins, or your own. Changing the twin takes effect at the next question; the agent's tools stay the same.</p>
       <div id="tw-active"></div>
+      <div class="section-h"><h3>What the twin is working on</h3><span class="faint" id="tw-runs-note">its recent runs: the network it ran, the change, and what it predicted</span></div>
+      <div class="twr-wrap">
+        <div class="card twr-list"><div class="body" style="padding:0" id="twr-list"></div></div>
+        <div class="card twr-detail"><div class="body" id="twr-detail"><div class="empty">Choose a run.</div></div></div>
+      </div>
       <div class="section-h"><h3>Domains it covers</h3><span class="faint" id="tw-dom-of"></span></div>
       <div id="tw-domains" class="tw-domains"></div>
       <div class="section-h"><h3>Twins available</h3><span class="faint">choose the one CANAH asks (admin)</span></div>
@@ -402,6 +408,19 @@
       </div>
     </section>
 
+    <!-- Live network -->
+    <section class="view" id="view-live">
+      <div class="row"><h2>Live network</h2><div class="spacer"></div>
+        <span class="faint" id="lv-when" style="font-size:12px"></span>
+        <label class="switch-l" title="Read again every 10 s"><input type="checkbox" id="lv-auto" checked> live</label>
+        <button class="btn sm" id="lv-refresh">Refresh</button></div>
+      <p class="muted page-lead">Every service, per network domain, as the controllers report it now through the agentic MCP, next to what the digital twin holds of each domain and what it last ran there.</p>
+      <div class="kpis hs" id="lv-kpis" style="margin-bottom:14px"></div>
+      <div class="row lv-tools"><input id="lv-filter" class="kn-filter" placeholder="Filter services: name, end, state" autocomplete="off">
+        <label class="switch-l"><input type="checkbox" id="lv-problems"> only what is not up</label></div>
+      <div id="lv-domains"></div>
+    </section>
+
     <!-- Knowledge -->
     <section class="view" id="view-knowledge">
       <div class="row"><h2>Documents &amp; memory</h2><div class="spacer"></div>
@@ -512,5 +531,6 @@
 
 <div class="toasts" id="toasts"></div>
 <script src="/static/app.js"></script>
+<script src="/static/live.js"></script>
 </body>
 </html>

@@ -139,21 +139,21 @@ class Network(Base):
         self.assertIn("node-2", got)
 
     def test_a_change_goes_through_the_domains_config_agent_and_waits(self):
-        a = self.agent(call("task", description="create a service a1 to z1 on alpha", subagent_type="domain-a-config"),
-                       call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}),
+        a = self.agent(call("task", description="create a service node-1 to node-2 on alpha", subagent_type="domain-a-config"),
+                       call("net_provision", controller="alpha", arguments={"a": "node-1", "z": "node-2"}),
                        say("created"), say("Service created."))
-        r = a.ask("create a service from a1 to z1", thread_id="w", who=ADMIN)
+        r = a.ask("create a service from node-1 to node-2", thread_id="w", who=ADMIN)
         self.assertTrue(r.waiting, r)
         self.assertEqual(r.pending[0]["name"], "net_provision")
-        self.assertEqual(self.service.calls, [])
+        self.assertFalse([c for c in self.service.calls if c[1] == "create_service"])     # nothing written before approval
         a.decide("w", [approval.decision("approve")], who=ADMIN)
         writes = [c for c in self.service.calls if c[1] == "create_service"]
-        self.assertEqual(writes, [("alpha", "create_service", {"a": "a1", "z": "z1"}, "ana (approved in canah)")])
+        self.assertEqual(writes, [("alpha", "create_service", {"a": "node-1", "z": "node-2"}, "ana (approved in canah)")])
         self.assertTrue(any(c[1] == "get_nodes" for c in self.service.calls))       # read back after the change
         report = [m for m in a.graph.get_state(a.config("w", ADMIN)).values["messages"]
                   if m.type == "tool" and m.name == "task"][-1].content
         self.assertIn("Writes sent in this task", report)                   # what was sent, from the harness
-        self.assertIn('"a": "a1"', report)
+        self.assertIn('"a": "node-1"', report)
 
     def test_a_tool_beyond_the_contract_through_the_config_agent(self):
         a = self.agent(call("task", description="put a meter on beta port 1", subagent_type="domain-b-config"),
@@ -166,7 +166,7 @@ class Network(Base):
         self.assertIn(("beta", "set_meter", {"port": "1"}), [c[:3] for c in self.service.calls])
 
     def test_without_the_team_the_agent_does_it_all_itself(self):
-        a = self.agent(call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}), say("ok"),
+        a = self.agent(call("net_provision", controller="alpha", arguments={"a": "node-1", "z": "node-2"}), say("ok"),
                        providers=[AgenticMCPProvider(service=self.service, team=False)])
         r = a.ask("create it", thread_id="solo", who=ADMIN)
         self.assertEqual(r.pending[0]["name"], "net_provision")
@@ -232,3 +232,17 @@ class Knowledge(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeneralPurpose(unittest.TestCase):
+    def test_the_general_purpose_agent_holds_no_network_twin_or_write_tool(self):
+        from canah import build_agent, load_settings
+        from canah.memory import open_memory
+        from canah.network import AgenticMCPProvider
+        from tests_canah.fakes import ScriptedModel, say
+        a = build_agent(load_settings(path="/x", sandbox="none"), [AgenticMCPProvider(service=FakeAgenticMCP())],
+                        model=ScriptedModel(script=[say("ok")]), memory=open_memory(in_memory=True))
+        gp = next(d for d in a.info["subagent_detail"] if d["name"] == "general-purpose")
+        names = gp.get("tool_names")
+        self.assertIsNotNone(names)                                       # its own list, not the main agent's
+        self.assertFalse([n for n in names if n.startswith(("net_", "controller_", "twin_")) or n == "twin_override"], names)

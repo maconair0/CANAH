@@ -522,6 +522,14 @@ _EXAMPLE = re.compile(r"\b(example|sample) (scenario|network)\b|\bthe twin'?s (o
 _LIVE = ("net_read_", "follow_relations", "network_controllers", "network_health", "controller_read")
 
 
+def _num(v: Any) -> str:
+    """A number as written: 5500, 395.5 (not 5500.0)."""
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
 class QotRuns(AgentMiddleware):
     """On qot. A task about the twin's own example scenario is run in the twin, not looked for in the live network
     (qot searched every controller for "turin" before, and once never ran the twin at all). And a report with a
@@ -555,6 +563,34 @@ class QotRuns(AgentMiddleware):
         state = getattr(request, "state", None) or {}
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         args = request.tool_call.get("args") or {}
+        if name == "twin_extra" and str(args.get("name")) == "route":
+            a = args.get("arguments") or {}
+            given = self._task(msgs)
+            length = a.get("length_km")
+            if length not in (None, "", 0) and not re.search(rf"(?<![\d.]){re.escape(_num(length))}(\.0+)?\s*km",
+                                                            given, re.I):
+                return ToolMessage(tool_call_id=request.tool_call["id"], name=name, status="error", content=(
+                    f"Not run: length_km={length} is not a length the operator gave, so it would be made up. Leave "
+                    f"length_km out: give the places as the operator did, or their coordinates as 'lat,lon' if the "
+                    f"question has them, and the route is computed from them (great-circle distance and a detour, "
+                    f"stated). If it then says what it needs, ask the operator for exactly that."))
+        if name == "twin_extra" and str(args.get("name")) == "route":
+            got = handler(request)
+            text = str(getattr(got, "content", got))
+            if '"ok": true' in text:
+                try:
+                    from .safety import _run
+                    run = _run()
+                    if run is not None:
+                        run["hypothetical"] = True       # no change follows in this request (safety.ScopeGuard)
+                except Exception:  # noqa: BLE001
+                    pass
+                if isinstance(got, ToolMessage):
+                    got = got.model_copy(update={"content": text + (
+                        "\n\n[HYPOTHETICAL: this route is built for the question, from distances, not read from any "
+                        "network. Nothing in it exists. Say so in your report (TWIN: ... on a hypothetical route), and "
+                        "propose no change from it.]")})
+            return got
         live = name.startswith(_LIVE) or (name == "twin_extra" and str(args.get("name")) in ("mirror", "inspect", "subnetwork",
                                                                                         "snapshots"))
         if live and _EXAMPLE.search(self._task(msgs)) and not self._ran(msgs):
@@ -565,6 +601,10 @@ class QotRuns(AgentMiddleware):
         return handler(request)
 
     async def awrap_tool_call(self, request, handler):
+        import asyncio
+        if request.tool_call.get("name") == "twin_extra" and str((request.tool_call.get("args") or {}).get("name")) == "route":
+            got = await handler(request)
+            return self.wrap_tool_call(request, lambda r: got)
         out = self.wrap_tool_call(request, lambda r: None)
         return out if out is not None else await handler(request)
 

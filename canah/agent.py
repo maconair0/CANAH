@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from deepagents import create_deep_agent
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
@@ -306,6 +306,11 @@ class CanahAgent:
                 continue
             for update in (chunk or {}).values() if isinstance(chunk, dict) else ():
                 for m in (update or {}).get("messages", []) if isinstance(update, dict) else ():
+                    if not ns and isinstance(m, HumanMessage) and "check]" in str(m.content)[:40]:
+                        # A check sent the answer back: what streamed so far is a draft, not the answer.
+                        cur, held, passing = None, "", False
+                        yield mode, {"type": "redo", "check": str(m.content)[1:str(m.content).find("]")]}
+                        continue
                     if isinstance(m, AIMessage):
                         for c in m.tool_calls or []:
                             if c.get("id") not in seen_calls:
@@ -503,7 +508,12 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                                       "agent's own tools: it cannot read or change a controller; delegate those to "
                                       "the main agent, which works the controllers through the agentic MCP."),
                       "system_prompt": ("You do one self-contained piece of work for the main agent and report the "
-                                        "result briefly. Read before you conclude; a change is paused for approval.")})
+                                        "result briefly. Read before you conclude; a change is paused for approval."),
+                      # what its description says: no controller, no twin, no change (it once overrode a twin check
+                      # with a made-up id); the main agent's other tools (documents, diagrams, operations)
+                      "tools": [t for t in tools if not t.name.startswith(("net_", "controller_", "network_", "twin_"))
+                                and t.name not in ("follow_relations",) and t.name not in set(writes)
+                                and t.name not in set(got.get("subagent_only") or [])]})
     shared = [t for t in tools if t.name in set(got.get("shared") or [])]
     budget = TimeBudget(settings.task_seconds)
     from .ops import Ops
@@ -529,7 +539,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     repeat = RepeatGuard()
     guard_mem = GuardMemory(ops)
     calls = CallLog(settings.home_path)
-    scope = ScopeGuard(approvals)
+    scope = ScopeGuard(approvals, locate=getattr(_net_for_verify, "locate", None))
     for spec in specs:
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
@@ -636,6 +646,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     known = {"librarian": "knowledge", "general-purpose": "general", "qot": "qot"}
     detail = [{"name": sp["name"], "description": str(sp.get("description") or "")[:400],
                "tools": len(sp["tools"]) if sp.get("tools") is not None else None,
+               "tool_names": [getattr(t, "name", str(t)) for t in sp["tools"]] if sp.get("tools") is not None else None,
                "kind": (roles.get(sp["name"]) or {}).get("kind") or known.get(sp["name"], "custom"),
                **{k: v for k, v in (roles.get(sp["name"]) or {}).items() if k != "kind"}} for sp in specs]
     info = {"model": models.describe() if model is None else {"model": type(model).__name__},
@@ -679,7 +690,15 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
              "system_prompt": ("You are CANAH's quality-of-transmission agent. First: when the request names the twin's "
                                "example scenario, or describes a network itself, call twin_schema(domain) and run that "
                                "scenario (twin_validate, twin_predict) as given, changing only what the request changes; "
-                               "do not look for its objects in the live network, they are not there. "
+                               "do not look for its objects in the live network, they are not there. When it names places that are in no "
+                               "network here (cities, sites: 'a 600G service from Accra to Milan'), build the route with "
+                               "twin_extra('route', {from, to, rate_gbps, length_km if the operator gave it}) and run its "
+                               "scenario (twin_validate, twin_predict); report the result with the route's assumptions as "
+                               "listed. If it answers with what it needs (a length or coordinates), ask the operator for "
+                               "exactly that. A what-if on a live optical network (a fibre cut, a new lightpath on it) is built "
+                               "from twin_extra('mirror', {controller}) on that optical controller: its fibres with their "
+                               "lengths and its lightpaths, put in the optical scenario as they are; if it says a length is "
+                               "missing, ask the operator for it, never guess it. "
                                "You read every domain and you work the digital "
                                "twin; you change nothing. For a question about quality or health: read it (net_read_ tools, "
                                "incidents, health_over_time, network_changes) and report the figures as read. For a what-if "

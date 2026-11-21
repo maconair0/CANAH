@@ -115,7 +115,7 @@ setInterval(() => { $("#st-clock").textContent = new Date().toLocaleTimeString()
 $("#st-ctl").addEventListener("click", () => go("controllers"));
 
 /* ================= router ================= */
-const VIEWS = ["incidents", "model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
+const VIEWS = ["live", "incidents", "model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
 function go(view, first = false) {
   if (!VIEWS.includes(view)) view = "topology";
   state.view = view; store.set("canah.view", view);
@@ -133,7 +133,8 @@ function go(view, first = false) {
   }
   if (view === "topology") pollActivity();
   if (view === "ops") renderOps();
-  if (view === "twins") renderTwins();
+  if (view === "twins") renderTwins().then(() => typeof renderTwinRuns === "function" && renderTwinRuns());
+  if (view === "live" && typeof renderLive === "function") renderLive();
   if (view === "knowledge") renderKnowledge();
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
@@ -862,19 +863,63 @@ function saveThread(id, title) {
   const old = threads().find((t) => t.id === id);
   const list = threads().filter((t) => t.id !== id);
   const keep = old && old.title && old.title !== "new thread" && old.title !== "attached files";
-  list.unshift({ id, title: ((keep ? old.title : title) || "new thread").slice(0, 80), at: Date.now() / 1000 });
-  store.set(threadsKey(), list.slice(0, 60)); loadThreads();
+  list.unshift({ id, title: ((keep ? old.title : title) || "new thread").slice(0, 80), at: Date.now() / 1000, pinned: !!old?.pinned });
+  // pinned threads are never pushed out by new ones
+  const pinned = list.filter((t) => t.pinned), rest = list.filter((t) => !t.pinned);
+  store.set(threadsKey(), [...pinned, ...rest.slice(0, Math.max(10, 60 - pinned.length))]); loadThreads();
+}
+function editThread(id, change) { store.set(threadsKey(), threads().map((t) => t.id === id ? { ...t, ...change } : t)); loadThreads(); }
+async function deleteThread(id) {
+  const t = threads().find((x) => x.id === id);
+  if (!confirm(`Delete "${t?.title || id}"? Its messages are removed from CANAH for good.`)) return;
+  try { await api(`/threads/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  catch (e) { toast(e.message, "bad"); return; }
+  store.set(threadsKey(), threads().filter((x) => x.id !== id));
+  toast("Thread deleted.", "ok");
+  if (state.chat.thread === id) openThread(""); else loadThreads();
+}
+function threadMenu(id, x, y) {
+  const old = $("#thread-menu"); if (old) old.parentNode.removeChild(old);
+  const t = threads().find((q) => q.id === id); if (!t) return;
+  const m = document.createElement("div"); m.id = "thread-menu"; m.className = "ctx-menu"; m.setAttribute("role", "menu");
+  m.innerHTML = `<button role="menuitem" data-a="pin">${t.pinned ? "Unpin" : "Pin to top"}</button>
+    <button role="menuitem" data-a="rename">Rename</button>
+    <button role="menuitem" data-a="hide">Remove from this list</button>
+    <hr><button role="menuitem" data-a="del" class="danger">Delete thread</button>`;
+  document.body.append(m);
+  const r = m.getBoundingClientRect();
+  m.style.left = `${Math.max(8, Math.min(x, innerWidth - r.width - 8))}px`; m.style.top = `${Math.max(8, Math.min(y, innerHeight - r.height - 8))}px`;
+  const close = () => { if (m.parentNode) m.parentNode.removeChild(m); document.removeEventListener("pointerdown", away, true); document.removeEventListener("keydown", onKey); };
+  const away = (e) => { if (!m.contains(e.target)) close(); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  setTimeout(() => { document.addEventListener("pointerdown", away, true); document.addEventListener("keydown", onKey); });
+  m.addEventListener("click", (e) => {
+    const act = e.target.dataset?.a; if (!act) return; close();
+    if (act === "pin") editThread(id, { pinned: !t.pinned });
+    else if (act === "rename") { const nm = prompt("Thread name", t.title); if (nm && nm.trim()) editThread(id, { title: nm.trim().slice(0, 80) }); }
+    else if (act === "hide") { store.set(threadsKey(), threads().filter((q) => q.id !== id)); if (state.chat.thread === id) openThread(""); else loadThreads(); }
+    else if (act === "del") deleteThread(id);
+  });
+  m.querySelector("button")?.focus();
 }
 function loadThreads() {
   const box = $("#thread-list"); if (!box) return;
-  const list = threads();
-  box.innerHTML = list.length ? list.map((t) => `<button class="lg-thread${t.id === state.chat.thread ? " on" : ""}" data-id="${esc(t.id)}">
-      <span class="t">${esc(t.title)}</span><span class="x" data-x="${esc(t.id)}" title="Forget this thread here">×</span><span class="w">${esc(ago(t.at))}</span></button>`).join("")
+  const all = threads(), list = [...all.filter((t) => t.pinned), ...all.filter((t) => !t.pinned)];
+  const row = (t) => `<button class="lg-thread${t.id === state.chat.thread ? " on" : ""}${t.pinned ? " pinned" : ""}" data-id="${esc(t.id)}" title="Right-click: pin, rename, delete">
+      <span class="t">${t.pinned ? `<svg class="pin" aria-label="pinned" width="10" height="10" viewBox="0 0 16 16"><path fill="currentColor" d="M10.5 1.5 14.5 5.5 12 6.3 9.6 8.7 10 12.5 8.6 13.9 5.6 10.9 2 14.5 1.5 14 5.1 10.4 2.1 7.4 3.5 6 7.3 6.4 9.7 4z"/></svg>` : ""}${esc(t.title)}</span><span class="x" data-menu="1" title="Pin, rename, delete">⋯</span><span class="w">${esc(ago(t.at))}</span></button>`;
+  const pins = list.filter((t) => t.pinned);
+  box.innerHTML = list.length ? (pins.length ? `<div class="lg-thread-group">Pinned</div>${pins.map(row).join("")}<div class="lg-thread-group">Recent</div>` : "")
+      + list.filter((t) => !t.pinned).map(row).join("")
     : `<div class="empty" style="font-size:12.5px">No threads yet. Ask something to start one.</div>`;
-  $$(".lg-thread", box).forEach((b) => b.addEventListener("click", (e) => {
-    if (e.target.dataset.x) { store.set(threadsKey(), threads().filter((t) => t.id !== e.target.dataset.x)); if (state.chat.thread === e.target.dataset.x) openThread(""); else loadThreads(); return; }
-    openThread(b.dataset.id);
-  }));
+  $$(".lg-thread", box).forEach((b) => {
+    b.addEventListener("click", (e) => {
+      if (e.target.dataset.menu) { const r = e.target.getBoundingClientRect(); threadMenu(b.dataset.id, r.left, r.bottom + 4); return; }
+      openThread(b.dataset.id);
+    });
+    b.addEventListener("contextmenu", (e) => { e.preventDefault(); threadMenu(b.dataset.id, e.clientX, e.clientY); });
+    let press; b.addEventListener("touchstart", (e) => { const p0 = e.touches[0]; press = setTimeout(() => threadMenu(b.dataset.id, p0.clientX, p0.clientY), 550); }, { passive: true });
+    b.addEventListener("touchend", () => clearTimeout(press));
+  });
   const cur = list.find((t) => t.id === state.chat.thread);
   $("#lg-title").textContent = cur ? cur.title : "new thread";
 }
@@ -1137,6 +1182,13 @@ function addAgent(question = "") {
   const turn = {
     el: m, segs, raw: "", flow: newFlow(question), timing,
     token(t) { if (timing.first == null) timing.first = performance.now() - t0; working()?.remove(); if (!last) { last = document.createElement("div"); last.className = "reply-rich"; last._raw = ""; segs.append(last); } last._raw += t; last.innerHTML = md(last._raw); scrollDown(); },
+    redo(check) {   // a check sent the answer back: the text streamed since the last reply is a draft
+      const drafts = [...segs.querySelectorAll(":scope > .reply-rich")].filter((x) => !x.closest("details"));
+      if (!drafts.length) return;
+      const d = document.createElement("details"); d.className = "draft";
+      d.innerHTML = `<summary>An earlier draft, sent back by the ${esc(check || "check")}</summary>`;
+      drafts[0].before(d); drafts.forEach((x) => d.append(x)); last = null;
+    },
     text(t) { if (!t) return; working()?.remove(); last = document.createElement("div"); last.className = "reply-rich"; last._raw = t; last.innerHTML = md(t); segs.append(last); drawDiagrams(last); },
     final(t) {     // the reply as the agent ended it: replaces what streamed after the last tool card
       working()?.remove();
@@ -1213,6 +1265,7 @@ async function stream(path, body, turn) {
         if (!ev || !data) continue;
         const d = JSON.parse(data);
         if (ev === "token") turn.token(d.text);
+        else if (ev === "redo") turn.redo(d.check);
         else if (ev === "tool_call") {
           const sub = d.name === "task" ? d.args?.subagent_type : agentFor(String(d.name).split("__")[0]);
           if (/^net_|^controller_|^network_|follow_relations/.test(d.name)) active.add(d.args?.controller ? `ctl:${d.args.controller}` : "mcp");

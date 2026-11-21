@@ -400,15 +400,26 @@ _ASKS_REMOVAL = re.compile(r"\b(delete|remove|tear\s*down|teardown|destroy|detac
 _SCOPE = "[scope check]"
 
 
-class ScopeGuard(AgentMiddleware):
-    """A change that removes something (delete, teardown, disconnect ...) when the operator asked for nothing of
-    the kind is taken back before it reaches the approval: the model is asked again, once, without it. One run
-    tore down a lightpath in service to free a transponder for the one it was asked to create. The operator's
-    own question is what counts, also inside a subagent (it travels with the task)."""
+_ENDPOINT_KEYS = ("a", "z", "src", "dst", "source", "destination", "from", "to", "node", "node_id", "device", "device_id",
+                  "router", "switch", "leaf", "a_end", "z_end", "src_node", "dst_node", "transponder")
 
-    def __init__(self, writes: Iterable[str]):
+
+class ScopeGuard(AgentMiddleware):
+    """Changes taken back before they reach the approval (the model is asked again, once, without them):
+
+      a removal (delete, teardown, disconnect ...) the operator did not ask for: one run tore down a lightpath in
+          service to free a transponder for the one it was asked to create;
+      any change in a request that built a hypothetical route (places in no network, for a question): what it
+          describes does not exist, and a what-if never becomes a change on its own;
+      a change naming an endpoint (a device, a port, a site) that no controller lists: links and devices are not
+          made up.
+
+    The operator's own question is what counts, also inside a subagent (it travels with the task)."""
+
+    def __init__(self, writes: Iterable[str], locate: Any = None):
         super().__init__()
         self.writes = set(writes)
+        self.locate = locate            # name -> controllers whose reads mention it
 
     def _removal(self, call: Dict[str, Any]) -> bool:
         name = str(call.get("name") or "")
@@ -428,39 +439,67 @@ class ScopeGuard(AgentMiddleware):
         from .grounding import current_question
         return current_question(list(getattr(request, "messages", []) or []))
 
+    def _unknown_endpoints(self, call: Dict[str, Any]) -> List[str]:
+        if self.locate is None or str(call.get("name") or "") not in self.writes:
+            return []
+        args = call.get("args") or {}
+        inner = args.get("arguments") if isinstance(args.get("arguments"), dict) else args
+        out = []
+        for k, v in (inner or {}).items():
+            if k.lower() not in _ENDPOINT_KEYS or not isinstance(v, str) or not v.strip():
+                continue
+            try:
+                if not self.locate(v) and not self.locate(v.split(":")[0]):
+                    out.append(v)
+            except Exception:  # noqa: BLE001 - a lookup that fails proves nothing either way
+                continue
+        return out
+
+    def _review(self, request, msg) -> Optional[str]:
+        if msg is None or not msg.tool_calls:
+            return None
+        if any(_SCOPE in str(getattr(m, "content", "")) for m in (request.messages or [])):
+            return None
+        writes = [c for c in msg.tool_calls if str(c.get("name") or "") in self.writes]
+        if not writes:
+            return None
+        run = _run() or {}
+        if run.get("hypothetical"):
+            return (f"{_SCOPE} This request answered a question on a hypothetical route (places in no network here): "
+                    f"nothing it describes exists, so no change follows from it. Do not make one. Answer the question; "
+                    f"a change is for the operator to ask for separately, on the real network.")
+        unknown = [e for c in writes for e in self._unknown_endpoints(c)]
+        if unknown:
+            return (f"{_SCOPE} The change names {', '.join(sorted(set(unknown)))}, which no controller lists: it would "
+                    f"be made up. Do not send it. Read what exists (the net_read_ tools) and use the real names, or say "
+                    f"that {'it does' if len(set(unknown)) == 1 else 'they do'} not exist in the network.")
+        bad = [c for c in writes if self._removal(c)]
+        if bad and not self._asked_for(self._question(request) or ""):
+            return (f"{_SCOPE} You were about to remove something ({', '.join(c['name'] + ' ' + json.dumps(c.get('args'), default=str)[:200] for c in bad)}), "
+                    f"and the operator did not ask to remove anything. Do not. If what was asked cannot be done without it "
+                    f"(a port or transponder is in use, say), report exactly that, and what is using it, and stop: removing it "
+                    f"is the operator's decision, to ask for in their own words.")
+        return None
+
     def wrap_model_call(self, request, handler: Callable):
         got = handler(request)
         msg = _last_ai(got)
-        if msg is None or not msg.tool_calls:
-            return got
-        bad = [c for c in msg.tool_calls if self._removal(c)]
-        if not bad or self._asked_for(self._question(request) or ""):
-            return got
-        if any(_SCOPE in str(getattr(m, "content", "")) for m in (request.messages or [])):
+        why = self._review(request, msg)
+        if not why:
             return got
         from langchain_core.messages import HumanMessage
-        note = HumanMessage(content=(
-            f"{_SCOPE} You were about to remove something ({', '.join(c['name'] + ' ' + json.dumps(c.get('args'), default=str)[:200] for c in bad)}), "
-            f"and the operator did not ask to remove anything. Do not. If what was asked cannot be done without it "
-            f"(a port or transponder is in use, say), report exactly that, and what is using it, and stop: removing it "
-            f"is the operator's decision, to ask for in their own words."))
-        return handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls], note]))
+        return handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls],
+                                                  HumanMessage(content=why)]))
 
     async def awrap_model_call(self, request, handler: Callable):
         got = await handler(request)
         msg = _last_ai(got)
-        if msg is None or not msg.tool_calls:
-            return got
-        bad = [c for c in msg.tool_calls if self._removal(c)]
-        if not bad or self._asked_for(self._question(request) or ""):
-            return got
-        if any(_SCOPE in str(getattr(m, "content", "")) for m in (request.messages or [])):
+        why = self._review(request, msg)
+        if not why:
             return got
         from langchain_core.messages import HumanMessage
-        note = HumanMessage(content=(
-            f"{_SCOPE} You were about to remove something, and the operator did not ask to remove anything. Do not. "
-            f"If what was asked cannot be done without it, report exactly that and stop."))
-        return await handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls], note]))
+        return await handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls],
+                                                        HumanMessage(content=why)]))
 
 
 def _last_ai(got: Any):

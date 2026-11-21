@@ -337,3 +337,16 @@ class DocumentsPage(Base):
         self.assertEqual(self.a.memory.store.get(namespace("ana"), "/memories/site.md").value["content"],
                          ["site-b: fans replaced"])
         self.assertEqual(self.client.get("/memories/ana/item?path=/x", headers=self.h).status_code, 404)
+
+
+class DeleteThread(Base):
+    def test_a_thread_is_deleted_for_good_and_only_the_callers(self):
+        os.environ["CANAH_ADMIN_PASSWORD"] = "adm1n-pass"
+        self.addCleanup(os.environ.pop, "CANAH_ADMIN_PASSWORD")
+        a = self.agent(say("hello back"), say("again"))
+        client = TestClient(create_app(a, Accounts(os.path.join(self.home, "users.json"))))
+        h = {"Authorization": "Bearer " + client.post("/session", json={"username": "admin", "password": "adm1n-pass"}).json()["token"]}
+        client.post("/threads/t1/messages", json={"text": "hello"}, headers=h)
+        self.assertEqual(len(client.get("/threads/t1/history", headers=h).json()["messages"]), 2)
+        self.assertEqual(client.delete("/threads/t1", headers=h).json(), {"deleted": "t1"})
+        self.assertEqual(client.get("/threads/t1/history", headers=h).json()["messages"], [])

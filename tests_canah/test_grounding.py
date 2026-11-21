@@ -643,3 +643,56 @@ class ExampleFromTheOperator(unittest.TestCase):
             self.assertIn("[twin run check]", out["messages"][0].content)       # "cannot" without trying is not enough
         finally:
             _ASKED.reset(tok)
+
+
+class RouteLength(unittest.TestCase):
+    def test_a_route_length_the_operator_did_not_give_is_refused(self):
+        from types import SimpleNamespace
+        from langchain_core.messages import HumanMessage
+        from canah.grounding import QotRuns
+        q = QotRuns()
+
+        def ask(task, length):
+            req = SimpleNamespace(tool_call={"name": "twin_extra", "id": "1", "args": {"name": "route", "arguments": {
+                "from": "Accra", "to": "Milan", "length_km": length}}}, state={"messages": [HumanMessage(content=task)]})
+            return q.wrap_tool_call(req, lambda r: "ran")
+        self.assertIn("made up", ask("A 600G service from Accra to Milan?", 5500).content)
+        self.assertEqual(ask("A 600G service from Accra to Milan over 5500 km of fibre?", 5500), "ran")
+        self.assertEqual(ask("A 600G service from Accra to Milan?", None), "ran")
+
+
+class Grounded(unittest.TestCase):
+    def _agent(self, script, locate=None):
+        p = FunctionProvider()
+
+        def create_link(a: str, z: str) -> str:
+            """Create a link."""
+            return f"link {a}-{z} created"
+        p.add(create_link, write=True)
+        model = ScriptedModel(script=list(script))
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        return a, model
+
+    def test_a_change_naming_an_endpoint_no_controller_lists_is_taken_back(self):
+        from canah.identity import Identity
+        from canah.safety import ScopeGuard
+        # the guard itself, with a lookup that knows pe-a only
+        g = ScopeGuard(["create_link"], locate=lambda n: ["packet"] if n == "pe-a" else [])
+        from langchain_core.messages import AIMessage
+        from types import SimpleNamespace
+        msg = AIMessage(content="", tool_calls=[{"name": "create_link", "args": {"a": "pe-a", "z": "Accra-ROADM"}, "id": "1"}])
+        why = g._review(SimpleNamespace(messages=[]), msg)
+        self.assertIn("Accra-ROADM", why)
+        self.assertIn("made up", why)
+        ok = AIMessage(content="", tool_calls=[{"name": "create_link", "args": {"a": "pe-a", "z": "pe-a:eth4"}, "id": "2"}])
+        self.assertIsNone(g._review(SimpleNamespace(messages=[]), ok))
+
+    def test_no_change_follows_a_hypothetical_route_in_the_same_request(self):
+        from unittest import mock
+        from types import SimpleNamespace
+        from langchain_core.messages import AIMessage
+        from canah.safety import ScopeGuard
+        g = ScopeGuard(["create_link"])
+        msg = AIMessage(content="", tool_calls=[{"name": "create_link", "args": {"a": "x", "z": "y"}, "id": "1"}])
+        with mock.patch("canah.safety._run", return_value={"hypothetical": True}):
+            self.assertIn("hypothetical", g._review(SimpleNamespace(messages=[]), msg))

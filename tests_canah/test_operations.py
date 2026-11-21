@@ -227,3 +227,56 @@ class HealthOverTime(Base):
         t = {x.name: x for x in p.tools()}
         out = json.loads(t["health_over_time"].invoke({"hours": 1}, config={"configurable": {}}))
         self.assertEqual(out["opt"]["incidents"], {"now": 2, "max": 2, "min": 0})
+
+
+class SelfDescription(unittest.TestCase):
+    def test_an_answer_that_calls_built_features_missing_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.operations import SelfClaims
+        g = SelfClaims.make()
+        q = HumanMessage(content="Describe yourself.")
+        wrong = AIMessage(content="What I cannot do:\n- Auto-remediation: I cannot apply fixes without human approval.\n"
+                                  "- Multi-tenant support: no isolation between domains.\n"
+                                  "- RBAC enforcement: cannot block actions based on user role.")
+        out = g.after_model({"messages": [q, wrong]}, None)
+        self.assertIn("tenant", out["messages"][0].content)
+        self.assertIn("roles enforced", out["messages"][0].content)
+        right = AIMessage(content="Not built yet: applying a fix without human approval; several agentic MCPs.\n"
+                                  "Needs attention: no notification channel is configured.")
+        self.assertIsNone(g.after_model({"messages": [q, right]}, None))
+        self.assertIsNone(g.after_model({"messages": [HumanMessage(content="List the lightpaths."), wrong]}, None))
+
+
+class Heartbeat(unittest.TestCase):
+    def test_a_controller_going_down_is_seen_at_the_next_beat_and_read_at_once(self):
+        import tempfile
+        from pathlib import Path
+        from canah.incidents import Incidents, Watcher
+        from canah.notify import Notifier
+
+        class Svc:
+            def __init__(self):
+                self.state, self.calls = "up", []
+
+            def controllers(self):
+                return [{"key": "pkt"}]
+
+            def tools(self, key):
+                return [{"name": "health", "verb": "health", "write": False}]
+
+            def call(self, key, tool, args):
+                self.calls.append((key, tool))
+                return {"text": "ok"}
+
+            def get(self, path, timeout=None):
+                return {"sessions": [{"controller": "pkt", "state": self.state}]}
+
+        svc = Svc()
+        topo = type("T", (), {"service": svc, "read": lambda self, refresh=True: {"controllers": []}})()
+        home = Path(tempfile.mkdtemp())
+        w = Watcher(topo, Incidents(home / "i.sqlite"), Notifier([]), heartbeat_s=5)
+        self.assertEqual(w.heartbeat(), {})                       # the first beat only learns the states
+        self.assertIn(("pkt", "health"), svc.calls)               # the controller itself was asked, cheaply
+        svc.state = "down"
+        self.assertEqual(w.heartbeat(), {"pkt": ("up", "down")})
+        self.assertEqual(w.heartbeat(), {})                       # said once, not at every beat

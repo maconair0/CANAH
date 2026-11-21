@@ -258,7 +258,8 @@ class Watcher:
 
     def __init__(self, topology: Any, store: Incidents, notifier: Notifier, history: Any = None,
                  runbooks: Callable[[], List[Dict[str, Any]]] = lambda: [], respond: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 interval_s: float = 60.0, resolve_after: int = 2, history_every: int = 5, series: Any = None):
+                 interval_s: float = 60.0, resolve_after: int = 2, history_every: int = 5, series: Any = None,
+                 heartbeat_s: float = 5.0):
         self.topology, self.store, self.notifier, self.history, self.series = topology, store, notifier, history, series
         self.runbooks, self.respond = runbooks, respond
         self.interval_s, self.resolve_after, self.history_every = interval_s, resolve_after, max(1, history_every)
@@ -266,6 +267,11 @@ class Watcher:
         self.last: Dict[str, Any] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.heartbeat_s = float(heartbeat_s or 0)
+        self._states: Dict[str, str] = {}
+        self._poll_lock = threading.Lock()
+        self.beats = 0
+        self.last_beat: Dict[str, Any] = {}
 
     # -- what the networks say
 
@@ -419,15 +425,71 @@ class Watcher:
                                                              "services", "services_down")}
         return {"objects": objects, "controllers": ctls, "relations": rel, "recent_changes": changes, "health_now": health}
 
+    # -- the heartbeat: is every controller still there, every few seconds, at almost no cost
+
+    def heartbeat(self) -> Dict[str, Any]:
+        """Each controller's health check (the contract's health verb, a light call that reads no devices), at once
+        and in parallel, then the agentic MCP's view of each session. What changed since the last beat (a controller
+        down, back, the agentic MCP itself gone) is returned; the loop then reads everything at once instead of
+        waiting for the next full poll. Sessions are only updated by calls, so the calls are what make it current."""
+        self.beats += 1
+        svc = self.topology.service
+        states: Dict[str, str] = {}
+        try:
+            keys = [c.get("key") for c in svc.controllers() if c.get("key")]
+        except Exception as e:  # noqa: BLE001
+            states["agentic-mcp"] = "down"
+            keys = []
+            logger.debug("heartbeat: agentic MCP: %s", e)
+        else:
+            states["agentic-mcp"] = "up"
+
+        def ping(key):
+            tool = self._verb_tools(svc, key).get("health")
+            if tool:
+                try:
+                    svc.call(key, tool, {})
+                except Exception:  # noqa: BLE001 - the session records it
+                    pass
+        threads = [threading.Thread(target=ping, args=(k,), daemon=True) for k in keys]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+        try:
+            sess = svc.get("/sessions", timeout=5)
+            for x in (sess.get("sessions") if isinstance(sess, dict) else sess) or []:
+                if x.get("controller"):
+                    states[x["controller"]] = str(x.get("state") or "unknown").lower()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("heartbeat sessions: %s", e)
+        changed = {k: (self._states.get(k), v) for k, v in states.items() if self._states and self._states.get(k) != v}
+        self._states = states
+        self.last_beat = {"at": time.time(), "states": states, "changed": changed}
+        return changed
+
     def start(self) -> "Watcher":
         def loop():
             time.sleep(5)
+            next_poll = 0.0
             while not self._stop.is_set():
-                try:
-                    self.poll()
-                except Exception:  # noqa: BLE001 - the watcher keeps watching
-                    logger.exception("watch poll failed")
-                self._stop.wait(self.interval_s)
+                now = time.time()
+                changed = {}
+                if self.heartbeat_s:
+                    try:
+                        changed = self.heartbeat()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("heartbeat failed")
+                if changed:
+                    logger.info("controller state changed %s: reading now", changed)
+                if changed or now >= next_poll:
+                    try:
+                        with self._poll_lock:
+                            self.poll()
+                    except Exception:  # noqa: BLE001 - the watcher keeps watching
+                        logger.exception("watch poll failed")
+                    next_poll = time.time() + self.interval_s
+                self._stop.wait(self.heartbeat_s or self.interval_s)
         self._thread = threading.Thread(target=loop, name="canah-watch", daemon=True)
         self._thread.start()
         return self

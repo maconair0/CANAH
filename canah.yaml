@@ -29,7 +29,8 @@ twin_gate: true
 
 # Operations (canah/incidents.py): the watcher reads every controller through the contract each minute and opens
 # incidents; runbooks (canah/runbooks, and <CANAH_HOME>/runbooks) investigate or propose fixes for approval.
-# watch_interval_s: 60
+# watch_interval_s: 30      # a full read of every controller
+# heartbeat_s: 5            # each controller's health check; a change reads all at once
 # respond: true                 # runbooks may investigate on their own (respond_per_hour: 6)
 # Where incidents and waiting approvals are sent; a secret is the NAME of an environment variable:
 # notify_channels:

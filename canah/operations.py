@@ -10,6 +10,7 @@ opened, and the networks' history (a ToolProvider).
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -18,23 +19,84 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 
 HARNESS = """What this harness already does (so never say these are missing, and never try to build them yourself):
-- roles: observer (reads only), admin (approves changes), root (approves everything, manages accounts, the model,
-  the agentic MCP's token and contract); an account may be limited to some controllers (its scope)
+- a team of agents: you supervise and read; qot (quality of transmission) rehearses what-ifs in the digital twin
+  and proposes fixes; one config agent per network domain makes changes; a librarian answers from the documents
+- roles, enforced by the harness: observer (reads only; an observer's run is never offered a tool that changes
+  anything), admin (approves changes), root (root-only tools, accounts, the model, the agentic MCP's token and
+  contract); an account may be limited to some controllers (its scope), which is how tenants, sites or domains
+  are kept apart
 - approvals: every tool that changes a network pauses for a person with the right role; the pause IS the request
-  for approval, and the web page's Approvals page queues them
+  for approval, and the Approvals page queues them
+- the digital twin's write gate: every write is checked in the twin automatically before it is sent (you do not
+  call a tool for it); a rejected write is held
+- every change is read back after it goes through and checked against what was asked ("verified" or "not as
+  intended"); lessons from what went wrong are kept and shown at the next request that fits
 - audit: every proposal, decision and execution is logged with who, when and the arguments (Approvals & audit)
 - a watcher reads every controller through the contract each minute: a controller unreachable, a device, link or
-  service down, an alarm become incidents, notified to the configured channels (webhook, Slack, Teams, email)
-- runbooks respond to incidents: investigate, or rehearse a fix in the digital twin and propose it for approval
-- history: what each network held, kept when it changes (network_changes)
-- a digital twin rehearses changes first; a write is checked there before it is sent
+  service down, an alarm become incidents, grouped by what depends on what, notified to the configured channels
+  (webhook, Slack, Teams, email)
+- runbooks respond to incidents: investigate, or propose a fix that waits for approval
+- history: what each network held, kept when it changes (network_changes); health over time (health_over_time,
+  and the Incidents page's chart)
+- service scaling and moves (net_adjust, net_reroute where a controller serves them)
 - access: the web console, an HTTP API and a CLI (python -m canah ask|chat|audit|metrics|user)
 
-Not built yet (say so when it matters; see docs/ROADMAP.md):
+Not built yet (only these; say so when it matters; see docs/ROADMAP.md):
 - traffic counters over time (health_over_time keeps counts of what is up and down, not traffic)
 - applying a fix with no person, even under a policy: every fix waits for approval
 - several agentic MCPs (sites) behind one CANAH
 - calibration of the twin on this lab's measurements for every domain (uncalibrated twins answer at trust tier C)"""
+
+
+_SELF_Q = re.compile(r"\b(describe yourself|who are you|what are you|what (can|can't|cannot) you|about yourself|your "
+                     r"(capabilities|features|limits|limitations|build|role)|what do you (have|lack|do)|what is canah|"
+                     r"what('s| is) missing|introduce yourself)\b", re.I)
+_DENIES = re.compile(r"\b(cannot|can't|can not|no|not|missing|lacks?|without|unsupported|isn't|is not|not built|"
+                     r"not yet)\b", re.I)
+# a feature the harness has, and words that name it
+_HAS = {"roles enforced by the harness": r"\brbac\b|role[- ]based|\broles?\b.{0,40}\b(enforc|block)|block actions based on",
+        "per-account scopes (tenant, site or domain isolation)": r"multi[- ]?tenan|tenant isolation|isolation between",
+        "service scaling and moves (net_adjust)": r"\bscal(e|ing)\b|adjust (service )?bandwidth",
+        "health over time and history": r"dashboard|kpi visuali[sz]ation|history",
+        "audit log": r"\baudit",
+        "runbooks and the watcher": r"\brunbook|\bwatcher\b"}
+
+
+class SelfClaims:
+    """On a question about CANAH itself: an answer that calls a feature the harness has missing is sent back once,
+    with the facts (one listed RBAC, tenant isolation, scaling and dashboards as missing, all of which it has)."""
+
+    @staticmethod
+    def make():
+        from langchain.agents.middleware import AgentMiddleware, hook_config
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _SelfClaims(AgentMiddleware):
+            @hook_config(can_jump_to=["model"])
+            def after_model(self, state, runtime):
+                from .grounding import anchored, current_question, is_keep, turn_start
+                msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+                if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+                    return None
+                if not _SELF_Q.search(current_question(msgs) or ""):
+                    return None
+                if any(isinstance(m, HumanMessage) and "[self check]" in str(m.content) for m in msgs[turn_start(msgs):]):
+                    return None
+                wrong = []
+                for part in re.split(r"(?<=[.!?\n])\s+|\n", str(msgs[-1].content)):
+                    if not _DENIES.search(part) or re.search(r"(human|operator|person)('s)? approval|configured|"
+                                                             r"notification channel", part, re.I):
+                        continue
+                    for feature, pat in _HAS.items():
+                        if re.search(pat, part, re.I) and feature not in wrong:
+                            wrong.append(feature)
+                if not wrong:
+                    return None
+                return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                    f"[self check] Your answer says the harness lacks what it has: {', '.join(wrong)}. Take what it has "
+                    f"and what it does not have yet only from canah_status (its 'Not built yet' list is the whole of "
+                    f"it), and answer again, once, without repeating anything twice.", msgs, keep=False))]}
+        return _SelfClaims()
 
 
 class OperationsProvider:
@@ -83,13 +145,14 @@ class OperationsProvider:
                             "root": "everything, including root-only tools, accounts, the model and the contract"}[who.level],
                     "scope": list(who.controllers) or "every controller"},
             "controllers": [k for k in d.get("controllers", []) if who.sees(k)],
-            "digital_twin": d.get("twin"), "model": d.get("model"),
+            "digital_twin": d.get("twin"), "your_model (the model CANAH runs on, not the twin's)": d.get("model"),
             "incidents_active": inc, "network_changes_24h": changes,
             "watcher": {"on": bool(getattr(self.settings, "watch", True)), "every_s": getattr(self.settings, "watch_interval_s", 60)},
             "needs_attention": attention or ["nothing"],
             "harness": HARNESS,
-            "when_asked_what_is_missing": "be balanced: what the harness has, what it does not have yet (the list above), "
-                                          "and what needs attention now. Never say it is complete."}, indent=1, default=str)
+            "when_asked_what_is_missing": "be balanced: what the harness has, what it does not have yet (only the list "
+                                          "above: never add to it from general knowledge), and what needs attention now. "
+                                          "Never say it is complete."}, indent=1, default=str)
 
     def incidents(self, config: RunnableConfig, status: str = "active", limit: int = 20) -> str:
         """The incidents the watcher opened: status "active" (open or acknowledged), "resolved" or "" for all; each
@@ -145,12 +208,17 @@ class OperationsProvider:
     def writes(self) -> List[str]:
         return []
 
+    def middleware(self) -> List[Any]:
+        return [SelfClaims.make()]
+
     def instructions(self) -> str:
         return ("This harness already has, whatever an earlier answer in a conversation said: roles (observer, admin, "
                 "root) and per-account scopes enforced on every tool; approval of every change; an audit log of every "
                 "proposal, decision and execution; a watcher that opens incidents; runbooks that investigate and propose "
                 "fixes; notifications (webhook, Slack, Teams, email); the networks' history (network_changes) and health "
-                "over time; service scaling (net_adjust); a web console, an HTTP API and a CLI. Never suggest building "
+                "over time; service scaling (net_adjust); a team of agents (qot, a config agent per domain); every "
+                "write checked in the digital twin automatically and read back after it goes through; lessons kept "
+                "from what went wrong; a web console, an HTTP API and a CLI. Never suggest building "
                 "these with files, /etc/passwd, whoami or curl. "
                 "A question about CANAH itself (what you can do, your build, what you have or lack, your role or the "
                 "operator's) is about the harness, not about the networks: answer it from canah_status, covering what the "

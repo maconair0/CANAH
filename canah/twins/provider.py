@@ -235,6 +235,16 @@ class TwinsProvider:
                 runs = self.home / "twin_runs"
                 runs.mkdir(parents=True, exist_ok=True)
                 (runs / f"{r.run_id}.json").write_text(r.model_dump_json())
+                # what it ran on, for the Digital twins page's plot: the scenario, when, whether it was hypothetical
+                try:
+                    from ..safety import _DEPTH, _run
+                    hypo = bool((_run() or {}).get("hypothetical"))
+                    by = _DEPTH.get() or "supervisor"
+                except Exception:  # noqa: BLE001
+                    hypo, by = False, ""
+                (runs / f"{r.run_id}.scenario.json").write_text(json.dumps(
+                    {"run_id": r.run_id, "at": time.time(), "twin": r.twin, "domain": r.domain, "by": by,
+                     "hypothetical": hypo, "user": _user(), "scenario": scenario}, default=str))
             return json.dumps(compact(r), default=str)
 
         def twin_check_write(controller: str, tool: str, arguments: Dict[str, Any] = None, answers: Dict[str, Any] = None) -> str:

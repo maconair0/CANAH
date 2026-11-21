@@ -39,8 +39,24 @@ def services_of(data: Any) -> List[Dict[str, Any]]:
         if not sid:
             continue
         status = next((str(r[k]) for k in _STATUS if r.get(k) not in (None, "")), "")
+
+        def first(*keys):
+            for k in keys:
+                v = r.get(k)
+                if isinstance(v, dict):
+                    v = v.get("node-id") or v.get("id") or v.get("name")
+                if v not in (None, "", [], {}) and not isinstance(v, (list, dict)):
+                    return str(v)
+            return ""
+        rate = first("rate_gbps", "rate", "bandwidth", "capacity", "bw", "service-rate")
         out.append({"id": sid, "status": status or "unknown",
-                    "up": not status or not _DOWN.search(status.replace(" ", "").replace("_", ""))})
+                    "up": not status or not _DOWN.search(status.replace(" ", "").replace("_", "")),
+                    # for the live page: its ends and size, as far as the controller's answer says
+                    "a": first("a", "a_end", "src", "source", "service-a-end", "ingress", "from"),
+                    "z": first("z", "z_end", "dst", "destination", "service-z-end", "egress", "to"),
+                    "rate": (rate + ("G" if r.get("rate_gbps") not in (None, "") else "")) if rate else
+                            (f"vlan {r['vlan']}" if r.get("vlan") not in (None, "") else ""),
+                    "kind": first("type", "kind", "service-type", "service_type")})
     return out
 
 

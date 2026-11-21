@@ -245,6 +245,13 @@ agent at the next reload. `team: false` goes back to one agent doing it all.
 
 ## Operations: incidents, runbooks, history, notifications, scopes
 
+The watcher works on two clocks. **Every 5 s** (`heartbeat_s`) a heartbeat calls each controller's health check
+(the contract's health verb, a light call that reads no devices) in parallel, then reads the agentic MCP's view of
+each session; a controller going down or coming back, or the agentic MCP itself not answering, starts a full read
+at once. **Every 30 s** (`watch_interval_s`) a full read takes each controller's devices, links, services and
+alarms. A controller that stops answering is an incident within seconds (3.5 s on the test bed), without reading
+every device every few seconds. `heartbeat_s: 0` turns the heartbeat off.
+
 Everything here runs on the common contract's verbs and the normalised topology, so any controller the agentic
 MCP accepts is covered with no new code.
 
@@ -474,6 +481,7 @@ These go in `canah.yaml`, or in the environment as `CANAH_<NAME>` for the common
 | `interrupt_on` | none | more tool calls that pause for approval: `{pattern: true \| {allowed_decisions, description}}` |
 | `middleware` | none | extra LangChain middleware for every agent, as `package.module:Class` |
 | `max_seconds` | 600 | time budget per request |
+| `watch_interval_s`, `heartbeat_s` | 30, 5 | the watcher's full read, and its heartbeat |
 | `investigate_workers` | 2 | investigations of unrelated events run side by side |
 | `verify_changes` | on | read every change back and say whether it is what was asked |
 | `lessons`, `lessons_ttl_days` | on, 30 | keep what went wrong; show the fitting lessons at the next request |

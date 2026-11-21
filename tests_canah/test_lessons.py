@@ -89,11 +89,12 @@ class Verified(unittest.TestCase):
             def call(self, key, tool, arguments, approved_by=""):
                 if tool == "get_nodes":
                     self.calls.append((key, tool, dict(arguments), approved_by))
-                    return {"text": '{"nodes": [{"name": "node-1", "status": "up"}]}', "is_error": False}
+                    return {"text": '{"nodes": [{"name": "node-1", "status": "up"}, {"name": "node-2", "status": "up"}]}',
+                            "is_error": False}
                 return super().call(key, tool, arguments, approved_by)
         svc = Listing()
         net = AgenticMCPProvider(service=svc, team=False)
-        model = ScriptedModel(script=[call("net_provision", controller="alpha", arguments={"name": "svc-9", "a": "a1"}),
+        model = ScriptedModel(script=[call("net_provision", controller="alpha", arguments={"name": "svc-9", "a": "node-1"}),
                                       say("Done.")])
         a = build_agent(load_settings(path="/x", sandbox="none"), [net], model=model, memory=open_memory(in_memory=True))
         a.ask("create svc-9", thread_id="v", who=ADMIN)

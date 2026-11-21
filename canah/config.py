@@ -60,7 +60,8 @@ class Settings:
     # The watcher (canah/incidents.py): reads every controller through the contract every watch_interval_s;
     # incidents, notifications, runbooks and the networks' history follow. Only in the service.
     watch: bool = True
-    watch_interval_s: int = 60
+    watch_interval_s: int = 30         # a full read of every controller (devices, links, services, alarms)
+    heartbeat_s: float = 5             # each controller's health check and session state; a change reads all at once (0: off)
     resolve_after: int = 2              # polls in a row without a finding before its incident is resolved
     history_every: int = 5              # keep the networks' history every this many polls
     # Runbooks may investigate (and propose a fix for approval) on their own; at most this many an hour.
