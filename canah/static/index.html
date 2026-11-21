@@ -404,24 +404,66 @@
 
     <!-- Knowledge -->
     <section class="view" id="view-knowledge">
-      <div class="row"><h2>Documents &amp; memory</h2></div>
-      <div class="card" style="margin-bottom:14px"><header><h3>Second brain · how the knowledge connects</h3><div class="spacer"></div>
-        <span class="faint mono" id="mesh-cost" style="font-size:11.5px"></span>
-        <button class="btn sm" id="mesh-rebuild" title="Recompute from the embeddings (no embedding calls)">Rebuild</button></header>
-        <div class="body"><div class="mesh-wrap">
-          <div class="mesh-canvas"><svg id="mesh"></svg>
-            <div class="mesh-tools"><button class="btn sm" id="mesh-in">+</button><span class="pill mono" id="mesh-zoom">100%</span>
-              <button class="btn sm" id="mesh-out">−</button><button class="btn sm" id="mesh-fit">Fit</button></div>
-            <div class="mesh-hint faint">scroll to zoom · drag to pan · click a document</div></div>
-          <div class="mesh-side" id="mesh-detail"><span class="muted">A node per document, sized by how much of it was indexed and coloured by cluster; an edge joins documents about similar things.</span></div>
-        </div><p class="faint" style="font-size:11.5px;margin:8px 0 0" id="mesh-means"></p></div></div>
-      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start">
-        <div class="card"><header><h3>Documents the agent cites</h3><div class="spacer"></div><span class="faint" id="doc-folder" style="font-size:11px"></span></header>
-          <div class="body"><div id="doc-list"></div>
-            <div class="dropzone" id="doc-drop" style="margin-top:12px">Drop a document here, or click to choose one (admin)</div>
-            <input type="file" id="doc-file" hidden></div></div>
-        <div class="card"><header><h3>Long-term memories</h3><div class="spacer"></div><span class="faint" style="font-size:12px">admin</span></header>
-          <div class="body" style="padding:0" id="mem-list"></div></div>
+      <div class="row"><h2>Documents &amp; memory</h2><div class="spacer"></div>
+        <span class="faint" style="font-size:12px" id="kn-folder"></span></div>
+      <div class="kpis hs" id="kn-kpis" style="margin-bottom:14px"></div>
+      <div class="tabs" id="kn-tabs" role="tablist">
+        <button class="tab active" data-tab="map" role="tab">Second brain</button>
+        <button class="tab" data-tab="docs" role="tab">Documents <span class="count" id="kn-count-docs"></span></button>
+        <button class="tab" data-tab="search" role="tab">Try a search</button>
+        <button class="tab" data-tab="mem" role="tab">Long-term memories <span class="count" id="kn-count-mem"></span></button>
+      </div>
+
+      <div class="kn-pane" data-pane="docs" hidden>
+        <div class="card"><header><h3>Documents the agent cites</h3><div class="spacer"></div>
+          <input id="doc-filter" class="kn-filter" placeholder="Filter by name or type" autocomplete="off">
+          <button class="btn sm" id="doc-reindex" title="Index what is new or changed">Index changes</button>
+          <button class="btn sm" id="doc-reindex-all" title="Re-chunk and re-embed every document">Rebuild index</button></header>
+          <div class="body" style="padding:0">
+            <div id="doc-job"></div>
+            <div id="doc-list" class="kn-table"></div>
+          </div></div>
+        <div class="dropzone" id="doc-drop" style="margin-top:12px">Drop documents here, or click to choose (admin) ·
+          <span class="faint" id="doc-types"></span></div>
+        <input type="file" id="doc-file" multiple hidden>
+      </div>
+
+      <div class="kn-pane" data-pane="search" hidden>
+        <div class="card"><header><h3>What the agent would read for a question</h3></header>
+          <div class="body">
+            <form id="kn-search" class="kn-search" autocomplete="off">
+              <input id="kn-q" placeholder="Ask as an operator would, e.g. Can I use VLAN 1200 for a customer service?">
+              <button class="btn primary" type="submit">Search</button></form>
+            <p class="faint" style="font-size:11.5px;margin:8px 0 0">The same pipeline the agent uses: keyword (BM25) and
+              meaning (embeddings) search, fused, re-ranked by a cross-encoder, and gated: a passage under the relevance bar is
+              not evidence, and the agent is told the documents do not cover it.</p>
+            <div id="kn-results" style="margin-top:12px"></div>
+          </div></div>
+      </div>
+
+      <div class="kn-pane" data-pane="map">
+        <div class="card"><header><h3>Second brain · how the documents connect</h3><div class="spacer"></div>
+          <span class="faint mono" id="mesh-cost" style="font-size:11.5px"></span>
+          <button class="btn sm" id="mesh-rebuild" title="Recompute from the embeddings (no embedding calls)">Rebuild</button></header>
+          <div class="body"><div class="mesh-wrap">
+            <div class="mesh-canvas"><svg id="mesh"></svg>
+              <div class="mesh-tools"><button class="btn sm" id="mesh-in">+</button><span class="pill mono" id="mesh-zoom">100%</span>
+                <button class="btn sm" id="mesh-out">−</button><button class="btn sm" id="mesh-fit">Fit</button></div>
+              <div class="mesh-hint faint">scroll to zoom · drag to pan · click a document</div></div>
+            <div class="mesh-side" id="mesh-detail"><span class="muted">A node per document, sized by how much of it was indexed and coloured by cluster; an edge joins documents about similar things.</span></div>
+          </div><p class="faint" style="font-size:11.5px;margin:8px 0 0" id="mesh-means"></p></div></div>
+      </div>
+
+      <div class="kn-pane" data-pane="mem" hidden>
+        <div class="grid" style="grid-template-columns:minmax(0,340px) minmax(0,1fr);align-items:start">
+          <div class="card"><header><h3>Memories</h3><div class="spacer"></div>
+            <input id="mem-filter" class="kn-filter" placeholder="Filter" autocomplete="off" style="width:120px"></header>
+            <div class="body" style="padding:0" id="mem-list"></div></div>
+          <div class="card"><header><h3 id="mem-title">A memory</h3><div class="spacer"></div><span class="faint" id="mem-meta" style="font-size:11.5px"></span></header>
+            <div class="body" id="mem-detail"><div class="empty">Choose a memory to read it in full, correct it, or forget it.
+              <div class="faint" style="font-size:11.5px;margin-top:8px">The agent keeps what it should remember between
+              conversations (an operator's preferences, a site's quirks) under /memories/. It reads them as written here.</div></div></div></div>
+        </div>
       </div>
     </section>
 

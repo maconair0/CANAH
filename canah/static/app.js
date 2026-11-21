@@ -1269,7 +1269,7 @@ $("#composer").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.
 $("#composer").addEventListener("input", (e) => { e.target.style.height = "auto"; e.target.style.height = Math.min(200, e.target.scrollHeight) + "px"; });
 
 /* attachments */
-const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(1)} GB`;
 state.chat.files = [];
 function renderFiles() {
   const box = $("#files"); if (!box) return;
@@ -1920,32 +1920,174 @@ function meshDetail() {
   $("#mesh-rebuild").addEventListener("click", () => loadMesh(true));
 })();
 
-async function renderKnowledge() {
-  loadMesh().then(() => mesh.data?.nodes?.length && meshDetail());
-  try {
-    const d = await api("/documents");
-    $("#doc-folder").textContent = d.folder || "";
-    $("#doc-list").innerHTML = d.documents.length ? `<table class="tbl"><tbody>${d.documents.map((n) => `<tr><td class="mono">${esc(n)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No documents yet.</div>`;
-  } catch (e) { $("#doc-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
-  if (levelRank(state.level) < 1) { $("#mem-list").innerHTML = `<div class="empty">Memories are for admin and root.</div>`; return; }
-  try {
-    const m = await api("/memories");
-    $("#mem-list").innerHTML = m.memories.length ? `<table class="tbl"><thead><tr><th>user</th><th>memory</th><th></th></tr></thead><tbody>${m.memories.map((x) => `<tr><td>${esc(x.user)}</td><td><span class="mono">${esc(x.path)}</span><div class="faint" style="font-size:11.5px">${esc(String(x.content || x.preview || "").slice(0, 200))}</div></td><td><button class="btn sm danger" data-u="${esc(x.user)}" data-p="${esc(x.path)}">Forget</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty">No long-term memories.</div>`;
-    $$("#mem-list [data-u]").forEach((b) => b.addEventListener("click", async () => { await api(`/memories/${encodeURIComponent(b.dataset.u)}?path=${encodeURIComponent(b.dataset.p)}`, { method: "DELETE" }); toast("Forgotten.", "ok"); renderKnowledge(); }));
-  } catch (e) { $("#mem-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+const agoTs = (t) => !t ? "never" : (Date.now() / 1000 - t) < 86400 * 2 ? ago(t) : new Date(t * 1000).toLocaleDateString();
+const kn = { tab: "map", docs: null, mems: [], memSel: null, poll: null };
+function knTab(t) {
+  kn.tab = t;
+  $$("#kn-tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === t));
+  $$("#view-knowledge .kn-pane").forEach((p) => p.hidden = p.dataset.pane !== t);
+  if (t === "map") loadMesh().then(() => mesh.data?.nodes?.length && meshDetail());
+  if (t === "mem") renderMemories();
+  if (t === "search") setTimeout(() => $("#kn-q").focus(), 30);
 }
-async function upload(file) {
-  if (levelRank(state.level) < 1) { toast("Adding documents needs admin.", "warn"); return; }
-  const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(file); });
-  toast(`Indexing ${file.name}…`);
-  try { await api("/documents", { method: "POST", body: { name: file.name, content_base64: b64 } }); toast(`${file.name} added.`, "ok"); renderKnowledge(); }
+$$("#kn-tabs .tab").forEach((b) => b.addEventListener("click", () => knTab(b.dataset.tab)));
+
+async function renderKnowledge() {
+  knTab(kn.tab);
+  await renderDocuments();
+  if (levelRank(state.level) >= 1) {
+    try { kn.mems = (await api("/memories")).memories || []; } catch (e) { kn.mems = []; }
+  }
+  $("#kn-count-mem").textContent = levelRank(state.level) >= 1 ? kn.mems.length : "";
+  knKpis();
+}
+function knKpis() {
+  const d = kn.docs; if (!d) return;
+  const count = (st) => d.documents.filter((x) => x.status === st).length;
+  const pending = count("not indexed") + count("changed");
+  const kpi = (label, value, sub, dot = "") => `<div class="kpi"><div class="label">${dot ? `<span class="dot ${dot}"></span>` : ""}${label}</div><div class="value${String(value).length > 7 ? " small" : ""}">${value}</div><div class="sub">${sub}</div></div>`;
+  $("#kn-kpis").innerHTML = [
+    kpi("Documents", d.documents.length, `${fmtBytes(d.bytes)} · ${[...new Set(d.documents.map((x) => x.type))].join(", ") || "none"}`),
+    kpi("Passages indexed", d.passages.toLocaleString(), "what search ranks and the agent reads"),
+    kpi("Index", pending ? `${pending} to index` : "up to date", d.reindex?.running ? "indexing now…" : `last indexed ${agoTs(d.index_updated)}`, d.reindex?.running ? "warn" : pending ? "warn" : "ok"),
+    kpi("Relevance bar", d.settings.min_relevance, `re-ranker ${String(d.settings.reranker || "").split("/").pop() || "?"}`),
+    kpi("Embedder", String(d.settings.embedder || "?").split("/").pop(), "meaning search, on the GPU when there is one"),
+    kpi("Memories", levelRank(state.level) >= 1 ? kn.mems.length : "—", levelRank(state.level) >= 1 ? `${new Set(kn.mems.map((m) => m.user)).size} users` : "admin and root"),
+  ].join("");
+}
+
+async function renderDocuments() {
+  let d;
+  try { d = kn.docs = await api("/documents"); }
+  catch (e) { $("#doc-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  $("#kn-folder").textContent = d.folder || "";
+  $("#kn-count-docs").textContent = d.documents.length;
+  $("#doc-types").textContent = (d.settings.supported || []).join(" ");
+  const admin = levelRank(state.level) >= 1;
+  $("#doc-reindex").hidden = $("#doc-reindex-all").hidden = !admin;
+  const job = d.reindex || {};
+  $("#doc-job").innerHTML = job.running ? `<div class="banner warn" style="margin:10px">Indexing${job.force ? " every document" : " what changed"}… started ${ago(job.started)} by ${esc(job.by || "")}. Search keeps working on the index as it was.</div>`
+    : job.error ? `<div class="banner bad" style="margin:10px">The last indexing failed: ${esc(job.error)}</div>`
+    : job.finished && Date.now() / 1000 - job.finished < 600 ? `<div class="banner ok" style="margin:10px">Indexed ${ago(job.finished)}: ${(job.added || []).length} added, ${(job.changed || []).length} changed, ${(job.removed || []).length} removed${(job.failed || []).length ? `, ${job.failed.length} failed` : ""}.</div>` : "";
+  if (d.removed_since_index?.length) $("#doc-job").innerHTML += `<div class="banner warn" style="margin:10px">${d.removed_since_index.length} indexed document(s) are no longer in the folder: index changes to drop them.</div>`;
+  const most = Math.sqrt(Math.max(1, ...d.documents.map((x) => x.passages || 0)));
+  const f = ($("#doc-filter").value || "").toLowerCase();
+  const rows = d.documents.filter((x) => !f || x.name.toLowerCase().includes(f) || x.type.includes(f));
+  const statusOf = (x) => x.status === "indexed" ? `<span class="dstat"><span class="dot ok"></span>indexed</span>`
+    : x.status === "changed" ? `<span class="dstat"><span class="dot warn"></span>changed since</span>`
+    : x.status === "not indexed" ? `<span class="dstat"><span class="dot warn"></span>not indexed</span>` : `<span class="dstat"><span class="dot"></span>${esc(x.status)}</span>`;
+  $("#doc-list").innerHTML = rows.length ? `<table class="tbl"><thead><tr><th>document</th><th class="num hide-sm">size</th><th class="hide-sm">passages</th><th class="hide-sm">indexed</th><th></th></tr></thead><tbody>${rows.map((x) => `
+    <tr data-name="${esc(x.name)}"><td><div class="doc-name"><span class="ftype ${esc(x.type)}">${esc(x.type)}</span><span class="nm" title="${esc(x.name)}">${esc(x.name)}</span></div>
+        <div class="faint only-sm" style="font-size:11px;margin-top:3px">${fmtBytes(x.bytes)} · ${(x.passages || 0).toLocaleString()} passages · ${esc(x.status)}</div></td>
+      <td class="num faint hide-sm">${fmtBytes(x.bytes)}</td>
+      <td class="hide-sm"><div style="display:flex;gap:8px;align-items:center"><div class="bar" style="width:70px"><i style="width:${Math.max(2, 100 * Math.sqrt(x.passages || 0) / most)}%"></i></div><span class="mono faint" style="font-size:11.5px">${(x.passages || 0).toLocaleString()}</span></div></td>
+      <td class="hide-sm">${statusOf(x)}<div class="faint" style="font-size:11px">${x.indexed_at ? agoTs(x.indexed_at) : ""}</div></td>
+      <td class="doc-acts"><button class="btn sm ghost" data-act="ask" title="Search within the documents">Search</button>
+        <a class="btn sm ghost" href="/documents/file?name=${encodeURIComponent(x.name)}" data-act="get" title="Download" aria-label="Download">↓</a>
+        ${admin ? `<button class="btn sm ghost del" data-act="del" title="Remove from the corpus and the index" aria-label="Remove">✕</button>` : ""}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">${d.documents.length ? "Nothing matches the filter." : "No documents yet: drop some below."}</div>`;
+  $$("#doc-list tr[data-name]").forEach((tr) => {
+    const name = tr.dataset.name;
+    tr.querySelector('[data-act="get"]').addEventListener("click", async (e) => {
+      e.preventDefault();                    // with the session token, not a bare link
+      try { const r = await fetch(`/documents/file?name=${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${state.token}` } });
+        if (!r.ok) throw new Error(`${r.status}`); const blob = await r.blob(); const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob); a.download = name.split("/").pop(); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      } catch (err) { toast(`Download failed: ${err.message}`, "bad"); }
+    });
+    tr.querySelector('[data-act="ask"]').addEventListener("click", () => { knTab("search"); $("#kn-q").value = `${name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")}: `; $("#kn-q").focus(); });
+    tr.querySelector('[data-act="del"]')?.addEventListener("click", async () => {
+      if (!confirm(`Remove ${name} from the corpus and its passages from the index?`)) return;
+      try { const r = await api(`/documents?name=${encodeURIComponent(name)}`, { method: "DELETE" }); toast(`Removed ${name} (${r.passages} passages).`, "ok"); renderKnowledge(); }
+      catch (e) { toast(e.message, "bad"); }
+    });
+  });
+  clearTimeout(kn.poll);
+  if (job.running) kn.poll = setTimeout(() => state.view === "knowledge" && renderDocuments().then(knKpis), 4000);
+}
+$("#doc-filter").addEventListener("input", () => kn.docs && renderDocuments());
+async function reindex(force) {
+  if (force && !confirm("Re-chunk and re-embed every document? With a large corpus this takes minutes; search keeps working meanwhile.")) return;
+  try { await api("/documents/reindex", { method: "POST", body: { force } }); toast(force ? "Rebuilding the index…" : "Indexing changes…"); renderDocuments().then(knKpis); }
   catch (e) { toast(e.message, "bad"); }
 }
+$("#doc-reindex").addEventListener("click", () => reindex(false));
+$("#doc-reindex-all").addEventListener("click", () => reindex(true));
+
+function cleanPassage(t) {
+  return String(t || "").replace(/^\s*\[[^\]\n]{1,120}\]\s*\n/, "").replace(/-\n(?=[a-z])/g, "")
+    .replace(/([^\n.:;!?])\n(?=[^\n•\-*\d#])/g, "$1 ").replace(/\n{3,}/g, "\n\n").trim();
+}
+$("#kn-search").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const q = $("#kn-q").value.trim(); if (!q) return;
+  $("#kn-results").innerHTML = `<div class="muted">Searching…</div>`;
+  let r; try { r = await api(`/knowledge/search?q=${encodeURIComponent(q)}`); } catch (err) { $("#kn-results").innerHTML = `<div class="banner bad">${esc(err.message)}</div>`; return; }
+  const bar = r.min_relevance ?? 0.1;
+  const card = (h, miss) => `<div class="hit${miss ? " miss" : ""}"><header>
+      <span class="relbar" title="relevance ${h.relevance ?? "?"} (bar ${bar})"><i style="width:${Math.round(100 * (h.relevance || 0))}%"></i><b style="left:${Math.round(100 * bar)}%"></b></span>
+      <span class="rel">${h.relevance != null ? Number(h.relevance).toFixed(3) : "?"}</span>
+      <span class="mono">${esc(h.source || "?")}${h.page ? ` · p.${esc(h.page)}` : ""}</span><div class="spacer"></div>
+      <span class="faint" style="font-size:11px">${[h.keyword && "keyword", h.dense && "meaning"].filter(Boolean).join(" + ")}</span></header>
+      <div class="txt">${esc(cleanPassage(h.text))}</div></div>`;
+  $("#kn-results").innerHTML = `<div class="faint" style="font-size:12px;margin-bottom:8px">${r.ms} ms · best relevance ${r.best_relevance ?? "?"} against a bar of ${bar}${r.rewrites?.length ? ` · also tried: ${r.rewrites.map(esc).join("; ")}` : ""}</div>`
+    + (r.abstained ? `<div class="banner warn" style="margin-bottom:10px">No passage clears the bar: the agent would say the documents do not cover this, and not answer it from them.</div>
+        ${r.near_misses.length ? `<div class="faint" style="font-size:12px;margin:0 0 6px">Closest, judged not to answer it:</div>${r.near_misses.map((h) => card(h, true)).join("")}` : ""}`
+      : r.hits.map((h) => card(h, false)).join(""));
+  $$("#kn-results .hit").forEach((h) => h.addEventListener("click", () => h.classList.toggle("open")));
+});
+
+function renderMemories() {
+  if (levelRank(state.level) < 1) { $("#mem-list").innerHTML = `<div class="empty">Memories are for admin and root.</div>`; return; }
+  const f = ($("#mem-filter").value || "").toLowerCase();
+  const rows = kn.mems.filter((m) => !f || `${m.user} ${m.path} ${m.preview}`.toLowerCase().includes(f));
+  const users = [...new Set(rows.map((m) => m.user))].sort();
+  $("#mem-list").innerHTML = rows.length ? users.map((u) => `<div class="mem-user">${esc(u)}</div>` + rows.filter((m) => m.user === u).map((m) => `
+      <div class="mem-row${kn.memSel && kn.memSel.user === m.user && kn.memSel.path === m.path ? " sel" : ""}" data-u="${esc(m.user)}" data-p="${esc(m.path)}">
+        <div class="p">${esc(m.path)}</div><div class="pv">${esc(m.preview || "")}</div></div>`).join("")).join("")
+    : `<div class="empty">${kn.mems.length ? "Nothing matches." : "No long-term memories yet."}</div>`;
+  $$("#mem-list .mem-row").forEach((r) => r.addEventListener("click", () => openMemory(r.dataset.u, r.dataset.p)));
+}
+$("#mem-filter").addEventListener("input", renderMemories);
+async function openMemory(user, path) {
+  kn.memSel = { user, path }; renderMemories();
+  let m; try { m = await api(`/memories/${encodeURIComponent(user)}/item?path=${encodeURIComponent(path)}`); }
+  catch (e) { $("#mem-detail").innerHTML = `<div class="banner bad">${esc(e.message)}</div>`; return; }
+  $("#mem-title").textContent = path;
+  $("#mem-meta").textContent = `${user} · ${m.content.length} characters · changed ${m.modified ? new Date(m.modified).toLocaleString() : "?"}`;
+  $("#mem-detail").innerHTML = `<textarea id="mem-edit" spellcheck="false" maxlength="4000">${esc(m.content)}</textarea>
+    <div class="row" style="margin-top:10px"><button class="btn primary" id="mem-save">Save</button><span class="faint" id="mem-chars" style="font-size:11.5px"></span>
+      <div class="spacer"></div><button class="btn danger" id="mem-forget">Forget</button></div>`;
+  const chars = () => $("#mem-chars").textContent = `${$("#mem-edit").value.length} / 4000`;
+  chars(); $("#mem-edit").addEventListener("input", chars);
+  $("#mem-save").addEventListener("click", async () => {
+    try { await api(`/memories/${encodeURIComponent(user)}/item`, { method: "PUT", body: { path, content: $("#mem-edit").value } }); toast("Saved.", "ok"); renderKnowledge(); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  $("#mem-forget").addEventListener("click", async () => {
+    if (!confirm(`Forget ${path} for ${user}?`)) return;
+    await api(`/memories/${encodeURIComponent(user)}?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+    toast("Forgotten.", "ok"); kn.memSel = null;
+    $("#mem-detail").innerHTML = `<div class="empty">Forgotten.</div>`; $("#mem-title").textContent = "A memory"; $("#mem-meta").textContent = "";
+    renderKnowledge();
+  });
+}
+
+async function upload(files) {
+  if (levelRank(state.level) < 1) { toast("Adding documents needs admin.", "warn"); return; }
+  for (const file of [...files]) {
+    const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(file); });
+    toast(`Indexing ${file.name}…`);
+    try { const r = await api("/documents", { method: "POST", body: { name: file.name, content_base64: b64 } }); toast(`${file.name} added${r.index?.failed?.length ? " (failed to index)" : ""}.`, r.index?.failed?.length ? "warn" : "ok"); }
+    catch (e) { toast(`${file.name}: ${e.message}`, "bad"); }
+  }
+  renderKnowledge();
+}
 $("#doc-drop").addEventListener("click", () => $("#doc-file").click());
-$("#doc-file").addEventListener("change", (e) => { if (e.target.files[0]) upload(e.target.files[0]); });
+$("#doc-file").addEventListener("change", (e) => { if (e.target.files.length) upload(e.target.files); e.target.value = ""; });
 $("#doc-drop").addEventListener("dragover", (e) => { e.preventDefault(); e.currentTarget.classList.add("over"); });
 $("#doc-drop").addEventListener("dragleave", (e) => e.currentTarget.classList.remove("over"));
-$("#doc-drop").addEventListener("drop", (e) => { e.preventDefault(); e.currentTarget.classList.remove("over"); if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
+$("#doc-drop").addEventListener("drop", (e) => { e.preventDefault(); e.currentTarget.classList.remove("over"); if (e.dataTransfer.files.length) upload(e.dataTransfer.files); });
 
 /* ================= profile, about ================= */
 function renderIdentity() {

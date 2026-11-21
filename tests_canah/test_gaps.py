@@ -286,3 +286,54 @@ class Reaper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentsPage(Base):
+    def setUp(self):
+        super().setUp()
+        from unittest import mock
+        from canah.knowledge.rag import refresh as rf, settings as rs
+        self.corpus = os.path.join(self.home, "corpus")
+        os.makedirs(self.corpus)
+        with open(os.path.join(self.corpus, "rules.md"), "w") as f:
+            f.write("# Rules\n\n## Packet\nVLAN ids 100 to 999 are for customers.\n")
+        with open(os.path.join(self.corpus, "new.txt"), "w") as f:
+            f.write("not indexed yet")
+        manifest = os.path.join(self.home, "manifest.json")
+        with open(manifest, "w") as f:
+            json.dump({"files": {"rules.md": {"hash": "x", "chunks": 3, "sections": {"body": 3},
+                                             "ingested_at": "2099-01-01T00:00:00+00:00"}}, "updated_at": "2099-01-01T00:00:00+00:00"}, f)
+        for target, value in ((rs, self.corpus), (rf, manifest)):
+            p = mock.patch.object(target, "CORPUS_DIR" if target is rs else "MANIFEST_PATH", value)
+            p.start()
+            self.addCleanup(p.stop)
+        os.environ["CANAH_ADMIN_PASSWORD"] = "adm1n-pass"
+        self.addCleanup(os.environ.pop, "CANAH_ADMIN_PASSWORD")
+        self.a = self.agent(say("hi"))
+        self.client = TestClient(create_app(self.a, Accounts(os.path.join(self.home, "users.json"))))
+        self.h = {"Authorization": "Bearer " + self.client.post("/session", json={
+            "username": "admin", "password": "adm1n-pass"}).json()["token"]}
+
+    def test_the_list_says_what_the_index_holds_of_each(self):
+        d = self.client.get("/documents").json()
+        rows = {r["name"]: r for r in d["documents"]}
+        self.assertEqual((rows["rules.md"]["status"], rows["rules.md"]["passages"]), ("indexed", 3))
+        self.assertEqual(rows["new.txt"]["status"], "not indexed")
+        self.assertEqual(d["passages"], 3)
+        self.assertIn("min_relevance", d["settings"])
+
+    def test_a_document_downloads_and_a_path_outside_the_corpus_does_not(self):
+        self.assertIn(b"VLAN ids", self.client.get("/documents/file?name=rules.md").content)
+        self.assertEqual(self.client.get("/documents/file?name=../users.json").status_code, 404)
+        self.assertEqual(self.client.delete("/documents?name=rules.md").status_code, 403)   # removing needs admin
+
+    def test_a_memory_is_read_in_full_and_corrected(self):
+        from canah.memory import namespace
+        self.a.memory.store.put(namespace("ana"), "/memories/site.md", {"content": ["site-b runs hot", "check fans"]})
+        got = self.client.get("/memories/ana/item?path=/memories/site.md", headers=self.h).json()
+        self.assertEqual(got["content"], "site-b runs hot\ncheck fans")
+        self.client.put("/memories/ana/item", json={"path": "/memories/site.md", "content": "site-b: fans replaced"},
+                        headers=self.h)
+        self.assertEqual(self.a.memory.store.get(namespace("ana"), "/memories/site.md").value["content"],
+                         ["site-b: fans replaced"])
+        self.assertEqual(self.client.get("/memories/ana/item?path=/x", headers=self.h).status_code, 404)

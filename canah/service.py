@@ -215,6 +215,15 @@ def _reply_json(r: Reply) -> Dict[str, Any]:
             "usage": r.usage}
 
 
+def _iso_ts(v: Any) -> float:
+    """An ISO time (as the index manifest writes it) as epoch seconds."""
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology: Any = None,
                rebuild: Optional[Any] = None, watch: bool = False) -> FastAPI:
     """`topology`: what /network and /topology read (a canah.topology.Topology); by default one over the
@@ -498,6 +507,38 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         from .memory import list_memories
         return {"memories": list_memories(A().memory.store, user or None)}
 
+    @app.get("/memories/{user}/item")
+    def memory_item(user: str, path: str, c=Depends(caller)):
+        admin(c)
+        from .memory import namespace
+        item = A().memory.store.get(namespace(user), path)
+        if item is None:
+            raise HTTPException(404, "no such memory")
+        content = item.value.get("content", "")
+        return {"user": user, "path": path, "content": content if isinstance(content, str) else "\n".join(content),
+                "modified": str(item.updated_at)}
+
+    @app.put("/memories/{user}/item")
+    def memory_edit(user: str, body: Dict[str, Any] = Body(...), c=Depends(caller)):
+        """Correct a memory in place: the agent reads it as written here."""
+        who = admin(c)
+        from .memory import namespace
+        path, content = str(body.get("path") or ""), str(body.get("content") or "")
+        if not path.strip():
+            raise HTTPException(400, "a memory needs its path")
+        if len(content) > 4000:
+            raise HTTPException(413, "a memory is at most 4000 characters")
+        item = A().memory.store.get(namespace(user), path)
+        value = dict(item.value) if item is not None else {}
+        value["content"] = content.split("\n") if isinstance(value.get("content"), list) else content
+        import datetime as _dt
+        value["modified_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        value.setdefault("created_at", value["modified_at"])
+        A().memory.store.put(namespace(user), path, value)
+        if A().ops:
+            A().ops.audit("memory edited", who.user, who.level, "", "memory", {"user": user, "path": path})
+        return {"saved": path, "chars": len(content)}
+
     @app.delete("/memories/{user}")
     def forget(user: str, path: str, c=Depends(caller)):
         who = admin(c)
@@ -507,11 +548,141 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             A().ops.audit("memory deleted", who.user, who.level, "", "memory", {"user": user, "path": path})
         return {"deleted": gone}
 
+    # ----- documents: what the agent cites -----
+
+    reindex_job: Dict[str, Any] = {"running": False}
+
+    def _knowledge():
+        """The agent's own retriever (its models are already loaded), or a fresh one."""
+        for pv in getattr(A(), "providers", []) or []:
+            r = getattr(pv, "retriever", None)
+            if r is not None and hasattr(r, "retrieve"):
+                return r
+        from .knowledge import HybridKnowledge
+        return HybridKnowledge(A().settings.knowledge_collection)
+
+    def _doc_path(name: str) -> str:
+        from .knowledge.rag.settings import CORPUS_DIR
+        base = os.path.realpath(CORPUS_DIR)
+        full = os.path.realpath(os.path.join(base, name))
+        if not full.startswith(base + os.sep) or not os.path.isfile(full):
+            raise HTTPException(404, "no such document")
+        return full
+
     @app.get("/documents")
     def documents(c=Depends(caller)):
-        from .knowledge.rag.settings import CORPUS_DIR
-        names = sorted(os.listdir(CORPUS_DIR)) if os.path.isdir(CORPUS_DIR) else []
-        return {"folder": CORPUS_DIR, "documents": names}
+        """Every document in the corpus with its size, type and what the index holds of it: passages, sections,
+        when it was indexed, and whether the file changed since (or was never indexed)."""
+        from .knowledge.rag.loaders import SUPPORTED_EXTENSIONS
+        from .knowledge.rag import refresh as rf
+        from .knowledge.rag import settings as rs
+        manifest = rf.load_manifest(rf.MANIFEST_PATH)
+        files = manifest.get("files", {})
+        rows = []
+        if os.path.isdir(rs.CORPUS_DIR):
+            for root, _, names in os.walk(rs.CORPUS_DIR):
+                for nm in names:
+                    if nm.startswith("."):
+                        continue
+                    full = os.path.join(root, nm)
+                    rel = os.path.relpath(full, rs.CORPUS_DIR)
+                    st = os.stat(full)
+                    ext = os.path.splitext(nm)[1].lower()
+                    m = files.get(rel) or {}
+                    indexed_at = m.get("ingested_at")
+                    status = ("unsupported" if ext not in SUPPORTED_EXTENSIONS else "not indexed" if not m else
+                              "changed" if indexed_at and st.st_mtime > _iso_ts(indexed_at) + 2 else "indexed")
+                    rows.append({"name": rel, "type": ext.lstrip(".") or "file", "bytes": st.st_size,
+                                 "modified": st.st_mtime, "passages": m.get("chunks", 0), "sections": m.get("sections", {}),
+                                 "indexed_at": _iso_ts(indexed_at) if indexed_at else None, "status": status})
+        rows.sort(key=lambda r: r["name"].lower())
+        gone = sorted(set(files) - {r["name"] for r in rows})
+        try:
+            from .knowledge.rag.reranker import CROSS_ENCODER_MODELS
+            reranker = CROSS_ENCODER_MODELS[0] if CROSS_ENCODER_MODELS else ""
+        except Exception:  # noqa: BLE001
+            reranker = ""
+        from .knowledge.rag.store import EMBED_MODEL
+        return {"folder": rs.CORPUS_DIR, "documents": rows, "removed_since_index": gone,
+                "passages": sum(int((files.get(r["name"]) or {}).get("chunks", 0)) for r in rows),
+                "bytes": sum(r["bytes"] for r in rows), "index_updated": _iso_ts(manifest["updated_at"]) if manifest.get("updated_at") else None,
+                "settings": {"embedder": EMBED_MODEL, "reranker": reranker, "min_relevance": rs.MIN_RELEVANCE,
+                             "supported": sorted(SUPPORTED_EXTENSIONS)},
+                "reindex": dict(reindex_job)}
+
+    @app.get("/documents/file")
+    def document_file(name: str, c=Depends(caller)):
+        from fastapi.responses import FileResponse
+        return FileResponse(_doc_path(name), filename=os.path.basename(name))
+
+    @app.delete("/documents")
+    def delete_document(name: str, c=Depends(caller)):
+        """Remove a document from the corpus and its passages from the index."""
+        who = admin(c)
+        full = _doc_path(name)
+        from .knowledge.rag import refresh as rf
+        from .knowledge.rag.store import RagStore
+        from .knowledge.rag import settings as rs
+        rel = os.path.relpath(full, rs.CORPUS_DIR)
+        os.remove(full)
+        RagStore(collection=A().settings.knowledge_collection).delete_by_source(rel)
+        m = rf.load_manifest(rf.MANIFEST_PATH)
+        gone = (m.get("files") or {}).pop(rel, None)
+        rf.save_manifest(m, rf.MANIFEST_PATH)
+        r = _knowledge()
+        if hasattr(getattr(r, "retriever", None), "_bm25_size"):
+            r.retriever._bm25_size = -1               # the keyword index is rebuilt on the next search
+        if A().ops:
+            A().ops.audit("document deleted", who.user, who.level, "", "documents", {"name": rel})
+        return {"deleted": rel, "passages": (gone or {}).get("chunks", 0)}
+
+    @app.post("/documents/reindex")
+    def reindex(body: Dict[str, Any] = Body(default={}), c=Depends(caller)):
+        """Index what is new or changed in the corpus (all of it with force), in the background."""
+        who = admin(c)
+        if reindex_job.get("running"):
+            return dict(reindex_job)
+        force = bool((body or {}).get("force"))
+        reindex_job.clear()
+        reindex_job.update({"running": True, "started": time.time(), "force": force, "by": who.user})
+
+        def run():
+            try:
+                from .knowledge.rag import refresh as rf
+                got = rf.refresh(collection=A().settings.knowledge_collection, force=force)
+                reindex_job.update({k: got.get(k) for k in ("added", "changed", "removed", "failed", "collection_size")
+                                    if k in got})
+                r = _knowledge()
+                if hasattr(getattr(r, "retriever", None), "_bm25_size"):
+                    r.retriever._bm25_size = -1
+            except Exception as e:  # noqa: BLE001 - said on the page
+                reindex_job["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                reindex_job.update({"running": False, "finished": time.time()})
+        threading.Thread(target=run, name="canah-reindex", daemon=True).start()
+        if A().ops:
+            A().ops.audit("documents reindexed", who.user, who.level, "", "documents", {"force": force})
+        return dict(reindex_job)
+
+    @app.get("/knowledge/search")
+    def knowledge_search(q: str, k: int = 6, c=Depends(caller)):
+        """The retrieval the agent would get for a question: each passage with its source, page and relevance,
+        or why it abstained (best relevance against the bar, near misses, the rewrites tried)."""
+        q = (q or "").strip()
+        if not q:
+            raise HTTPException(400, "ask something")
+        t0 = time.time()
+        got = _knowledge().retrieve(q[:500], top_k=max(1, min(int(k), 12)))
+
+        def hit(h):
+            md = h.get("metadata") or {}
+            return {"source": h.get("source") or md.get("source"), "page": md.get("page_start") or md.get("page"),
+                    "relevance": h.get("relevance", h.get("rerank_relevance")), "score": h.get("rerank_score"),
+                    "text": str(h.get("text") or "")[:1200], "dense": bool(h.get("in_dense")), "keyword": bool(h.get("in_sparse"))}
+        return {"query": q, "ms": int((time.time() - t0) * 1000), "abstained": bool(got.get("abstained")),
+                "best_relevance": got.get("best_relevance"), "min_relevance": got.get("min_relevance"),
+                "rewrites": got.get("rewrites") or [], "hits": [hit(h) for h in got.get("hits") or []],
+                "near_misses": [hit(h) for h in (got.get("near_misses") or [])[:3]]}
 
     @app.post("/documents")
     def add_document(body: Dict[str, Any] = Body(...), c=Depends(caller)):
@@ -1248,7 +1419,16 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
 
     @app.get("/", response_class=HTMLResponse)
     def page():
-        return PAGE.read_text() if PAGE.is_file() else "<p>CANAH</p>"
+        """The console, with app.js and app.css tagged by when they changed: a browser never runs a cached script
+        against a newer page (it did, and the documents page came up empty)."""
+        if not PAGE.is_file():
+            return "<p>CANAH</p>"
+        html = PAGE.read_text()
+        for name in ("app.js", "app.css"):
+            f = STATIC / name
+            if f.is_file():
+                html = html.replace(f"/static/{name}\"", f"/static/{name}?v={int(f.stat().st_mtime)}\"")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     return app
 
