@@ -66,7 +66,8 @@ class Settings:
     # Runbooks may investigate (and propose a fix for approval) on their own; at most this many an hour.
     respond: bool = True
     respond_per_hour: int = 6
-    investigate_seconds: int = 900     # an investigation's time budget (it runs in the background, one at a time)
+    investigate_workers: int = 2       # investigations run side by side (unrelated events)
+    investigate_seconds: int = 900     # an investigation's time budget (in the background; investigate_workers at once)
     runbooks_dirs: List[str] = field(default_factory=list)
     # Where incidents and waiting approvals are sent (canah/notify.py): webhook, slack, teams, email.
     notify_channels: List[Dict[str, Any]] = field(default_factory=list)

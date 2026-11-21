@@ -262,7 +262,11 @@ class HybridRetriever:
         Both are measured against the parent — see `_passage_chars`.
         """
         n = self._passage_chars(hit)
-        if n < mc.MIN_PASSAGE_CHARS:
+        # The floor is for PDFs, where a short passage is a heading, a caption or a running head. A short section of
+        # a Markdown or text file is content (a design rule of 220 characters was dropped by it).
+        src = str(hit.get("source") or (hit.get("metadata") or {}).get("source") or "").lower()
+        floor = mc.MIN_PASSAGE_CHARS if src.endswith(".pdf") or not src else min(mc.MIN_PASSAGE_CHARS, 80)
+        if n < floor:
             return False
         if hit.get("in_sparse") and not hit.get("in_dense"):
             return n >= mc.SPARSE_ONLY_MIN_CHARS

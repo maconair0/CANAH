@@ -116,3 +116,16 @@ class StartsWithTheAgent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JqHyphen(unittest.TestCase):
+    def test_a_jq_hyphen_key_error_says_how_to_quote_it(self):
+        from canah.sandbox.backend import SandboxBackend
+
+        class R:
+            def run(self, argv, timeout):
+                return "", 'jq: error: null (null) and string ("object") cannot be subtracted', 5
+        sb = SandboxBackend.__new__(SandboxBackend)
+        sb.runtime, sb.default_timeout = R(), 30
+        out = sb.execute("""jq -c '.nodes[] | select(.node-type == "XPONDER")' /workspace/x.json""").output
+        self.assertIn('."node-type"', out)

@@ -167,3 +167,23 @@ class GpuFallback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarkdownSections(unittest.TestCase):
+    def test_a_markdown_file_is_cut_at_its_headings_with_the_heading_path(self):
+        from canah.knowledge.rag.chunker import chunk_markdown
+        text = ("# Rules\n\n## Optical\n- A 100G lightpath needs 15.0 dB of OSNR; a 400G one needs 22.0 dB, measured.\n"
+                "- Each transponder carries one lightpath, and a lightpath below its minimum must be re-routed.\n\n"
+                "## Packet\n- VLAN ids 100 to 999 are for customer services; 1000 and above are reserved for operations.\n"
+                "- A customer service between sites must ride a link carried by an optical lightpath.\n")
+        got = chunk_markdown(text)
+        self.assertEqual(len(got), 2)
+        self.assertTrue(got[1].startswith("Rules > Packet"))
+        self.assertNotIn("OSNR", got[1])
+
+    def test_a_short_section_of_a_text_file_is_admissible(self):
+        from canah.knowledge.rag.retriever import HybridRetriever
+        r = HybridRetriever.__new__(HybridRetriever)
+        r._passage_chars = lambda hit: 220
+        self.assertTrue(r._admissible({"source": "design-rules.md", "in_dense": True}))
+        self.assertFalse(r._admissible({"source": "paper.pdf", "in_dense": True}))

@@ -34,10 +34,10 @@ class LargeResults(unittest.TestCase):
         self.addCleanup(a.close)
         a.ask("how many nodes?", who=Identity("ana", "admin"))
         shown = model.tool_results()[-1]
-        self.assertLess(len(shown), 3600)                       # a 2,500-character preview and its note
+        self.assertLess(len(shown), 4400)                       # a 2,500-character preview, its note and its shape
         self.assertIn(f"of {len(BIG)} characters", shown)
         self.assertIn("incomplete", shown)
-        kept = list((Path(self.home) / "results").glob("*.txt"))
+        kept = list((Path(self.home) / "results").glob("r*-list_nodes.*"))
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0].read_text(), BIG)
 
@@ -137,3 +137,16 @@ class Passages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JqHint(unittest.TestCase):
+    def test_hyphenated_keys_are_quoted_and_the_command_runs(self):
+        import shutil
+        import subprocess
+        from canah.large_results import structure
+        data = json.dumps({"nodes": [{"node-id": "x", "node-type": "XPONDER"}, {"node-id": "y", "node-type": "ROADM"}]})
+        jq = structure(data)[1].replace("<condition>", '."node-type" == "XPONDER"')
+        self.assertIn('."node-id"', jq)
+        if shutil.which("jq"):
+            out = subprocess.run(["jq", "-c", jq.split("'")[1]], input=data, capture_output=True, text=True)
+            self.assertEqual(out.stdout.strip(), '{"node-id":"x","node-type":"XPONDER"}')

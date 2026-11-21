@@ -38,6 +38,19 @@ def _run() -> Optional[Dict[str, Any]]:
     return run if isinstance(run, dict) else None
 
 
+def _mine() -> Optional[Dict[str, Any]]:
+    """This agent's own counters in the run: the supervisor's and each subagent's apart, so one agent's repeats
+    neither refuse another's first call nor end another's turn."""
+    run = _run()
+    if run is None:
+        return None
+    try:
+        who = _DEPTH.get() or "supervisor"
+    except NameError:
+        who = "supervisor"
+    return run.setdefault("by_agent", {}).setdefault(who, {})
+
+
 class RunTracker(AgentMiddleware):
     def __init__(self, max_tokens: int = 0):
         super().__init__()
@@ -94,7 +107,7 @@ class RepeatGuard(AgentMiddleware):
         self.limit, self.max_pages = limit, max_pages
 
     def _seen(self, request) -> Optional[ToolMessage]:
-        run = _run()
+        run = _mine()
         if run is None:
             return None
         call = request.tool_call
@@ -114,16 +127,70 @@ class RepeatGuard(AgentMiddleware):
         seen[key] = seen.get(key, 0) + 1
         if seen[key] <= self.limit:
             return None
+        run["repeats_refused"] = run.get("repeats_refused", 0) + 1
         return ToolMessage(tool_call_id=call["id"], name=call.get("name"), status="error", content=(
             f"Not run again: {call.get('name')} was already called {seen[key] - 1} times with exactly these arguments "
             f"in this request, and it answers the same each time. Use what it returned, try something different, or "
             f"answer the operator now with what you have (saying what is missing)."))
 
+    @staticmethod
+    def _count_fail(result) -> None:
+        """Calls that keep failing, each a little different (ten python3 -c variants with the same syntax error),
+        are a loop too: six failures in a row count as three repeats refused, ten as five."""
+        run = _mine()
+        if run is None or not isinstance(result, ToolMessage):
+            return
+        text = str(result.content)[:400]
+        failed = getattr(result, "status", "") == "error" or text.startswith(("Error", "Not run", "Not sent")) or \
+            "Traceback (most recent call last)" in text or "SyntaxError" in text or "parse error" in text
+        run["fails_in_row"] = run.get("fails_in_row", 0) + 1 if failed else 0
+        if run["fails_in_row"] >= 14:
+            run["repeats_refused"] = max(run.get("repeats_refused", 0), 8)
+            run["circle_broken"] = True
+        elif run["fails_in_row"] >= 6:
+            run["repeats_refused"] = max(run.get("repeats_refused", 0), 3)
+
     def wrap_tool_call(self, request, handler: Callable):
-        return self._seen(request) or handler(request)
+        got = self._seen(request) or handler(request)
+        self._count_fail(got)
+        return got
 
     async def awrap_tool_call(self, request, handler: Callable):
-        return self._seen(request) or await handler(request)
+        got = self._seen(request) or await handler(request)
+        self._count_fail(got)
+        return got
+
+    # Going in circles (three repeats refused in one request: the same few reads in turn) is broken by taking the
+    # tools away for one model call: it answers with what it has. A run once cycled three reads to its 400-step limit.
+    def _circling(self, request):
+        run = _mine()
+        if run is None or run.get("repeats_refused", 0) < 3 or run.get("circle_broken"):
+            return request
+        run["circle_broken"] = True
+        from langchain_core.messages import HumanMessage
+        note = HumanMessage(content=(
+            "[loop check] You are repeating the same calls, and they answer the same. Answer the operator now from "
+            "what you have read; say plainly what you could not find or do."))
+        return request.override(messages=[*request.messages, note])
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        """Still circling after the loop check (two more repeats refused): the request ends with what it had."""
+        run = _mine()
+        if run is None or not run.get("circle_broken") or run.get("repeats_refused", 0) < 8:
+            return None
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        # The longest thing it said, not the last: in an investigation that is the report taking shape.
+        said = [str(m.content) for m in msgs[-40:] if isinstance(m, AIMessage) and str(m.content).strip()]
+        best = max(said, key=len) if said else ""
+        return {"jump_to": "end", "messages": [AIMessage(content=(
+            (best + "\n\n" if best else "") + "[I stopped here: I kept repeating the same calls without getting further.]"))]}
+
+    def wrap_model_call(self, request, handler: Callable):
+        return handler(self._circling(request))
+
+    async def awrap_model_call(self, request, handler: Callable):
+        return await handler(self._circling(request))
 
 
 def _stamp(result: Any, t0: float) -> Any:
@@ -244,6 +311,156 @@ class RecordWrites(AgentMiddleware):
             finally:
                 _SENT.reset(tok)
         return self._after(request, await handler(request))
+
+
+_DEPTH: "contextvars.ContextVar" = contextvars.ContextVar("canah_task_depth", default="")
+_ASKED: "contextvars.ContextVar" = contextvars.ContextVar("canah_operator_question", default="")
+_REMOVES = re.compile(r"delete|remove|teardown|tear_down|destroy|detach|disconnect|shutdown|shut_down|decommission|"
+                      r"release|deprovision|purge|wipe|erase|reset", re.I)
+_ASKS_REMOVAL = re.compile(r"\b(delete|remove|tear\s*down|teardown|destroy|detach|disconnect|shut\s*down|decommission|"
+                           r"release|free (up|it)|replace|move|reroute|re-route|migrate|clean\s*up|drop|deprovision|"
+                           r"take down|undo|roll\s*back|revert)\b", re.I)
+_SCOPE = "[scope check]"
+
+
+class ScopeGuard(AgentMiddleware):
+    """A change that removes something (delete, teardown, disconnect ...) when the operator asked for nothing of
+    the kind is taken back before it reaches the approval: the model is asked again, once, without it. One run
+    tore down a lightpath in service to free a transponder for the one it was asked to create. The operator's
+    own question is what counts, also inside a subagent (it travels with the task)."""
+
+    def __init__(self, writes: Iterable[str]):
+        super().__init__()
+        self.writes = set(writes)
+
+    def _removal(self, call: Dict[str, Any]) -> bool:
+        name = str(call.get("name") or "")
+        if name not in self.writes:
+            return False
+        args = call.get("args") or {}
+        return bool(_REMOVES.search(name) or _REMOVES.search(str(args.get("tool") or "")))
+
+    @staticmethod
+    def _asked_for(q: str) -> bool:
+        return bool(_ASKS_REMOVAL.search(q) or _REMOVES.search(q))
+
+    def _question(self, request) -> str:
+        asked = _ASKED.get()
+        if asked:
+            return asked
+        from .grounding import current_question
+        return current_question(list(getattr(request, "messages", []) or []))
+
+    def wrap_model_call(self, request, handler: Callable):
+        got = handler(request)
+        msg = _last_ai(got)
+        if msg is None or not msg.tool_calls:
+            return got
+        bad = [c for c in msg.tool_calls if self._removal(c)]
+        if not bad or self._asked_for(self._question(request) or ""):
+            return got
+        if any(_SCOPE in str(getattr(m, "content", "")) for m in (request.messages or [])):
+            return got
+        from langchain_core.messages import HumanMessage
+        note = HumanMessage(content=(
+            f"{_SCOPE} You were about to remove something ({', '.join(c['name'] + ' ' + json.dumps(c.get('args'), default=str)[:200] for c in bad)}), "
+            f"and the operator did not ask to remove anything. Do not. If what was asked cannot be done without it "
+            f"(a port or transponder is in use, say), report exactly that, and what is using it, and stop: removing it "
+            f"is the operator's decision, to ask for in their own words."))
+        return handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls], note]))
+
+    async def awrap_model_call(self, request, handler: Callable):
+        got = await handler(request)
+        msg = _last_ai(got)
+        if msg is None or not msg.tool_calls:
+            return got
+        bad = [c for c in msg.tool_calls if self._removal(c)]
+        if not bad or self._asked_for(self._question(request) or ""):
+            return got
+        if any(_SCOPE in str(getattr(m, "content", "")) for m in (request.messages or [])):
+            return got
+        from langchain_core.messages import HumanMessage
+        note = HumanMessage(content=(
+            f"{_SCOPE} You were about to remove something, and the operator did not ask to remove anything. Do not. "
+            f"If what was asked cannot be done without it, report exactly that and stop."))
+        return await handler(request.override(messages=[*request.messages, msg, *[_ack(c) for c in msg.tool_calls], note]))
+
+
+def _last_ai(got: Any):
+    res = getattr(got, "result", None)
+    msgs = res if isinstance(res, list) else [got] if isinstance(got, AIMessage) else []
+    return next((m for m in reversed(msgs) if isinstance(m, AIMessage)), None)
+
+
+def _ack(call: Dict[str, Any]) -> ToolMessage:
+    return ToolMessage(tool_call_id=call["id"], name=call.get("name"), status="error",
+                       content="Not sent: taken back by the scope check below.")
+
+
+class CallLog(AgentMiddleware):
+    """One log line per tool call, in every agent (logger canah.calls): who called it (the supervisor, or the
+    subagent a task went to), the arguments and the start of the result. What a subagent did inside its task is
+    otherwise invisible: only its report comes back."""
+
+    def __init__(self, folder: Any = None):
+        super().__init__()
+        import logging
+        self.log = logging.getLogger("canah.calls")
+        self.log.setLevel(logging.INFO)
+        if folder is not None and not any(getattr(h, "canah_calls", False) for h in self.log.handlers):
+            from logging.handlers import RotatingFileHandler
+            from pathlib import Path
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            h = RotatingFileHandler(str(Path(folder) / "calls.log"), maxBytes=5_000_000, backupCount=3)
+            h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            h.canah_calls = True
+            self.log.addHandler(h)
+
+    def _line(self, request, result, ms: float) -> None:
+        call = request.tool_call
+        text = getattr(result, "content", None)
+        if text is None and isinstance(getattr(result, "update", None), dict):
+            msgs = result.update.get("messages") or []
+            text = getattr(msgs[-1], "content", "") if msgs else ""
+        who = _DEPTH.get() or "supervisor"
+        self.log.info("%s %s %s -> %s (%d ms)", who, call.get("name"),
+                      json.dumps(call.get("args"), default=str)[:300], str(text or "")[:200].replace("\n", " "), ms)
+
+    @staticmethod
+    def _enter(request):
+        if request.tool_call.get("name") != "task":
+            return None
+        from .grounding import current_question
+        state = getattr(request, "state", None) or {}
+        msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        q = _ASKED.get() or current_question(msgs)
+        return (_DEPTH.set(str((request.tool_call.get("args") or {}).get("subagent_type") or "subagent")), _ASKED.set(q))
+
+    @staticmethod
+    def _leave(tok) -> None:
+        if tok is not None:
+            _DEPTH.reset(tok[0])
+            _ASKED.reset(tok[1])
+
+    def wrap_tool_call(self, request, handler: Callable):
+        tok = self._enter(request)
+        t0 = time.time()
+        try:
+            got = handler(request)
+        finally:
+            self._leave(tok)
+        self._line(request, got, (time.time() - t0) * 1000)
+        return got
+
+    async def awrap_tool_call(self, request, handler: Callable):
+        tok = self._enter(request)
+        t0 = time.time()
+        try:
+            got = await handler(request)
+        finally:
+            self._leave(tok)
+        self._line(request, got, (time.time() - t0) * 1000)
+        return got
 
 
 class GuardMemory(AgentMiddleware):

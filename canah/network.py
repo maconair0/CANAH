@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import logging
 import os
 from typing import Any, Dict, List, Optional, Type
@@ -253,6 +254,15 @@ class _RelationsTool(BaseTool):
         def same(a: str, b: str) -> bool:
             a, b = a.lower(), b.lower()
             return a == b or a.split(":")[-1] == b.split(":")[-1]
+        # "tenant green", "lightpath LP-1", "the service VS-100": the object is the name, not its kind.
+        names = {x for e in good for x in (e["from"], e["to"])}
+        if not any(same(start, n) for n in names):
+            kinds = r"^(tenant|lightpath|service|link|router|node|device|switch|port|fibre|fiber|customer|vlan)[-_ ]"
+            cands = str(start).replace(",", " ").split() + [re.sub(kinds, "", str(start), flags=re.I)]
+            for cand in reversed(cands):
+                if any(same(cand, n) for n in names):
+                    start = cand
+                    break
         seen, frontier, lines = set(), [start], []
         for step in range(max(1, min(int(depth or 4), 8))):
             nxt = []
@@ -297,11 +307,16 @@ def _find(catalog: Dict[str, Dict[str, Dict[str, Any]]], controller: str, tool: 
     return None
 
 
+_DOWN: Dict[str, float] = {}          # controller -> when it last timed out
+DOWN_FOR_S = float(os.getenv("CANAH_DOWN_FOR_S", "20"))
+
+
 class _CatalogTool(BaseTool):
     """Shared by the tools below: the controllers' tools as the agentic MCP offers them."""
     service: Any
     catalog: Dict[str, Dict[str, Dict[str, Any]]] = {}     # controller -> tool name -> record
     changes_by: Dict[str, str] = {}                        # controller -> the config agent that changes it (team)
+    locate: Any = None                                     # name -> controllers whose reads mention it
 
     def _find(self, controller: str, tool: str) -> Optional[Dict[str, Any]]:
         return _find(self.catalog, controller, tool)
@@ -318,6 +333,13 @@ class _CatalogTool(BaseTool):
         refused = self._out_of_scope(controller, config)
         if refused:
             return refused
+        # A controller that just timed out is not asked again for a little while: each read of it would wait and
+        # fail the same way (an investigation read a down controller nine times). Writes are always tried.
+        since = _DOWN.get(controller)
+        if since and not rec.get("write") and time.time() - since < DOWN_FOR_S:
+            return (f"Error: {controller} is not answering (it timed out {int(time.time() - since)} s ago), so it "
+                    f"cannot be read now. Do not read it again in this request: work from what the other controllers "
+                    f"and the evidence say, and report that {controller} could not be read.")
         # A write reaches here only after the operator approved it (interrupt_on stops the call before it
         # runs); the approval travels to the agentic MCP as approved_by, and its own gate checks it.
         by = f"{_user(config)} (approved in canah)" if rec.get("write") else ""
@@ -326,7 +348,37 @@ class _CatalogTool(BaseTool):
         except Exception as e:  # noqa: BLE001 - the model is told, the run goes on
             return f"Error: {controller} {rec['name']} did not answer: {type(e).__name__}: {e}"
         text = str(got.get("text", ""))
-        return _clip(("Error: " if got.get("is_error") and not text.lower().startswith("error") else "") + text)
+        if re.search(r"does not answer|not answering|ConnectTimeout|ConnectError|timed out|unreachable", text[:300], re.I) \
+                and (got.get("is_error") or text.lower().startswith("error")):
+            _DOWN[controller] = time.time()
+        else:
+            _DOWN.pop(controller, None)
+        out = _clip(("Error: " if got.get("is_error") and not text.lower().startswith("error") else "") + text)
+        if rec.get("write") and out.startswith("Error") and self.locate is not None:
+            out += self._where_it_is(out, controller)
+        return out
+
+    def _where_it_is(self, error: str, controller: str) -> str:
+        """A write refused for an object the controller does not have: where that object is, and who changes it
+        there. (A tenant change sent to the packet domain failed on "no router border-leaf-1"; the leaf is the
+        data centre's.)"""
+        m = (re.search(r"\b(?:no|unknown|not found:?)\s+(?:router|switch|device|node|link|service|tenant|port|"
+                       r"transponder|lightpath|interface|leaf)\s+['\"]?([\w:./-]+)", error, re.I)
+             or re.search(r"['\"]?([\w:./-]+)['\"]? is not an? \w+", error))
+        if not m:
+            return ""
+        name = m.group(1).rstrip(".,")
+        try:
+            found = [k for k in self.locate(name) if k != controller]
+        except Exception:  # noqa: BLE001
+            return ""
+        if not found:
+            return ""
+        who = "; ".join(f"{k}" + (f" (changed by {self.changes_by[k]})" if self.changes_by.get(k) else "") for k in found)
+        return (f"\n[{name} is not on {controller}: it is on {who}. If the change is to {name} itself, it belongs "
+                f"there: say so in your report. If {name} was only a value in this change (the link to ride, say), "
+                f"use {controller}'s own object instead: the error, or a read, names them (the one {name} carries, "
+                f"for a lightpath).]")
 
 
 def _terms(match: Any) -> List[str]:
@@ -552,6 +604,45 @@ def _verb_schema(verb: str, write: bool, served: Dict[str, Dict[str, Any]]) -> D
         "required": ["controller"] if write else []}
 
 
+_REL_GUARD = "[relations check]"
+_PATHQ = re.compile(r"\b(how does .{1,60} (reach|get to|connect)|which .{0,40}(carr(y|ies)|rides?)|what (carries|rides)|"
+                    r"carried by|rides? (on|over)|path|end[- ]to[- ]end|depend\w*|at risk|affect\w*|impact\w*|"
+                    r"reach(es)? outside|goes? through)\b", re.I)
+
+
+class RelationsFirst:
+    """Built in AgenticMCPProvider.middleware(): a question about what carries what (a path, an impact, what is at
+    risk) answered without follow_relations is sent back once. The model otherwise strings pieces together
+    from separate reads and invents the joins (an optical hop for a tenant that never leaves packet)."""
+
+    @staticmethod
+    def make():
+        from langchain.agents.middleware import AgentMiddleware, hook_config
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        class _RelationsFirst(AgentMiddleware):
+            @hook_config(can_jump_to=["model"])
+            def after_model(self, state, runtime):
+                from .grounding import anchored, current_question, is_keep, turn_start
+                msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+                if not msgs or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls or is_keep(msgs[-1].content):
+                    return None
+                q = current_question(msgs) or ""
+                if not _PATHQ.search(q) or len(q) > 500:
+                    return None
+                turn = msgs[turn_start(msgs):]
+                if any(isinstance(m, HumanMessage) and _REL_GUARD in str(m.content) for m in turn):
+                    return None
+                if any(isinstance(m, AIMessage) and any(c.get("name") in ("follow_relations", "task") for c in
+                                                        (m.tool_calls or [])) for m in turn):
+                    return None
+                return {"jump_to": "model", "messages": [HumanMessage(content=anchored(
+                    f"{_REL_GUARD} This asks what carries what. Call follow_relations from the object the question "
+                    f"names (a tenant, a service, a lightpath) and answer from the chain it returns: name each piece "
+                    f"and its domain as it returns them, and no piece it does not.", msgs))]}
+        return _RelationsFirst()
+
+
 class AgenticMCPProvider:
     """The networks, through the agentic MCP. The agentic MCP holds the controllers and checks each against the
     common contract; CANAH's main agent works them all through it with one set of tools, the same for every
@@ -675,9 +766,10 @@ class AgenticMCPProvider:
         if self.team:
             self._build_team(held, served, rules)
             by = {k: a["name"] for a in self.config_agents for k in self.roles[a["name"]]["controllers"]}
-            for t in self._tools:
+            for t in self._tools + [t for a in self.config_agents for t in a["tools"]]:
                 if isinstance(t, _CatalogTool):
                     t.changes_by = by
+                    t.locate = self.locate
 
     def _build_team(self, held: Dict[str, Any], served: Dict[str, Dict[str, Dict[str, Any]]], rules: Dict[str, Any]) -> None:
         """One config agent per network domain (packet, optical, data centre, ...), from the domain each controller
@@ -740,6 +832,33 @@ class AgenticMCPProvider:
                                   f"may take several calls (attach a tenant, then connect it): make every one until the "
                                   f"change you were given is complete, then read it back."),
                 "tools": tools})
+
+    def middleware(self) -> List[Any]:
+        self._load()
+        return [RelationsFirst.make()] if any(t.name == "follow_relations" for t in self._tools) else []
+
+    def locate(self, name: str) -> List[str]:
+        """The controllers whose devices, links or services mention this name (reads, cached for 30 s)."""
+        self._load()
+        now = time.time()
+        cache = getattr(self, "_seen_cache", None)
+        if cache is None or now - cache[0] > 30:
+            seen: Dict[str, str] = {}
+            for verb in ("read_devices", "read_links", "read_services"):
+                vt = self.verb_tools.get(f"net_{verb}")
+                if vt is None:
+                    continue
+                for k, tool in vt.served.items():
+                    try:
+                        got = self.service.call(k, tool, {}, approved_by="")
+                        seen[k] = seen.get(k, "") + str(got.get("text", "")).lower()
+                    except Exception:  # noqa: BLE001
+                        continue
+            cache = (now, seen)
+            if seen:
+                self._seen_cache = cache
+        n = name.lower()
+        return [k for k, text in cache[1].items() if re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", text)]
 
     def agent_roles(self) -> Dict[str, Dict[str, Any]]:
         self._load()

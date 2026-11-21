@@ -282,6 +282,54 @@ def _enforce_max_records(records: List[Dict],
     return out
 
 
+_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+
+
+def chunk_markdown(text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS) -> List[str]:
+    """A Markdown file cut at its headings, each section led by its heading path ("Design rules > Packet domain"),
+    so one passage holds one subject. A rules file whose three sections each covered a different domain was one
+    passage before: a question about one domain scored it low (0.097, under the 0.1 bar), the other two diluting it.
+    A section longer than a chunk goes through chunk_text; tiny ones join the next."""
+    path: List[str] = []
+    sections: List[tuple] = []
+    body: List[str] = []
+
+    def flush():
+        t = "\n".join(body).strip()
+        if t:
+            sections.append((" > ".join(path), t))
+        body.clear()
+    for line in text.splitlines():
+        m = _HEADING.match(line)
+        if m:
+            flush()
+            level = len(m.group(1))
+            path[:] = path[:level - 1] + [m.group(2)]
+            continue
+        body.append(line)
+    flush()
+    if len(sections) <= 1:
+        return chunk_text(text, chunk_chars)
+    out: List[str] = []
+    carry = ""
+    for head, t in sections:
+        piece = (carry + "\n\n" if carry else "") + (f"{head}\n{t}" if head else t)
+        if len(piece) < 160:
+            carry = piece
+            continue
+        carry = ""
+        if len(piece) <= chunk_chars:
+            out.append(piece)
+        else:
+            out += [(f"{head}\n" if head and not c.startswith(head) else "") + c for c in chunk_text(piece, chunk_chars)]
+    if carry:
+        if out:
+            out[-1] += "\n\n" + carry
+        else:
+            out.append(carry)
+    return out
+
+
 def chunk_file(path: str, text: str,
                file_meta: Optional[Dict] = None) -> List[Dict[str, Any]]:
     """Chunk one file according to its type, labelling each chunk's section.
@@ -302,6 +350,9 @@ def chunk_file(path: str, text: str,
             text, source=os.path.splitext(os.path.basename(path))[0][:40]
         )
         kind = "pdf"
+    elif ext in (".md", ".markdown"):
+        records = _as_records(chunk_markdown(text))
+        kind = "md"
     else:
         records = _as_records(chunk_text(text))
         kind = ext.lstrip(".") or "text"

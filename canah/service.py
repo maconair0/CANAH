@@ -604,14 +604,42 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         work.put((-worst, seq[0], {"group": group, "specs": specs, "mode": mode, "key": key, "evidence": evidence or {}}))
         return {"started": True, "queued": work.qsize(), "mode": mode, "thread": key}
 
+    def unreachable_report(group: List[Dict[str, Any]], evidence: Dict[str, Any]) -> str:
+        """A controller that does not answer: the facts are known, so the report is written from them, not
+        guessed at (asked to explain it, the model once blamed a fibre cut in another domain)."""
+        ctls = sorted({g["controller"] for g in group})
+        held = []
+        for c in ctls:
+            h = (evidence.get("health_now") or {}).get(c) or {}
+            parts = [f"{h[k]} {k}" for k in ("devices", "links", "services") if h.get(k)]
+            held.append(f"{c}" + (f" ({', '.join(parts)} when last read)" if parts else ""))
+        why = "; ".join(f"#{g['id']}: {(g.get('details') or g['title'])[:200]}" for g in group)
+        return (f"CAUSE: {', '.join(ctls)} does not answer the agentic MCP ({why}). This is the controller (its host, "
+                f"process or credentials), not the network it manages: nothing read shows a network fault behind it.\n"
+                f"AFFECTS: what {', '.join(held)} manages cannot be read or changed until it answers; its network may "
+                f"still be carrying traffic.\n"
+                f"FIX: for the operator to do: check {', '.join(ctls)}'s host and process, its address and credentials "
+                f"in the agentic MCP's configuration, and the network path to it.\n"
+                f"CONFIDENCE: high, because the agentic MCP reports the controller itself as not answering.")
+
     def investigate(job: Dict[str, Any]) -> None:
         group, mode, key = job["group"], job["mode"], job["key"]
+        if all(g.get("kind") in ("controller_unreachable", "agentic_mcp_down") for g in group):
+            text = unreachable_report(group, job.get("evidence") or {})
+            for g in group:
+                incidents.set(g["id"], investigated_at=time.time(), report=text, note="")
+            return
         ids = ", ".join(str(g["id"]) for g in group)
         books = {sp.get("name"): sp.get("instructions", "").strip() for sp in job["specs"] if sp.get("name")}
         lines = "\n".join(f"- #{g['id']} [{g['severity']}] {g['title']} (controller {g['controller']}, {g['kind']}): "
                           f"{(g.get('details') or '')[:300]}" for g in group)
+        mine = {g["id"] for g in group}
+        others = [o for o in incidents.list("active", 50) if o["id"] not in mine]
+        apart = ("Other open incidents are investigated separately, as unrelated to these (nothing published links "
+                 "them): " + "; ".join(f"#{o['id']} {o['title']}" for o in others[:8]) + ". Do not explain these "
+                 "incidents by them unless a relation or a read shows one caused the other.\n\n") if others else ""
         prompt = (f"[incidents {ids}] The watcher opened {'these together' if len(group) > 1 else 'this incident'}"
-                  f"{'; they may share one cause' if len(group) > 1 else ''}.\n{lines}\n\n"
+                  f"{'; they may share one cause' if len(group) > 1 else ''}.\n{lines}\n\n" + apart +
                   f"Evidence the watcher already gathered (do not read it again):\n"
                   f"{json.dumps(job['evidence'], default=str)[:4000]}\n\n"
                   + "".join(f"Runbook {n}:\n{t}\n\n" for n, t in books.items())
@@ -634,14 +662,18 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             r = A().ask(prompt, key, WATCH_WHO, max_seconds=A().settings.investigate_seconds)
             fix = next((ln.split(":", 1)[1].strip() for ln in (r.text or "").splitlines()
                         if ln.strip().upper().startswith("FIX:")), "")
-            if mode == "propose" and not r.pending and fix and not re.search(
-                    r"^(none|no fix|nothing)\b|for the operator|operator (should|must|to)|replace|physical|on site|"
-                    r"technician|vendor|check the", fix, re.I):
-                # A fix a tool can make, written in the report but not handed on: hand it on now, once, so it
-                # waits for approval rather than for someone to read the report.
+            # Handed on when a tool can make it: the FIX names a network action (reroute, adjust, provision, ...)
+            # however it is worded, also when the model held it back for the twin's low trust ("cannot be proposed
+            # until more data is gathered"): that is the operator's call at the approval, not the model's.
+            acts = bool(re.search(r"\b(re-?rout\w*|adjust\w*|provision\w*|restor\w*|move|attach\w*|connect\w*|"
+                                  r"create\w*|set_\w+|net_\w+|controller_write|switch\w* (over|to))\b", fix, re.I))
+            manual = re.search(r"^(none|no fix|nothing)\b|\(for the operator to do\)", fix, re.I)
+            if mode == "propose" and not r.pending and fix and acts and not manual:
                 r2 = A().ask(f"Hand this FIX to the domain's config agent now, with the exact change, so it waits for the "
-                             f"operator's approval: {fix[:600]}. If no tool can make it, say so in one line.",
-                             key, WATCH_WHO, max_seconds=max(120, A().settings.investigate_seconds // 3))
+                             f"operator's approval: {fix[:600]}. The twin's low trust (gather_more_data, tier C) is not a "
+                             f"reason to hold it back: say it with the proposal, and the operator decides at the approval. "
+                             f"If no tool can make it, say so in one line.",
+                             key, WATCH_WHO, max_seconds=min(180, max(60, A().settings.investigate_seconds // 3)))
                 if r2.pending:
                     import dataclasses
                     r = dataclasses.replace(r, pending=r2.pending, text=(r.text or "") + "\n\n" + (r2.text or ""))
@@ -667,7 +699,10 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                 investigate(job)
             except Exception:  # noqa: BLE001 - the next one still runs
                 logger.exception("an investigation failed")
-    threading.Thread(target=worker, name="canah-investigations", daemon=True).start()
+    # Unrelated events are investigated side by side (Ollama serves two at once with OLLAMA_NUM_PARALLEL=2); the
+    # worst first, each in its own thread of the conversation store.
+    for n in range(max(1, int(agent.settings.investigate_workers or 1))):
+        threading.Thread(target=worker, name=f"canah-investigations-{n}", daemon=True).start()
 
     watcher = Watcher(topology, incidents, agent.notifier or __import__("canah.notify", fromlist=["Notifier"]).Notifier([]),
                       net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s,

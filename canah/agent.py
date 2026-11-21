@@ -29,7 +29,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
 from .notify import Notifier
-from .grounding import DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, TimeBudget
+from .grounding import (DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, NumberCheck,
+                        QotRuns, TimeBudget)
 from .identity import OBSERVER, Identity
 from . import memory as mem
 from .config import Settings, load
@@ -171,10 +172,24 @@ class CanahAgent:
         from .grounding import is_keep
         msgs = out.get("messages", [])[start:]
         text = ""
-        for m in reversed(msgs):
-            if isinstance(m, AIMessage) and str(m.content or "").strip() and not is_keep(m.content):
-                text = m.content if isinstance(m.content, str) else str(m.content)
-                text = re.sub(r"\n+\s*KEEP\s*$", "", text)       # a KEEP tacked on the end of an answer
+        pending = approval.pending(self.graph, cfg)
+        # The answer is the last message without a tool call: a call's preamble ("I'll verify it with ...") is not
+        # one, unless the run stopped there for an approval, where that preamble says what waits.
+        for calls_ok in ((False, True) if not pending else (True,)):
+            for m in reversed(msgs):
+                if (isinstance(m, AIMessage) and str(m.content or "").strip() and not is_keep(m.content)
+                        and (calls_ok or not m.tool_calls)):
+                    text = m.content if isinstance(m.content, str) else str(m.content)
+                    text = re.sub(r"\n+\s*KEEP\s*$", "", text)       # a KEEP tacked on the end of an answer
+                    # A check's own words copied into the answer ("The operator's question this turn: «...»").
+                    for tail in (r"KEEP and it stands as it is\.", r"not an earlier one\."):
+                        cut = re.sub(r"(?s)^\s*(\[[a-z -]+ check\][^\n]*\n+)?The operator's question this turn: «.*?».*?"
+                                     + tail + r"\s*", "", text, count=1).strip()
+                        if cut != text.strip():
+                            text = cut or text
+                            break
+                    break
+            if text:
                 break
         results = {m.tool_call_id: str(m.content) for m in msgs if isinstance(m, ToolMessage)}
         calls = []
@@ -182,7 +197,6 @@ class CanahAgent:
             if isinstance(m, AIMessage):
                 calls += [{"name": c["name"], "args": c.get("args", {}), "result": results.get(c.get("id"))}
                           for c in (m.tool_calls or [])]
-        pending = approval.pending(self.graph, cfg)
         for p in pending:
             p["needs"] = self.needs(p["name"])
         return Reply(text=text, thread_id=cfg["configurable"]["thread_id"], pending=pending, tool_calls=calls)
@@ -434,6 +448,22 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     large = LargeResults(limit=settings.large_result_chars, sandbox=sandbox,
                          folder=settings.home_path / "results" if sandbox is None else None)
     extra_mw = [*_load_middleware(settings.middleware), *list(middleware)]
+    _targets = [pv.write_target for pv in all_providers if hasattr(pv, "write_target")]
+
+    def write_tool_of(name, args):
+        """The controller's own tool a write call sends (net_adjust on fabric: connect_tenant_external)."""
+        for r in _targets:
+            got = r(name, args)
+            if got is not None:
+                return got[1]
+        return name
+    _net = next((pv for pv in all_providers if hasattr(pv, "locate") and hasattr(pv, "roles")), None)
+    _locate = _net.locate if _net is not None else None
+    _agent_of = ({k: name for name, r in _net.roles.items() for k in r.get("controllers", [])} if _net is not None else {})
+    controller_writes = set()
+    for pv in all_providers:
+        for tools_of in (getattr(pv, "catalog", None) or {}).values():
+            controller_writes |= {n for n, r in tools_of.items() if r.get("write")}
     if twin_provider and settings.twin_gate:
         from .twins.provider import make_gate
         approvals_set = set(approvals)
@@ -457,17 +487,20 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     shared = [t for t in tools if t.name in set(got.get("shared") or [])]
     budget = TimeBudget(settings.task_seconds)
     from .ops import Ops
-    from .safety import GuardMemory, RecordWrites, RepeatGuard, RunTracker, ScreenOutput
+    from .safety import CallLog, GuardMemory, ScopeGuard, RecordWrites, RepeatGuard, RunTracker, ScreenOutput
     ops = Ops(settings.home_path / "ops.sqlite") if settings.audit else None
     tracker, screen, record = RunTracker(settings.max_tokens_per_request), ScreenOutput(), RecordWrites(approvals, ops)
     repeat = RepeatGuard()
     guard_mem = GuardMemory(ops)
+    calls = CallLog(settings.home_path)
+    scope = ScopeGuard(approvals)
     for spec in specs:
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
-        spec["middleware"] = [*_retry(), budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
+        spec["middleware"] = [*_retry(), calls, scope, budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
+                              NumberCheck(),
                               *list(spec.get("middleware") or []),
-                              *([MakeTheChange(writes)] if team_specs and spec["name"].endswith("-config") else []),
+                              *([MakeTheChange(writes, controller_writes, write_tool_of)] if team_specs and spec["name"].endswith("-config") else []),
                               *extra_mw]
         if spec.get("tools") is not None and shared:
             have = {t.name for t in spec["tools"]}
@@ -531,8 +564,9 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             model=main_model,
             tools=main_tools,
             system_prompt=prompt,
-            middleware=[budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                        KeepAnswer(), *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")])] if team_specs else []), *_fallback(),
+            middleware=[calls, scope, budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
+                        KeepAnswer(), NumberCheck(), *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
+                                             agent_of=_agent_of)] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
                         *compact_mw],
             subagents=specs or None,
@@ -598,7 +632,11 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
                              "probability and trust. Give it any what-if, any 'is it safe', any degradation, and the "
                              "fix for an incident. A plain change goes straight to the config agent (the write gate "
                              "rehearses it). It changes nothing itself."),
-             "system_prompt": ("You are CANAH's quality-of-transmission agent. You read every domain and you work the digital "
+             "system_prompt": ("You are CANAH's quality-of-transmission agent. First: when the request names the twin's "
+                               "example scenario, or describes a network itself, call twin_schema(domain) and run that "
+                               "scenario (twin_validate, twin_predict) as given, changing only what the request changes; "
+                               "do not look for its objects in the live network, they are not there. "
+                               "You read every domain and you work the digital "
                                "twin; you change nothing. For a question about quality or health: read it (net_read_ tools, "
                                "incidents, health_over_time, network_changes) and report the figures as read. For a what-if "
                                "or a change: build the twin's scenario from what you read (twin_schema for its format), "
@@ -619,7 +657,7 @@ def _qot_spec(tools: Sequence[Any], writes: set) -> List[Dict[str, Any]]:
                                "network, the PROPOSAL is the fix that restores the service (reroute, restore, move), "
                                "as an exact change.\n"
                                "Never say a change is made: the supervisor hands your proposal to the domain's config agent."),
-             "tools": chosen}]
+             "tools": chosen, "middleware": [QotRuns()]}]
 
 
 def _retry() -> List[Any]:

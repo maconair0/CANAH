@@ -65,3 +65,19 @@ class Emulator(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhereItIs(unittest.TestCase):
+    def test_a_write_refused_for_an_object_elsewhere_says_where_it_is(self):
+        from canah.network import AgenticMCP, AgenticMCPProvider
+        from testbed.emulator import Running
+        e = Running()
+        try:
+            p = AgenticMCPProvider(service=AgenticMCP(e.url, token=""))
+            tools = {t.name: t for t in next(a for a in p.subagents() if a["name"] == "packet-config")["tools"]}
+            out = tools["net_provision"].invoke({"controller": "packet", "arguments": {
+                "name": "X", "vlan": 301, "a": "border-leaf-1", "z": "pe-b:eth4"}}, config={"configurable": {}})
+            self.assertIn("it is on fabric (changed by data-centre-config)", out)
+            self.assertIn("only a value in this change", out)
+        finally:
+            e.stop()

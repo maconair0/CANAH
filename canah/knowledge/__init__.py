@@ -248,6 +248,20 @@ class DocsFirst(AgentMiddleware):
             f"cite it; if it returns nothing, say the documents do not cover it.", msgs, keep=False))]}
 
 
+def _question_forms(question: str, query: str) -> List[str]:
+    """The operator's question, its interrogative sentences alone, and the question without its instructions;
+    each once, none equal to the query already searched."""
+    parts = [x.strip() for x in re.split(r"(?<=[.?!])\s+", question.strip()) if x.strip()]
+    asks = [x for x in parts if x.endswith("?")]
+    plain = " ".join(x for x in parts if not re.match(r"(?i)^(use|check|look|see|answer|ask|search|read|follow|"
+                                                         r"according)\b", x))
+    out: List[str] = []
+    for c in [question.strip(), *asks, plain]:
+        if c and c.lower() != query.strip().lower() and c not in out:
+            out.append(c)
+    return out[:4]
+
+
 class KnowledgeProvider:
     """The RAG as tools and a librarian subagent (a ToolProvider)."""
 
@@ -260,13 +274,15 @@ class KnowledgeProvider:
         try:
             if hasattr(self.retriever, "retrieve"):
                 got = self.retriever.retrieve(query, top_k=k)
-                if got.get("abstained") and question and question.strip().lower() != query.strip().lower():
+                if got.get("abstained") and question:
                     # A model searches in keywords ("VLAN design rules 1200 range restrictions"), which a
                     # cross-encoder trained on questions scores near zero; the operator's own question is the
-                    # better query, so it is tried before saying the documents do not cover it.
-                    again = self.retriever.retrieve(question[:500], top_k=k)
-                    if not again.get("abstained"):
-                        return render(again["hits"][:k], chars, question)
+                    # better query. Instructions in it ("Use the design rules.") dilute it too, so its questions
+                    # are tried on their own: before saying the documents do not cover it.
+                    for alt in _question_forms(question, query):
+                        again = self.retriever.retrieve(alt[:500], top_k=k)
+                        if not again.get("abstained"):
+                            return render(again["hits"][:k], chars, question)
                 if got.get("abstained"):
                     return render_abstention(got)
                 hits = got["hits"]

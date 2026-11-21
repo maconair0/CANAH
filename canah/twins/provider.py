@@ -362,6 +362,10 @@ def make_gate(registry: Registry, checks: Checks, writes: Callable[[], Set[str]]
                 return result
             if rec.get("action") == "not_modelled":
                 text = result.content if isinstance(result.content, str) else str(result.content)
+                if text.lstrip().lower().startswith("error"):
+                    # Said so the model does not blame the twin for the controller's own refusal.
+                    return result.model_copy(update={"content": text + "\n\n[That refusal is the controller's own answer. "
+                                                     "The digital twin did not check this change and did not refuse it.]"})
                 return result.model_copy(update={"content": text + f"\n\n[Not checked: the digital twin {rec['twin']!r} cannot "
                                                  f"model this kind of change (check {rec['check_id']}); it went to approval alone.]"})
             note = (f"\n\n[Checked in the digital twin {rec['twin']!r} first: check {rec['check_id']}, {rec['action']}"

@@ -309,10 +309,29 @@ Each check sends an answer back once, with the reason, for the model to correct 
 | look first | a substantial answer given without looking anything up (not an observer's change, whose answer is that an admin must ask) |
 | documents | a question that points at the documents ("use the design rules") answered without searching them |
 | delegation | a what-if answered without `qot`; a plain change handed to `qot`; an admin's change ending in a plan or "shall I?" with nothing handed to a config agent; an observer's change sent to a config agent |
-| make the change | (config agents) a task report with no write tried |
+| make the change | (config agents) a task report with no write tried, or without a write tool the task named |
+| scope | (before approval) a delete, teardown or disconnect the operator did not ask for: taken back, and the model asked again without it ("xpdr-a1 already carries LP-1" is the answer, not deleting LP-1) |
+| arithmetic | a wrong comparison of numbers: "1200 falls within 100 to 999" (or "within this range", the range stated just before), "21.4 is below 15" |
+| relations | a question about what carries what (a path, an impact, what is at risk) answered without `follow_relations` |
+| twin report | an answer that drops the decision in `qot`'s TWIN line, or says the twin could not answer when its report has a prediction |
 
 The checks share one notion of "this turn": every check's own messages are skipped, so one check's send-back is
 never taken by another for a new question with nothing read yet.
+
+Every tool call, by the supervisor or inside a subagent's task, is one line in `CANAH_HOME/calls.log` (who, the
+arguments, the start of the result, how long it took). What a subagent did is otherwise invisible: only its
+report comes back.
+
+A write refused because the object is not on that controller says where it is, and which config agent changes it
+there ("border-leaf-1 is not on packet: it is on fabric, changed by data-centre-config").
+
+A large result is kept under a short name (`/workspace/.results/r3-net_read_statistics.json`) with its structure and
+a `jq` command for it, so the model filters it rather than paging through it or guessing at its shape.
+
+Documents: Markdown is cut at its headings, each passage led by its heading path ("Design rules > Packet domain"),
+so one passage holds one subject. The 250-character floor that drops headings and captions applies to PDFs; a short
+section of a text file is content. A search that finds nothing tries the operator's question, then each question in
+it on its own. After upgrading, re-index Markdown with `python -m canah.knowledge.rag.refresh --force`.
 
 Writes are reported by the harness, not only by the agent: a delegated task's result ends with every write sent in
 it, exactly as sent, and what each returned, so the supervisor compares what was done with what it asked for.
@@ -417,6 +436,7 @@ These go in `canah.yaml`, or in the environment as `CANAH_<NAME>` for the common
 | `interrupt_on` | none | more tool calls that pause for approval: `{pattern: true \| {allowed_decisions, description}}` |
 | `middleware` | none | extra LangChain middleware for every agent, as `package.module:Class` |
 | `max_seconds` | 600 | time budget per request |
+| `investigate_workers` | 2 | investigations of unrelated events run side by side |
 | `task_seconds` | 0 (a third of what is left) | one delegated task's share of it |
 | `max_tokens_per_request` | 0 (none) | token budget per request |
 | `approval_ttl_s` | 3600 | how long an approval stays open |

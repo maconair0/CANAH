@@ -16,6 +16,7 @@ runtime with a `run` would slot in the same way.
 from __future__ import annotations
 
 import base64
+import re
 import posixpath
 import shlex
 from typing import List, Protocol, Tuple
@@ -60,6 +61,16 @@ class SandboxBackend(BaseSandbox):
             return ExecuteResponse(output=f"Error: the sandbox did not run it: {type(e).__name__}: {e}",
                                    exit_code=None)
         text = out + (("\n" if out and err else "") + err if err else "")
+        hy = sorted(set(re.findall(r"(?<![\w\"'])\.([A-Za-z_]\w*(?:-\w+)+)", command)))
+        if re.search(r"\bjq\b", command) and hy and re.search(r"cannot be subtracted|is not defined|compile error", text):
+            text += ("\n[In jq, " + ", ".join(f".{k}" for k in hy) + " reads as a subtraction (." + hy[0].split("-")[0] +
+                     " minus " + hy[0].split("-", 1)[1] + "). Quote a key with a hyphen: " +
+                     ", ".join(f'."{k}"' for k in hy) + ", for example select(.\"" + hy[0] + "\" == \"X\").]")
+        if "SyntaxError" in text and re.search(r"python3?\s+-c\b", command):
+            text += ("\n[python3 -c takes one line, and a `with`, `for` or `if` block cannot follow a `;` on it. Write "
+                     "the script on several lines with a heredoc instead:\npython3 - <<'PY'\nimport json\n"
+                     "data = json.load(open('/workspace/.results/<file>'))\nfor x in data['<list>']:\n"
+                     "    if <condition>:\n        print(x)\nPY]")
         truncated = len(text) > MAX_OUTPUT_CHARS
         if truncated:
             text = text[:MAX_OUTPUT_CHARS] + f"\n... [{len(text) - MAX_OUTPUT_CHARS} more characters cut]"

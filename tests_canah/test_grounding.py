@@ -394,3 +394,233 @@ class ModelHiccup(unittest.TestCase):
                         memory=open_memory(in_memory=True))
         self.assertEqual(a.ask("hi").text, "Recovered.")
         self.assertEqual(m.n, 2)
+
+
+class Arithmetic(unittest.TestCase):
+    def test_a_wrong_comparison_is_caught_and_a_right_one_is_not(self):
+        from canah.grounding import wrong_numbers
+        self.assertEqual(wrong_numbers("VLAN ids 100 to 999 are for customers, and VLAN 1200 falls within this range."),
+                         ["1200 is not within 100 to 999"])
+        self.assertEqual(wrong_numbers("An OSNR of 21.4 dB is below the 15.0 dB minimum."), ["21.4 is not below 15.0"])
+        self.assertEqual(wrong_numbers("Yes, you can use VLAN 1200 for a new customer service, as it falls within the "
+                                       "allowed range of VLAN IDs (100 to 999) for customer services."),
+                         ["1200 is not within 100 to 999"])
+        self.assertEqual(wrong_numbers("No: VLAN 1200 is not within the customer range (100 to 999)."), [])
+        for ok in ("VLAN 1200 is outside the range 100 to 999.", "VLAN 500 falls within 100 to 999.",
+                   "13.0 is below 15.0.", "7 errors is above 5.", "VLAN 1200 is not within 100 to 999."):
+            self.assertEqual(wrong_numbers(ok), [], ok)
+
+    def test_the_answer_is_sent_back_once(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import NumberCheck
+        q = HumanMessage(content="Can I use VLAN 1200?")
+        out = NumberCheck().after_model({"messages": [q, AIMessage(content="Yes: 1200 falls within 100 to 999.")]}, None)
+        self.assertIn("1200 is not within 100 to 999", out["messages"][0].content)
+
+
+class TwinReport(unittest.TestCase):
+    def test_an_answer_that_drops_qots_twin_decision_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import DelegationGuard
+        g = DelegationGuard()
+        msgs = [HumanMessage(content="Using the twin's ntn example, what does 25 mm/h of rain do?"),
+                AIMessage(content="", tool_calls=[{"name": "task", "args": {"subagent_type": "qot", "description": "x"}, "id": "t"}]),
+                ToolMessage(content="PROPOSAL: none\nTWIN: reject, availability 66.63% (p=0.0), trust tier C", tool_call_id="t"),
+                AIMessage(content="The twin cannot simulate this: the network has no NTN terminal.")]
+        out = g.after_model({"messages": msgs}, None)
+        self.assertIn("reject", out["messages"][0].content)
+        msgs[-1] = AIMessage(content="The twin rejects it: availability falls to 66.63% (tier C).")
+        self.assertIsNone(g.after_model({"messages": msgs}, None))
+
+
+class Relations(unittest.TestCase):
+    def test_a_path_question_answered_without_the_relations_is_sent_back(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.network import RelationsFirst
+        r = RelationsFirst.make()
+        q = HumanMessage(content="How does tenant green reach outside the data centre?")
+        out = r.after_model({"messages": [q, AIMessage(content="Through border-leaf-1, then xpdr-b1.")]}, None)
+        self.assertIn("follow_relations", out["messages"][0].content)
+        used = AIMessage(content="", tool_calls=[{"name": "follow_relations", "args": {"start": "green"}, "id": "1"}])
+        self.assertIsNone(r.after_model({"messages": [q, used, AIMessage(content="Via VS-200.")]}, None))
+
+
+class KeepAfterAnyCheck(unittest.TestCase):
+    def test_keep_after_a_relations_lookup_never_returns_the_lookups_preamble(self):
+        from langchain_core.messages import AIMessage
+        p = FunctionProvider()
+        p.add(read_power)
+        lookup = call("read_power")
+        lookup = AIMessage(content="I'll verify it with a lookup:", tool_calls=lookup.tool_calls)
+        model = ScriptedModel(script=[say("The power is -2.37 dBm."), lookup, say("KEEP"), say("The power is -2.37 dBm.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        r = a.ask("What is the transmit power?")
+        self.assertNotIn("I'll verify", r.text)
+        self.assertIn("-2.37", r.text)
+
+
+class Scope(unittest.TestCase):
+    def _agent(self, *script):
+        p = FunctionProvider()
+
+        def delete_lightpath(name: str) -> str:
+            """Delete a lightpath."""
+            return f"deleted {name}"
+
+        def create_lightpath(name: str) -> str:
+            """Create a lightpath."""
+            return f"created {name}"
+        p.add(delete_lightpath, write=True)
+        p.add(create_lightpath, write=True)
+        model = ScriptedModel(script=list(script))
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        return a, model
+
+    def test_a_removal_nobody_asked_for_never_reaches_the_approval(self):
+        from canah.identity import Identity
+        a, model = self._agent(call("delete_lightpath", name="LP-1"),
+                               say("xpdr-a1 already carries LP-1, so LP-4 cannot be created there."))
+        r = a.ask("Create a 100G lightpath named LP-4 between xpdr-a1 and xpdr-c2.", thread_id="s",
+                  who=Identity("ana", "admin"))
+        self.assertEqual(r.pending, [])
+        self.assertIn("already carries LP-1", r.text)
+        self.assertIn("[scope check]", str(model.seen[-1][-1].content))
+
+    def test_a_removal_that_was_asked_for_goes_to_approval(self):
+        from canah.identity import Identity
+        a, _ = self._agent(call("delete_lightpath", name="LP-1"), say("ok"))
+        r = a.ask("Delete lightpath LP-1.", thread_id="d", who=Identity("ana", "admin"))
+        self.assertEqual(r.pending[0]["name"], "delete_lightpath")
+
+
+class NamedWrites(unittest.TestCase):
+    def test_a_write_the_task_named_but_never_sent_is_asked_for(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import MakeTheChange
+        g = MakeTheChange(["net_provision", "net_adjust"], {"attach_tenant", "connect_tenant_external"},
+                          lambda n, a: {"net_provision": "attach_tenant", "net_adjust": "connect_tenant_external"}[n])
+        task = HumanMessage(content="Connect tenant blue to VS-100 with connect_tenant_external.")
+        attach = AIMessage(content="", tool_calls=[{"name": "net_provision", "args": {}, "id": "1"}])
+        out = g.after_model({"messages": [task, attach, AIMessage(content="Connected.")]}, None)
+        self.assertIn("connect_tenant_external", out["messages"][0].content)
+        both = AIMessage(content="", tool_calls=[{"name": "net_adjust", "args": {}, "id": "2"}])
+        self.assertIsNone(g.after_model({"messages": [task, attach, both, AIMessage(content="Connected.")]}, None))
+
+    def test_a_refused_write_whose_prerequisite_was_then_done_is_tried_again(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import MakeTheChange
+        g = MakeTheChange(["net_provision", "net_adjust"])
+        connect = AIMessage(content="", tool_calls=[{"name": "net_adjust", "args": {"tenant": "blue"}, "id": "1"}])
+        attach = AIMessage(content="", tool_calls=[{"name": "net_provision", "args": {"leaf": "border-leaf-1"}, "id": "2"}])
+        msgs = [HumanMessage(content="Connect tenant blue to VS-100."), connect,
+                ToolMessage(content="Error: blue is not on border-leaf-1", tool_call_id="1"), attach,
+                ToolMessage(content="tenant blue attached to border-leaf-1", tool_call_id="2"), AIMessage(content="Done.")]
+        out = g.after_model({"messages": msgs}, None)
+        self.assertIn("call it again now", out["messages"][0].content)
+
+    def test_one_corrected_retry_after_a_refused_write(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import MakeTheChange
+        g = MakeTheChange(["net_provision"])
+        w = AIMessage(content="", tool_calls=[{"name": "net_provision", "args": {"over": "LP-1"}, "id": "1"}])
+        msgs = [HumanMessage(content="Create VS-400 over the link LP-1 carries."), w,
+                ToolMessage(content="Error: no link LP-1 on this controller; links are L-ab, L-a1", tool_call_id="1"),
+                AIMessage(content="It failed.")]
+        self.assertIn("correct that value", g.after_model({"messages": msgs}, None)["messages"][0].content)
+
+
+class ChangeAnywhere(unittest.TestCase):
+    def test_the_instruction_may_come_last(self):
+        from canah.grounding import asks_change
+        self.assertTrue(asks_change("Customer initech needs a VLAN service VS-400. The rules say how. Set it up accordingly."))
+        self.assertTrue(asks_change("Create LP-3 between xpdr-c2 and xpdr-b2."))
+        self.assertFalse(asks_change("Which tenants are on which leaf switches?"))
+
+
+class Circling(unittest.TestCase):
+    def test_after_three_refused_repeats_the_model_answers_without_tools(self):
+        p = FunctionProvider()
+        p.add(read_power)
+        model = ScriptedModel(script=[call("read_power") for _ in range(5)] + [say("Power is -2.37; nothing else found.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        r = a.ask("what is the power?")
+        self.assertIn("-2.37", r.text)
+        self.assertIn("[loop check]", str(model.seen[-1][-1].content))
+
+    def test_still_circling_after_the_loop_check_ends_the_request(self):
+        p = FunctionProvider()
+        p.add(read_power)
+        model = ScriptedModel(script=[call("read_power") for _ in range(14)] + [say("never reached")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        r = a.ask("what is the power?")
+        self.assertIn("kept repeating the same calls", r.text)
+        self.assertLess(len(model.seen), 13)
+
+
+class QotHonesty(unittest.TestCase):
+    def test_the_example_is_run_not_searched_for_and_a_verdict_needs_a_run(self):
+        from types import SimpleNamespace
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import QotRuns
+        q = QotRuns()
+        task = HumanMessage(content="Using the twin's ntn example scenario, what does 25 mm/h of rain do?")
+        req = SimpleNamespace(tool_call={"name": "net_read_devices", "id": "1", "args": {"match": "turin"}},
+                              state={"messages": [task]})
+        self.assertIn("not in the live", q.wrap_tool_call(req, lambda r: "ran").content)
+        made_up = AIMessage(content="PROPOSAL: none\nTWIN: propose, p=0.85 [0.78, 0.92], tier B")
+        out = q.after_model({"messages": [task, made_up]}, None)
+        self.assertIn("[twin run check]", out["messages"][0].content)
+        run = AIMessage(content="", tool_calls=[{"name": "twin_predict", "args": {}, "id": "p"}])
+        ran = [task, run, ToolMessage(content='{"ok": true, "decision": {"action": "reject"}}', tool_call_id="p"),
+               AIMessage(content="PROPOSAL: none\nTWIN: reject, p=0.0")]
+        self.assertIsNone(q.after_model({"messages": ran}, None))
+
+    def test_failing_calls_in_a_row_are_a_loop_too(self):
+        p = FunctionProvider()
+
+        def run_code(code: str) -> str:
+            """Run code."""
+            return "Error: SyntaxError: invalid syntax"
+        p.add(run_code)
+        model = ScriptedModel(script=[call("run_code", code=f"x{i}") for i in range(14)] + [say("Could not compute it.")])
+        a = build_agent(load_settings(path="/x", sandbox="none"), [p], model=model, memory=open_memory(in_memory=True))
+        r = a.ask("compute it")
+        self.assertTrue(any("[loop check]" in str(s[-1].content) for s in model.seen))
+
+
+
+class DownController(unittest.TestCase):
+    def test_a_controller_that_timed_out_is_not_read_again_at_once(self):
+        from canah.network import AgenticMCPProvider, _DOWN
+        from tests_canah.test_network_knowledge import FakeAgenticMCP
+
+        class Down(FakeAgenticMCP):
+            def call(self, controller, tool, arguments, approved_by=""):
+                self.calls.append((controller, tool))
+                return {"text": f"Error: {controller} does not answer (ConnectTimeout)", "is_error": True}
+        svc = Down()
+        t = {x.name: x for x in AgenticMCPProvider(service=svc, team=False).tools()}["net_read_devices"]
+        first = t.invoke({"controller": "alpha"}, config={"configurable": {}})
+        second = t.invoke({"controller": "alpha"}, config={"configurable": {}})
+        self.assertIn("does not answer", first)
+        self.assertIn("cannot be read now", second)
+        self.assertEqual(len([c for c in svc.calls if c[0] == "alpha"]), 1)
+        _DOWN.clear()
+
+
+class Subject(unittest.TestCase):
+    def test_the_first_step_goes_to_the_domain_that_holds_the_subject(self):
+        from types import SimpleNamespace
+        from langchain_core.messages import HumanMessage
+        from canah.grounding import DelegationGuard
+        g = DelegationGuard(config_agents=["packet-config", "data-centre-config"],
+                            locate=lambda n: {"blue": ["fabric"], "VS-100": ["packet"]}.get(n, []),
+                            agent_of={"fabric": "data-centre-config", "packet": "packet-config"})
+        q = HumanMessage(content="Connect tenant blue to the service VS-100 outside the data centre.")
+
+        def send(to):
+            req = SimpleNamespace(tool_call={"name": "task", "id": "t", "args": {"subagent_type": to}},
+                                  state={"messages": [q]})
+            return g.wrap_tool_call(req, lambda r: "ran")
+        self.assertIn("data-centre-config", send("packet-config").content)
+        self.assertEqual(send("data-centre-config"), "ran")
