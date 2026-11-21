@@ -147,8 +147,9 @@ class Network(Base):
         self.assertEqual(r.pending[0]["name"], "net_provision")
         self.assertEqual(self.service.calls, [])
         a.decide("w", [approval.decision("approve")], who=ADMIN)
-        self.assertEqual(self.service.calls, [("alpha", "create_service", {"a": "a1", "z": "z1"},
-                                               "ana (approved in canah)")])
+        writes = [c for c in self.service.calls if c[1] == "create_service"]
+        self.assertEqual(writes, [("alpha", "create_service", {"a": "a1", "z": "z1"}, "ana (approved in canah)")])
+        self.assertTrue(any(c[1] == "get_nodes" for c in self.service.calls))       # read back after the change
         report = [m for m in a.graph.get_state(a.config("w", ADMIN)).values["messages"]
                   if m.type == "tool" and m.name == "task"][-1].content
         self.assertIn("Writes sent in this task", report)                   # what was sent, from the harness
@@ -162,7 +163,7 @@ class Network(Base):
         r = a.ask("put a meter on beta port 1", thread_id="m", who=ADMIN)
         self.assertEqual(r.pending[0]["name"], "controller_write")
         a.decide("m", [approval.decision("approve")], who=ADMIN)
-        self.assertEqual(self.service.calls[-1][:3], ("beta", "set_meter", {"port": "1"}))
+        self.assertIn(("beta", "set_meter", {"port": "1"}), [c[:3] for c in self.service.calls])
 
     def test_without_the_team_the_agent_does_it_all_itself(self):
         a = self.agent(call("net_provision", controller="alpha", arguments={"a": "a1", "z": "z1"}), say("ok"),

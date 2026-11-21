@@ -65,6 +65,7 @@ class CanahAgent:
     twins: Any = None               # canah.twins.Registry: the digital twins and the one in use
     twin_checks: Any = None         # the checks they made, and operators' overrides
     providers: List[Any] = field(default_factory=list)   # the ToolProviders, for warm()
+    lessons: Any = None             # canah.lessons.Lessons: what went wrong before
     notifier: Any = None            # canah.notify.Notifier: incidents and waiting approvals, to the channels
     model: Any = None               # the main agent's model
 
@@ -186,7 +187,7 @@ class CanahAgent:
                         cut = re.sub(r"(?s)^\s*(\[[a-z -]+ check\][^\n]*\n+)?The operator's question this turn: «.*?».*?"
                                      + tail + r"\s*", "", text, count=1).strip()
                         if cut != text.strip():
-                            text = cut or text
+                            text = cut if len(cut) >= 40 else text      # never leave a sliver of an answer behind
                             break
                     break
             if text:
@@ -339,6 +340,25 @@ class CanahAgent:
                 self.ops.audit("decided", who.user, who.level, thread_id, p["name"],
                                d.get("edited_action", {}).get("args") if d.get("type") == "edit" else p.get("args"),
                                decision=d.get("type", ""), message=str(d.get("message") or ""))
+        # An operator's reason for rejecting a change is a lesson: the next proposal should not repeat it.
+        for p, d in zip(waiting, decisions):
+            reason = str(d.get("message") or "").strip()
+            if self.lessons is None or d.get("type") != "reject" or not reason or reason == "The operator rejected this change.":
+                continue
+            controller, tool = "", p["name"]
+            for pv in self.providers:
+                if hasattr(pv, "write_target"):
+                    try:
+                        got = pv.write_target(p["name"], p.get("args") or {})
+                    except Exception:  # noqa: BLE001
+                        got = None
+                    if got:
+                        controller, tool = got[0], got[1]
+                        break
+            import json as _json
+            self.lessons.add("operator-rejected", f"{who.user} rejected {tool}"
+                             + (f" on {controller}" if controller else "")
+                             + f" with {_json.dumps(p.get('args') or {}, default=str)[:200]}: {reason[:300]}", controller, tool)
 
     def close(self) -> None:
         self.memory.close()
@@ -489,7 +509,23 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     from .ops import Ops
     from .safety import CallLog, GuardMemory, ScopeGuard, RecordWrites, RepeatGuard, RunTracker, ScreenOutput
     ops = Ops(settings.home_path / "ops.sqlite") if settings.audit else None
-    tracker, screen, record = RunTracker(settings.max_tokens_per_request), ScreenOutput(), RecordWrites(approvals, ops)
+    _lessons: Dict[str, Any] = {}           # filled once the memory store is open, below
+    _net_for_verify = next((pv for pv in all_providers if hasattr(pv, "verify")), None)
+    _targets_v = [pv.write_target for pv in all_providers if hasattr(pv, "write_target")]
+
+    def _target_of(name, args):
+        for r in _targets_v:
+            got = r(name, args)
+            if got is not None:
+                return got
+        return None
+    tracker, screen = RunTracker(settings.max_tokens_per_request), ScreenOutput()
+    record = RecordWrites(approvals, ops,
+                          verify=_net_for_verify.verify if (_net_for_verify is not None and settings.verify_changes) else None,
+                          target=_target_of, lessons=lambda: _lessons.get("store"))
+    from .lessons import LessonsMiddleware
+    _ctl_names = lambda: list(getattr(_net_for_verify, "catalog", {}) or {})          # noqa: E731
+    lessons_mw = [LessonsMiddleware.make(lambda: _lessons.get("store"), _ctl_names)] if settings.lessons else []
     repeat = RepeatGuard()
     guard_mem = GuardMemory(ops)
     calls = CallLog(settings.home_path)
@@ -500,6 +536,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
         spec["middleware"] = [*_retry(), calls, scope, budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
                               NumberCheck(),
                               *list(spec.get("middleware") or []),
+                              *(lessons_mw if spec["name"].endswith("-config") else []),
                               *([MakeTheChange(writes, controller_writes, write_tool_of)] if team_specs and spec["name"].endswith("-config") else []),
                               *extra_mw]
         if spec.get("tools") is not None and shared:
@@ -510,6 +547,13 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             spec["tools"] = [*spec["tools"], *[t for t in give if t.name not in have]]
     backend, skill_paths, memory_paths = backends.build(settings, sandbox)
     memory = memory or mem.open_memory(settings.home_path)
+    if settings.lessons:
+        from .lessons import Lessons
+        _lessons["store"] = Lessons(memory.store, settings.lessons_ttl_days)
+        try:
+            _lessons["store"].prune()
+        except Exception:  # noqa: BLE001
+            pass
     if settings.memory_ttl_days:
         gone = mem.prune(memory.store, settings.memory_ttl_days)
         if gone:
@@ -565,7 +609,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             tools=main_tools,
             system_prompt=prompt,
             middleware=[calls, scope, budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
-                        KeepAnswer(), NumberCheck(), *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
+                        KeepAnswer(), NumberCheck(), *lessons_mw, *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
                                              agent_of=_agent_of)] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
                         *compact_mw],
@@ -608,7 +652,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                        "compact_tool": bool(compact_mw)}
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
                       interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
-                      providers=all_providers, model=main_model,
+                      providers=all_providers, model=main_model, lessons=_lessons.get("store"),
                       notifier=Notifier(settings.notify_channels, settings.notify_url, settings.console_url))
 
 

@@ -624,3 +624,22 @@ class Subject(unittest.TestCase):
             return g.wrap_tool_call(req, lambda r: "ran")
         self.assertIn("data-centre-config", send("packet-config").content)
         self.assertEqual(send("data-centre-config"), "ran")
+
+
+class ExampleFromTheOperator(unittest.TestCase):
+    def test_the_operators_question_counts_when_the_task_drops_example(self):
+        from types import SimpleNamespace
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import QotRuns
+        from canah.safety import _ASKED
+        q = QotRuns()
+        task = HumanMessage(content="Ask the twin what 25 mm/h of rain does to the backhaul in the ntn scenario.")
+        tok = _ASKED.set("Using the digital twin's ntn example scenario, what does 25 mm/h of rain do?")
+        try:
+            req = SimpleNamespace(tool_call={"name": "twin_extra", "id": "1", "args": {"name": "mirror"}},
+                                  state={"messages": [task]})
+            self.assertIn("not in the live", q.wrap_tool_call(req, lambda r: "ran").content)
+            out = q.after_model({"messages": [task, AIMessage(content="PROPOSAL: none\nTWIN: cannot: no NTN here")]}, None)
+            self.assertIn("[twin run check]", out["messages"][0].content)       # "cannot" without trying is not enough
+        finally:
+            _ASKED.reset(tok)

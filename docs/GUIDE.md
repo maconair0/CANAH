@@ -346,6 +346,44 @@ In every subagent too:
   One delegated task gets a share of it (`task_seconds`, by default a third of what is left). A subagent that goes in
   circles ends with what it had, and the supervisor still has time to act or say so.
 
+## Self-correction: checked changes and lessons
+
+Two parts, both done by the harness rather than by asking the model to judge itself (the same model shares its
+own blind spots; the checks above are code for the same reason).
+
+**Every change is read back against what was asked.** After a write goes through, the harness reads that
+controller's devices, links and services through the contract's reads. It finds the object the write names (for
+`connect_tenant_external(tenant, service)` the tenant, the named value that is an object there), and checks:
+
+- it is listed (or, for a removal, gone);
+- it is not down;
+- it shows the values the write gave it (numbers compared as numbers, names as whole words).
+
+The result is on the write's answer: `[Verified by the harness: packet now lists VS-300 (vlan 300, over L-ab …)]`, or
+`[Not as intended: … it does not show over=L-ab]`. A failure is also in the audit log ("not as intended") and is
+reported, with the correction or a rollback proposed for approval, never as done. It works on any controller that
+serves the read verbs, and says "not verified" when there is nothing to read back from. Incident investigations
+also see every change made in the last 30 minutes, since a fault that follows a change may be its result.
+`verify_changes: false` turns the read-back off.
+
+**Lessons keep a correction past its conversation.** The harness keeps a short lesson when:
+
+| kind | when |
+|---|---|
+| refused-then-done | a controller refused a write, and it went through after another step or with other values |
+| not-as-intended | the read-back did not show what was asked |
+| twin-rejected | the digital twin rejected a change |
+| operator-rejected | an operator rejected a change and said why |
+
+At each request the lessons that fit it (by the controllers and tools it names and the words they share; three
+at most) are put in front of the supervisor and the config agents, marked as the harness's and possibly out of
+date. A lesson seen again is counted, not repeated. They are memories of the reserved user `~lessons`: the
+Documents & memory page lists them ("Lessons · kept by the harness"), and an admin can correct or forget one. They
+expire after `lessons_ttl_days` (30) unless seen again. `lessons: false` turns them off.
+
+The test bed has a controller that answers every write as done and applies none (`writes_ignored`); the case
+`packet-silent` checks that CANAH says the change is not there instead of reporting it done.
+
 ## Digital twins
 
 A digital twin predicts what a change or a failure will do to a network before the network sees it. CANAH can use **any** twin that speaks one contract, `canah.twin/1` ([docs/TWIN_CONTRACT.md](TWIN_CONTRACT.md)): four calls (describe, validate, predict, and optionally check a controller write), in-process or over HTTP, with one standard shape for the answer.
@@ -437,6 +475,8 @@ These go in `canah.yaml`, or in the environment as `CANAH_<NAME>` for the common
 | `middleware` | none | extra LangChain middleware for every agent, as `package.module:Class` |
 | `max_seconds` | 600 | time budget per request |
 | `investigate_workers` | 2 | investigations of unrelated events run side by side |
+| `verify_changes` | on | read every change back and say whether it is what was asked |
+| `lessons`, `lessons_ttl_days` | on, 30 | keep what went wrong; show the fitting lessons at the next request |
 | `task_seconds` | 0 (a third of what is left) | one delegated task's share of it |
 | `max_tokens_per_request` | 0 (none) | token budget per request |
 | `approval_ttl_s` | 3600 | how long an approval stays open |

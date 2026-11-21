@@ -61,6 +61,7 @@ class Domain:
         self.writes: List[Dict[str, Any]] = []
         self.alarms: List[Dict[str, Any]] = []
         self.unreachable = False
+        self.ignore_writes = False        # a controller that says "done" and changes nothing
 
     def tools(self) -> List[Tool]:
         raise NotImplementedError
@@ -80,6 +81,9 @@ class Domain:
         if kind == "controller_down":
             self.unreachable = True
             return f"{self.key} does not answer"
+        if kind == "writes_ignored":
+            self.ignore_writes = True
+            return f"{self.key} answers every write as done and applies none"
         if kind == "alarm":
             self.alarms.append({"id": f"AL-{len(self.alarms) + 1}", "severity": severity, "text": text or "an alarm",
                                 "resource": target})

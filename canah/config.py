@@ -105,6 +105,9 @@ class Settings:
     max_tokens_per_request: int = 0
     # The longest one request may run, in seconds, across the main agent and every subagent (0: no limit).
     max_seconds: int = 600
+    lessons: bool = True               # keep what went wrong, and show the fitting lessons at the next request
+    lessons_ttl_days: float = 30       # a lesson not seen again is dropped after this
+    verify_changes: bool = True        # read every change back and say whether it is what was asked
     task_seconds: int = 0              # one delegated task's share of it; 0: a third of what is left
     # The model's input window in tokens (0: from the model: its profile, or Ollama's num_ctx less num_predict).
     context_window: int = 0

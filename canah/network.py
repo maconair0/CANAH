@@ -285,7 +285,21 @@ class _RelationsTool(BaseTool):
         errors = [e["error"] for e in edges if "error" in e]
         if not lines:
             return f"Nothing in the published relations involves {start}." + (f" ({'; '.join(errors)})" if errors else "")
-        return "\n".join([f"What {start} connects to, step by step (as the controllers publish it):", *lines] +
+        # A summary first: a long chain is easy to misread (one answer put a customer on the link instead of the
+        # service that serves it). What was reached, by domain, and which services serve which customers.
+        reached: Dict[str, List[str]] = {}
+        for e in good:
+            if (e["from"], e["relation"], e["to"]) in seen:
+                for x in (e["from"], e["to"]):
+                    dom, _, obj = x.partition(":")
+                    if obj and not same(x, start) and obj not in reached.setdefault(dom, []):
+                        reached[dom].append(obj)
+        serves = [(e["from"].partition(":")[2] or e["from"], e["to"].partition(":")[2] or e["to"]) for e in good
+                  if (e["from"], e["relation"], e["to"]) in seen and re.search(r"serves|customer", e["relation"], re.I)]
+        head = [f"Reached from {start}: " + "; ".join(f"{d}: {', '.join(v)}" for d, v in reached.items() if d != "customer")]
+        if serves:
+            head.append("Services and the customers they serve: " + "; ".join(f"{svc} serves {cust}" for svc, cust in serves))
+        return "\n".join([*head, f"The chain, step by step (as the controllers publish it):", *lines] +
                          ([f"(not read: {'; '.join(errors)})"] if errors else []))
 
 
@@ -836,6 +850,119 @@ class AgenticMCPProvider:
     def middleware(self) -> List[Any]:
         self._load()
         return [RelationsFirst.make()] if any(t.name == "follow_relations" for t in self._tools) else []
+
+    _NAME_KEYS = ("name", "service", "service_id", "lightpath", "tenant", "id", "link", "device", "node", "node_id",
+                  "router", "switch", "port", "interface")
+    _DOWN_WORDS = {"down", "failed", "error", "out-of-service", "degraded", "disabled", "inactive"}
+
+    def _records(self, controller: str) -> List[Dict[str, Any]]:
+        """Every object a controller lists through the contract's reads (devices, links, services), flattened."""
+        out: List[Dict[str, Any]] = []
+
+        def walk(v):
+            if isinstance(v, dict):
+                if any(k in v for k in ("name", "id", "node-id", "interface", "tenant")):
+                    out.append(v)
+                for x in v.values():
+                    if isinstance(x, (dict, list)):
+                        walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+        for verb in ("read_services", "read_devices", "read_links"):
+            vt = self.verb_tools.get(f"net_{verb}")
+            if vt is None or controller not in vt.served:
+                continue
+            try:
+                got = self.service.call(controller, vt.served[controller], {}, approved_by="")
+                walk(json.loads(got.get("text") or "null"))
+            except Exception:  # noqa: BLE001 - a read that fails says nothing either way
+                continue
+        return out
+
+    def verify(self, name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """After a write went through: does the network now show what was asked? Read back through the contract's
+        reads, on any controller: the object the write names is there (or gone, for a removal), not down, and
+        carries the values the write gave it. {"ok": True/False/None, "note", "controller", "tool", "missing"};
+        None when there is nothing to check against."""
+        self._load()
+        target = self.write_target(name, args or {})
+        if target is None:
+            return None
+        controller, tool, a = target
+        rec = (self.catalog.get(controller) or {}).get(tool) or {}
+        verb = str(rec.get("verb") or "")
+        removing = verb == "teardown" or bool(re.search(r"delete|remove|teardown|destroy|detach|disconnect", tool, re.I))
+        scalars = {k: v for k, v in (a or {}).items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                   and str(v).strip()}
+        names = [k for k in self._NAME_KEYS if isinstance(scalars.get(k), str)] + \
+            [k for k, v in scalars.items() if isinstance(v, str) and k not in self._NAME_KEYS]
+        if not names:
+            return None
+
+        def find(rows, subject):
+            for r in rows:
+                if any(isinstance(v, (str, int)) and str(v).lower() == subject.lower() for v in r.values()):
+                    return r
+            return None
+        rows = self._records(controller)
+        # The subject is the named value that is an object on this controller (connect_tenant_external(tenant,
+        # service): the tenant is the fabric's, the service another domain's); for a creation, the first name.
+        key = next((k for k in names if find(rows, str(scalars[k])) is not None), None)
+        if key is None or (verb == "provision" and "name" in scalars and key != "name"):
+            key = "name" if "name" in scalars else names[0]
+        subject = str(scalars[key])
+        if not rows:
+            return {"ok": None, "controller": controller, "tool": tool, "missing": [],
+                    "note": f"[Not verified: {controller} listed nothing to read {subject} back from.]"}
+        obj = find(rows, subject)
+        if obj is None and not removing:
+            time.sleep(1.0)                     # a controller may take a moment to list what it just made
+            obj = find(self._records(controller), subject)
+        if removing:
+            ok = obj is None
+            return {"ok": ok, "controller": controller, "tool": tool, "missing": [] if ok else [subject],
+                    "note": (f"[Verified by the harness: {subject} is no longer listed on {controller}.]" if ok else
+                             f"[Not as intended: {subject} is still listed on {controller} after {tool}. Say so; "
+                             f"propose the correction, which waits for approval.]")}
+        if obj is None:
+            return {"ok": False, "controller": controller, "tool": tool, "missing": [subject],
+                    "note": (f"[Not as intended: after {tool}, {controller} lists no {subject}, though it answered the write "
+                             f"as done. Report that now: what was sent, what {controller} answered, and that reading it "
+                             f"back shows no {subject}. Do not report it as done, and do not search further for the cause "
+                             f"unless the operator asks.]")}
+        values: List[Any] = []
+
+        def collect(v):
+            if isinstance(v, dict):
+                for x in v.values():
+                    collect(x)
+            elif isinstance(v, list):
+                for x in v:
+                    collect(x)
+            else:
+                values.append(v)
+        collect(obj)
+
+        def shows(v) -> bool:
+            if isinstance(v, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(v)):
+                return any(isinstance(x, (int, float, str)) and re.fullmatch(r"-?\d+(\.\d+)?", str(x))
+                           and float(x) == float(v) for x in values)
+            pat = re.compile(rf"(?<![\w-]){re.escape(str(v).lower())}(?![\w-])")
+            return any(isinstance(x, str) and pat.search(x.lower()) for x in values)
+        missing = [f"{k}={v}" for k, v in scalars.items() if k != key and not shows(v)]
+        down = [f"{k}={v}" for k, v in obj.items() if k in ("status", "state", "oper-status", "oper_status")
+                and str(v).lower() in self._DOWN_WORDS]
+        if not missing and not down:
+            shown = ", ".join(f"{k} {v}" for k, v in list(obj.items())[:6] if isinstance(v, (str, int, float)))
+            return {"ok": True, "controller": controller, "tool": tool, "missing": [],
+                    "note": f"[Verified by the harness: {controller} now lists {subject} ({shown[:240]}).]"}
+        return {"ok": False, "controller": controller, "tool": tool, "missing": missing + down,
+                "note": (f"[Not as intended: {controller} lists {subject}, but "
+                         + "; ".join(([f"it does not show {', '.join(missing)}"] if missing else [])
+                                     + ([f"it is {', '.join(down)}"] if down else []))
+                         + ". Report that now, with the correction or a rollback proposed (it waits for approval). "
+                           "Do not report it as done as asked.]")}
 
     def locate(self, name: str) -> List[str]:
         """The controllers whose devices, links or services mention this name (reads, cached for 30 s)."""

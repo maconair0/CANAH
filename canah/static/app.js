@@ -2042,7 +2042,8 @@ function renderMemories() {
   const f = ($("#mem-filter").value || "").toLowerCase();
   const rows = kn.mems.filter((m) => !f || `${m.user} ${m.path} ${m.preview}`.toLowerCase().includes(f));
   const users = [...new Set(rows.map((m) => m.user))].sort();
-  $("#mem-list").innerHTML = rows.length ? users.map((u) => `<div class="mem-user">${esc(u)}</div>` + rows.filter((m) => m.user === u).map((m) => `
+  const label = (u) => u === "~lessons" ? "Lessons · kept by the harness from what went wrong" : u;
+  $("#mem-list").innerHTML = rows.length ? users.map((u) => `<div class="mem-user">${esc(label(u))}</div>` + rows.filter((m) => m.user === u).map((m) => `
       <div class="mem-row${kn.memSel && kn.memSel.user === m.user && kn.memSel.path === m.path ? " sel" : ""}" data-u="${esc(m.user)}" data-p="${esc(m.path)}">
         <div class="p">${esc(m.path)}</div><div class="pv">${esc(m.preview || "")}</div></div>`).join("")).join("")
     : `<div class="empty">${kn.mems.length ? "Nothing matches." : "No long-term memories yet."}</div>`;

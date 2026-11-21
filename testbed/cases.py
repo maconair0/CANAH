@@ -97,6 +97,13 @@ CASES: List[Case] = [
     Case("optical-busy", "optical", ADMIN, "Create a 100G lightpath named LP-4 between xpdr-a1 and xpdr-c2.",
          all_of(state(lambda d: "LP-4" not in d["optical"].state["lightpaths"]),
                 matches(r"already|carries|in use|busy|occupied|not available|cannot|failed|error"))),
+    Case("packet-silent", "packet", ADMIN,
+         "Create a VLAN service named VS-500 with vlan 500 between pe-a and pe-b.",
+         all_of(matches(r"not as intended|not (been )?(created|applied|listed|there|present|show)|does not (show|list)|"
+                        r"no VS-500|did not|didn't|failed|is not listed|was not|isn't|cannot be (found|verified|confirmed)|"
+                        r"discrepancy|not found|not appear"),
+                lacks("successfully created", "has been created", "is now in place")),
+         setup=lambda d: d["packet"].fault("writes_ignored")),
     # ---- fabric ----
     Case("fabric-read", "fabric", OBSERVER, "Which tenants are on which leaf switches?",
          all_of(has("blue", "leaf-1", "green", "leaf-2"))),

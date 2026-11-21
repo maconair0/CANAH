@@ -809,8 +809,20 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         apart = ("Other open incidents are investigated separately, as unrelated to these (nothing published links "
                  "them): " + "; ".join(f"#{o['id']} {o['title']}" for o in others[:8]) + ". Do not explain these "
                  "incidents by them unless a relation or a read shows one caused the other.\n\n") if others else ""
+        recent = ""
+        try:
+            rows = [r for r in (A().ops.audit_log(200) if A().ops else [])
+                    if r.get("event") in ("executed", "not as intended") and time.time() - float(r.get("at") or 0) < 1800]
+            if rows:
+                recent = ("Changes made in the last 30 minutes (a fault that follows a change may be its result; say so "
+                          "if the evidence links them, and the rollback is then the first fix to consider):\n"
+                          + "\n".join(f"- {time.strftime('%H:%M:%S', time.localtime(float(r['at'])))} {r['event']}: "
+                                      f"{r.get('tool')} {str(r.get('args') or '')[:160]} by {r.get('user') or '?'}"
+                                      for r in rows[:8]) + "\n\n")
+        except Exception:  # noqa: BLE001 - context, not a requirement
+            recent = ""
         prompt = (f"[incidents {ids}] The watcher opened {'these together' if len(group) > 1 else 'this incident'}"
-                  f"{'; they may share one cause' if len(group) > 1 else ''}.\n{lines}\n\n" + apart +
+                  f"{'; they may share one cause' if len(group) > 1 else ''}.\n{lines}\n\n" + apart + recent +
                   f"Evidence the watcher already gathered (do not read it again):\n"
                   f"{json.dumps(job['evidence'], default=str)[:4000]}\n\n"
                   + "".join(f"Runbook {n}:\n{t}\n\n" for n, t in books.items())

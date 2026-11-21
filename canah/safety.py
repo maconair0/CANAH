@@ -150,12 +150,28 @@ class RepeatGuard(AgentMiddleware):
         elif run["fails_in_row"] >= 6:
             run["repeats_refused"] = max(run.get("repeats_refused", 0), 3)
 
+    @staticmethod
+    def _count_call(request) -> None:
+        """Many different calls in one turn with no answer is a loop too (one ran 25 reads after a failed change,
+        looking for why): past 20 the model is told to answer with what it has, past 40 the request ends."""
+        run = _mine()
+        if run is None or request.tool_call.get("name") in ("task", "write_todos"):
+            return
+        run["calls"] = run.get("calls", 0) + 1
+        if run["calls"] >= 40:
+            run["repeats_refused"] = max(run.get("repeats_refused", 0), 8)
+            run["circle_broken"] = True
+        elif run["calls"] >= 20:
+            run["repeats_refused"] = max(run.get("repeats_refused", 0), 3)
+
     def wrap_tool_call(self, request, handler: Callable):
+        self._count_call(request)
         got = self._seen(request) or handler(request)
         self._count_fail(got)
         return got
 
     async def awrap_tool_call(self, request, handler: Callable):
+        self._count_call(request)
         got = self._seen(request) or await handler(request)
         self._count_fail(got)
         return got
@@ -169,8 +185,8 @@ class RepeatGuard(AgentMiddleware):
         run["circle_broken"] = True
         from langchain_core.messages import HumanMessage
         note = HumanMessage(content=(
-            "[loop check] You are repeating the same calls, and they answer the same. Answer the operator now from "
-            "what you have read; say plainly what you could not find or do."))
+            "[loop check] You have made many calls in this request without answering, or repeated ones that answer the "
+            "same. Answer the operator now from what you have read; say plainly what you could not find or do."))
         return request.override(messages=[*request.messages, note])
 
     @hook_config(can_jump_to=["end"])
@@ -245,29 +261,90 @@ class RecordWrites(AgentMiddleware):
     that were sent in it and what each returned: the supervisor sees what was done, not only what the subagent
     says it did (a config agent once left out `over` and still reported the service over L-ab)."""
 
-    def __init__(self, writes: Iterable[str], ops: Any = None):
+    def __init__(self, writes: Iterable[str], ops: Any = None, verify: Any = None, target: Any = None,
+                 lessons: Any = None):
         super().__init__()
         self.writes = set(writes)
         self.ops = ops
+        self.verify = verify            # (tool name, args) -> {"ok", "note", "controller", "tool", "missing"} or None
+        self.target = target            # (tool name, args) -> (controller, controller's tool, arguments) or None
+        self.lessons = lessons          # () -> canah.lessons.Lessons or None
+        # refusals and the writes done since, per conversation: an approval pause ends a request, and the write that
+        # was refused, the step that unblocked it and the retry come in different ones
+        self._threads: Dict[str, Dict[str, Any]] = {}
+
+    def _lesson(self, kind: str, text: str, controller: str = "", tool: str = "") -> None:
+        try:
+            les = self.lessons() if self.lessons else None
+            if les is not None:
+                les.add(kind, text, controller, tool)
+        except Exception:  # noqa: BLE001 - a lesson not kept is no failure of the change
+            pass
+
+    def _where(self, name: str, args: Any):
+        try:
+            t = self.target(name, args or {}) if self.target else None
+        except Exception:  # noqa: BLE001
+            t = None
+        return t or ("", name, dict(args or {}))
 
     def _after(self, request, result):
         name = request.tool_call.get("name")
         if name not in self.writes or not isinstance(result, ToolMessage):
             return result
         c = _cfg()
+        args = request.tool_call.get("args")
         text = result.content if isinstance(result.content, str) else str(result.content)
-        sent = _SENT.get()
-        if sent is not None:
-            sent.append({"tool": name, "args": request.tool_call.get("args"), "result": text.split("\n\n[")[0][:300]})
         if self.ops is not None:
             self.ops.audit("executed", c.get("user_id", ""), c.get("level", ""), c.get("thread_id", ""), name,
-                           request.tool_call.get("args"), result=text)
-        failed = text.lower().startswith("error") or getattr(result, "status", "") == "error"
+                           args, result=text)
+        controller, tool, targs = self._where(name, args)
+        failed = text.lower().startswith(("error", "not sent")) or getattr(result, "status", "") == "error"
+        thread = str(c.get("thread_id") or "")
+        if len(self._threads) > 500:
+            self._threads.clear()
+        mine = self._threads.setdefault(f"{thread}|{_DEPTH.get() or 'supervisor'}", {}) if thread else _mine()
         if failed:
-            return result
-        return result.model_copy(update={"content": text + (
-            "\n\n[The change was sent. Before you report it as done, read the object back with a read tool and "
-            "say what you found.]")})
+            if mine is not None and not text.startswith("Not sent: taken back"):
+                mine.setdefault("refused", {})[f"{controller}|{tool}"] = {"args": targs, "why": text.split("\n")[0][:240]}
+            if text.startswith("Not sent: the digital twin") and "(reject)" in text[:200]:
+                why = re.search(r'"reasons":\s*\[\s*"([^"]{1,240})', text)
+                self._lesson("twin-rejected", f"The digital twin rejected {tool} on {controller} with "
+                             f"{json.dumps(targs, default=str)[:200]}" + (f": {why.group(1)}" if why else "."), controller, tool)
+            note_sent = None
+        else:
+            if mine is not None:
+                before = (mine.get("refused") or {}).pop(f"{controller}|{tool}", None)
+                if before:
+                    diff = {k: v for k, v in (targs or {}).items() if (before["args"] or {}).get(k) != v}
+                    between = [w["tool"] for w in (mine.get("done") or [])]
+                    how = (f"with {json.dumps(diff, default=str)[:200]}" if diff else
+                           f"after {', '.join(between[-3:])} was done first" if between else "when sent again")
+                    self._lesson("refused-then-done", f"On {controller}, {tool} was refused ({before['why']}); it went "
+                                 f"through {how}.", controller, tool)
+                mine.setdefault("done", []).append({"tool": tool, "controller": controller})
+            check = None
+            try:
+                check = self.verify(name, args) if self.verify else None
+            except Exception:  # noqa: BLE001 - a check that cannot run is said, never fails the change
+                check = {"ok": None, "note": "[Not verified: the read-back could not run.]"}
+            if check and check.get("ok") is False and self.ops is not None:
+                self.ops.audit("not as intended", c.get("user_id", ""), c.get("level", ""), c.get("thread_id", ""),
+                               name, args, result=check.get("note", ""))
+            if check and check.get("ok") is False:
+                self._lesson("not-as-intended", f"After {tool} on {controller} with "
+                             f"{json.dumps(targs, default=str)[:200]}, reading it back did not show "
+                             f"{', '.join(check.get('missing') or []) or 'what was asked'}.", controller, tool)
+            note_sent = check.get("note") if check else None
+            text = text + ("\n\n" + note_sent if note_sent else (
+                "\n\n[The change was sent. Before you report it as done, read the object back with a read tool and "
+                "say what you found.]"))
+            result = result.model_copy(update={"content": text})
+        sent = _SENT.get()
+        if sent is not None:
+            sent.append({"tool": name, "args": args, "result": text.split("\n\n[")[0][:300]
+                         + (" " + note_sent if note_sent else "")})
+        return result
 
     @staticmethod
     def _report(result, sent: List[Dict[str, Any]]):

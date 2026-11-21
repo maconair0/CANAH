@@ -531,7 +531,19 @@ class QotRuns(AgentMiddleware):
     RUNS = ("twin_predict", "twin_check_write")
 
     def _task(self, msgs: List[Any]) -> str:
-        return next((str(m.content) for m in msgs if isinstance(m, HumanMessage) and not is_check(m)), "")
+        """The task as handed over, and the operator's own question with it: a supervisor once dropped "example"
+        from the task, and qot went looking for the example's terminal in the live network."""
+        task = next((str(m.content) for m in msgs if isinstance(m, HumanMessage) and not is_check(m)), "")
+        try:
+            from .safety import _ASKED
+            asked = _ASKED.get() or ""
+        except Exception:  # noqa: BLE001
+            asked = ""
+        return f"{task}\n{asked}"
+
+    def _tried(self, msgs: List[Any]) -> bool:
+        return any(isinstance(m, AIMessage) and any(c.get("name") in ("twin_validate", "twin_predict", "twin_check_write")
+                                                    for c in (m.tool_calls or [])) for m in msgs)
 
     def _ran(self, msgs: List[Any]) -> bool:
         ids = {c.get("id") for m in msgs if isinstance(m, AIMessage) for c in (m.tool_calls or [])
@@ -542,7 +554,10 @@ class QotRuns(AgentMiddleware):
         name = str(request.tool_call.get("name") or "")
         state = getattr(request, "state", None) or {}
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
-        if name.startswith(_LIVE) and _EXAMPLE.search(self._task(msgs)) and not self._ran(msgs):
+        args = request.tool_call.get("args") or {}
+        live = name.startswith(_LIVE) or (name == "twin_extra" and str(args.get("name")) in ("mirror", "inspect", "subnetwork",
+                                                                                        "snapshots"))
+        if live and _EXAMPLE.search(self._task(msgs)) and not self._ran(msgs):
             return ToolMessage(tool_call_id=request.tool_call["id"], name=name, status="error", content=(
                 "Not run: the task is about the twin's own example scenario, and its objects are not in the live "
                 "network. Take the example from twin_schema(domain), change only what the task changes, then "
@@ -561,8 +576,9 @@ class QotRuns(AgentMiddleware):
         text = str(msgs[-1].content)
         if not re.search(r"^\s*\W*TWIN\W*:", text, re.M | re.I) or self._ran(msgs):
             return None
-        if re.search(r"TWIN\W*:\W*(not run|not_modelled|not modelled|no twin|cannot)", text, re.I):
-            return None
+        if re.search(r"TWIN\W*:\W*(not run|not_modelled|not modelled|no twin|cannot)", text, re.I) and (
+                self._tried(msgs) or not _EXAMPLE.search(self._task(msgs))):
+            return None                 # "cannot" stands once the twin was tried, or for a network it cannot have
         if any(isinstance(m, HumanMessage) and _RAN_GUARD in str(m.content) for m in msgs):
             return None
         return {"jump_to": "model", "messages": [HumanMessage(content=(
@@ -752,7 +768,8 @@ class DelegationGuard(AgentMiddleware):
         ran = bool(re.search(r"\b(predicts?|probability|availability|margin|figures?)\b", reports[-1], re.I))
         answer = str(msgs[-1].content)
         dropped = decision and not re.search(rf"\b{decision}\b|\b{decision.replace('_', ' ')}\b|{decision[:5]}", answer, re.I)
-        denied = ran and re.search(r"\b(cannot|can.t|could not|unable to|not able to) (simulate|run|answer|predict)", answer, re.I)
+        denied = ran and re.search(r"\b(cannot|can.t|could not|unable to|not able to) (simulate|run|answer|predict|determine|"
+                                   r"assess|say|tell|confirm|evaluate)", answer, re.I)
         if not (dropped or denied):
             return None
         return {"jump_to": "model", "messages": [HumanMessage(content=anchored(

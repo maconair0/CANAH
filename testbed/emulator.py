@@ -72,7 +72,13 @@ def create_app(domains: Optional[Dict[str, Domain]] = None, token: str = "") -> 
             app.state.refused.append({"controller": key, "tool": t.name})
             return {"text": f"Error: {t.name} changes {key} and carries no approval; refused", "is_error": True}
         try:
-            got = t.fn(**(body.get("arguments") or {}))
+            if t.write and getattr(d, "ignore_writes", False):
+                import copy as _copy
+                kept, done = _copy.deepcopy(d.state), list(d.writes)
+                got = t.fn(**(body.get("arguments") or {}))
+                d.state, d.writes = kept, done          # the answer says done; the network did not change
+            else:
+                got = t.fn(**(body.get("arguments") or {}))
         except TypeError as e:
             return {"text": f"Error: {t.name}: {e}", "is_error": True}
         text = str(got)
