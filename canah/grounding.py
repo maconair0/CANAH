@@ -49,6 +49,10 @@ _TICK = re.compile(r"`([^`\s]{2,80})`")
 _LABELLED = re.compile(r"^[ \t*\-•]*[A-Za-z][\w .()/-]{0,40}?:[ \t]*([^\s,;]+)[ \t]*$", re.M)
 _QUOTED = re.compile(r"(?<![\w'])'([A-Za-z0-9_.@/-]{2,60})'(?![\w'])|\"([A-Za-z0-9_.@/-]{2,60})\"")
 _GUARD = "[grounding check]"
+# The agent's own tools and subagents (set at build): naming them ("net_read_alarms", "optical-config") is not a
+# value a tool should have returned. A self-description that listed them was sent back for it.
+OWN_NAMES: set = set()
+MAX_SENDBACKS = 2   # an answer is sent back at most this often in one turn, whichever checks do it
 
 
 def _significant(token: str) -> bool:
@@ -74,9 +78,15 @@ def _derived(value: str, given: str, numbers: Optional[List[float]] = None) -> b
         return False
     mantissa = _norm(value).split("e")[0]
     places = len(mantissa.split(".")[1]) if "." in mantissa else 0
+    # 2.06e-4 for 0.000206 (a BER, written the way BERs are): the same figure at the significant digits it gives
+    sci = "e" in _norm(value) and v != 0
+    digits = len(re.sub(r"\D", "", mantissa).lstrip("0")) or 1
     for g in numbers if numbers is not None else _numbers(given):
         for f in (1.0, 100.0, 0.01):
-            if abs(round(g * f, places) - v) < 10 ** -(places + 6):
+            if sci:
+                if g * f != 0 and f"{g * f:.{digits - 1}e}" == f"{v:.{digits - 1}e}":
+                    return True
+            elif abs(round(g * f, places) - v) < 10 ** -(places + 6):
                 return True
     return False
 
@@ -121,7 +131,10 @@ def names(text: str) -> List[str]:
     text = text or ""
     found = [n for n in _IDENT.findall(text) if any(c.isdigit() for c in n)]
     found += [t.strip() for t in _TICK.findall(text) if t.strip()]
-    found += [v.rstrip(".") for v in _LABELLED.findall(text) if re.search(r"[-_./@]", v.rstrip("."))]
+    # "Path: `F-ab`", "Router: **pe-a**": the value, not its Markdown (with its backticks it was never in any
+    # tool's output, and a correct answer was sent back for it)
+    found += [v for v in (x.strip("`*_\"'").rstrip(".").strip("`*_\"'") for x in _LABELLED.findall(text))
+              if v and re.search(r"[-_./@]", v)]
     found += [a or b for a, b in _QUOTED.findall(text)]
     found = list(dict.fromkeys(f for f in found if f))
     # A name inside a longer one found here ("nodes-17" in "nodes-17.json") adds nothing.
@@ -157,7 +170,7 @@ class GroundingGuard(AgentMiddleware):
         # Values are held to this turn's tools; names to everything said or returned in the conversation,
         # and to what the agent itself called (an object named three turns ago is still known).
         given = _norm(" ".join(tools_said + [str(turn[0].content)] + [_calls(turn)]))
-        known = _norm(" ".join([str(m.content) for m in msgs if isinstance(m, (ToolMessage, HumanMessage))
+        known = _norm(" ".join(sorted(OWN_NAMES) + [str(m.content) for m in msgs if isinstance(m, (ToolMessage, HumanMessage))
                                 and _GUARD not in str(m.content)] + [_calls(msgs)]))
         nums = _numbers(given)
         missing = [v for v in specifics(answer) if _norm(v) not in given and not _derived(v, given, nums)]
@@ -173,7 +186,7 @@ class GroundingGuard(AgentMiddleware):
             f"Report only what the tools returned (rounding a figure, or giving it as a percentage, is fine). "
             f"If a command did not print what you "
             f"expected (for example `$(...)` inside single quotes is not expanded), fix it and run it again; "
-            f"otherwise drop the value and say it was not obtained."))]}
+            f"otherwise drop the value and say it was not obtained. " + QUIET))]}
 
 
 _ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me(?! know\b)|i(?:'ll| will) (?:now |first |next )?(?:check|look|run|query|fetch|get|"
@@ -186,6 +199,10 @@ _ANNOUNCE = re.compile(r"(?:^|[.!?]\s+|\n)\s*(?:let me(?! know\b)|i(?:'ll| will)
 _NUDGE = "[follow-through check]"
 _LOOK = "[look-first check]"
 KEEP = "KEEP"
+# A check's message is between the check and the model. The operator reads only the answer, which must read as
+# the first and only one ("as per the grounding check, the path was omitted" was written to them).
+QUIET = ("Write the answer for the operator as if it were your first: do not mention this check, a revision, an "
+         "earlier answer or what you left out because of it.")
 
 
 def is_keep(content: Any) -> bool:
@@ -225,7 +242,7 @@ def anchored(note: str, msgs: List[Any], keep: bool = True) -> str:
     q = " ".join(current_question(msgs).split())
     if len(q) > 400:
         q = q[:400] + " ..."
-    out = note
+    out = note + " " + QUIET
     if q:
         out += f"\n\nThe operator's question this turn: \u00ab{q}\u00bb. Answer that question, not an earlier one."
     if keep:
@@ -255,6 +272,16 @@ class KeepAnswer(AgentMiddleware):
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
         msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+        # The same answer written again after a check is the model keeping it: the check and the copy are dropped
+        # (it was written out five times, word for word, one check after another).
+        if (len(msgs) >= 3 and isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls and is_check(msgs[-2])
+                and isinstance(msgs[-3], AIMessage) and not msgs[-3].tool_calls and msgs[-1].id and msgs[-2].id
+                and " ".join(str(msgs[-1].content).split()) == " ".join(str(msgs[-3].content).split())
+                and str(msgs[-1].content).strip()):
+            run = _this_run()
+            if run is not None:
+                run["kept"] = True
+            return {"messages": [RemoveMessage(id=msgs[-2].id), RemoveMessage(id=msgs[-1].id)]}
         if (len(msgs) >= 3 and isinstance(msgs[-1], AIMessage) and not msgs[-1].tool_calls and is_keep(msgs[-1].content)
                 and is_check(msgs[-2])
                 and isinstance(msgs[-3], AIMessage) and msgs[-1].id and msgs[-2].id):
@@ -293,7 +320,10 @@ class FollowThrough(AgentMiddleware):
             return None
         asks = bool(_ASKS.search(text)) and self._may_change()
         # A stall ("I now have all the information...") sits at the start; an announced step at the end.
-        if not (asks or _ANNOUNCE.search(text[-400:]) or _ANNOUNCE.search(text[:200]) or _LACKS.search(text)):
+        # The start counts only in a short reply: a full answer that opens with "I'll check the services ..." and
+        # goes on with what it found is an answer (it was sent back, the model kept it, the page showed it twice).
+        if not (asks or _ANNOUNCE.search(text[-400:]) or (len(text) < 600 and _ANNOUNCE.search(text[:200]))
+                or _LACKS.search(text)):
             return None
         start = turn_start(msgs)
         if any(isinstance(m, HumanMessage) and _NUDGE in str(m.content) for m in msgs[start:]):
@@ -780,7 +810,14 @@ _CHANGE = re.compile(r"^\W*(?:please\s+|can you\s+|could you\s+|now\s+)*(create|
 
 def asks_change(q: str) -> bool:
     """Does any sentence of the request tell the agent to change something ("Create ...", "... Set it up
-    accordingly.")? The instruction is often last, after the context."""
+    accordingly.")? The instruction is often last, after the context. Making or removing a subagent is not a
+    change to a network ("create a subagent ...", "the span-checker's use is done: remove it")."""
+    try:
+        from .user_subagents import about_subagents
+        if about_subagents(q or ""):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     return any(_CHANGE.search(x) for x in re.split(r"(?<=[.!?;:])\s+|\n+", q or "") if x.strip())
 
 
@@ -976,3 +1013,27 @@ class DelegationGuard(AgentMiddleware):
             f"not yours. Call task(subagent_type='{self.qot}', description=<the what-if, with what you read>) and "
             f"answer from its report: its PROPOSAL and TWIN lines. Never say what the twin predicts without that.", msgs,
             keep=False))]}
+
+
+def limit_sendbacks(middleware: List[Any], limit: int = MAX_SENDBACKS) -> List[Any]:
+    """Every check sends an answer back at most once, but there are many of them: one after another they had the
+    model write the same answer five times. Past `limit` send-backs in a turn, whichever checks made them, the
+    answer stands (the checks' other work, such as dropping a KEEP, still happens)."""
+    for m in middleware:
+        if not isinstance(m, AgentMiddleware) or type(m).after_model is AgentMiddleware.after_model:
+            continue
+        if getattr(m, "_canah_limited", False):
+            continue
+        orig = m.after_model
+
+        def wrapped(state, runtime, _orig=orig):
+            out = _orig(state, runtime)
+            if isinstance(out, dict) and out.get("jump_to") == "model" and any(is_check(x) for x in out.get("messages") or []):
+                msgs = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
+                sent = sum(1 for x in msgs[turn_start(msgs):] if is_check(x))
+                if sent >= limit:
+                    return None
+            return out
+        object.__setattr__(m, "after_model", wrapped)
+        object.__setattr__(m, "_canah_limited", True)
+    return middleware

@@ -206,6 +206,35 @@ class Twins(unittest.TestCase):
         hr = {"Authorization": "Bearer " + client.post("/session", json={"username": "root", "password": "r00t"}).json()["token"]}
         self.assertEqual(client.delete("/twins/flow", headers=hr).json()["active"], "toy")
 
+    # -- a change is tried in the twin while it waits for approval, and the gate uses that try
+    def test_a_proposed_change_is_tried_before_approval_and_the_gate_reuses_it(self):
+        import time as _t
+        from canah.identity import Identity
+        from canah.twins.activity import FEED
+        a, _ = self.agent(call("ctl__set_rate", rate=150), say("sent"), say("ok"))
+        admin = Identity("admin", "admin")
+        seq = FEED.since(0, "", True)["seq"]
+        r = a.ask("set the rate to 150", "t1", who=admin)
+        self.assertTrue(r.pending)
+        for _ in range(50):                                   # the try runs in the background
+            st = a.twin_precheck.state("ctl__set_rate", {"rate": 150})
+            if st and st["state"] != "running":
+                break
+            _t.sleep(0.05)
+        self.assertEqual((st["state"], st["action"]), ("done", "reject"))
+        steps = [e for e in FEED.since(seq, "", True)["events"] if e["step"] == "precheck"]
+        self.assertEqual([e["state"] for e in steps], ["running", "done"])
+        self.assertEqual(steps[-1]["outcome"]["action"], "reject")
+        calls = []
+        real = TOY.check_write
+        TOY.check_write = lambda *x, **k: calls.append(x) or real(*x, **k)
+        try:
+            a.decide("t1", [{"type": "approve"}], who=admin)
+        finally:
+            TOY.check_write = real
+        self.assertEqual(calls, [])                           # the gate used the try made before approval
+        self.assertEqual(SENT, [])                            # and held the write, as the twin advised
+
 
 if __name__ == "__main__":
     unittest.main()

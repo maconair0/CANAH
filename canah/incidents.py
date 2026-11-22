@@ -196,7 +196,12 @@ def alarms_of(data: Any) -> List[Dict[str, Any]]:
 
 def _object(inc: Dict[str, Any]) -> str:
     fp = str(inc.get("fp") or "")
-    return fp.split(":", 2)[-1] if fp.count(":") >= 2 else ""
+    if fp.count(":") < 2:
+        return ""
+    rest = fp.split(":", 2)[-1]
+    if fp.split(":")[1] == "perf":            # <controller>:perf:<object>:<metric>: the object, not the measurement
+        return rest.rsplit(":", 1)[0]
+    return rest
 
 
 def related_groups(group: List[Dict[str, Any]], relations: List[Dict[str, Any]],
@@ -259,9 +264,10 @@ class Watcher:
     def __init__(self, topology: Any, store: Incidents, notifier: Notifier, history: Any = None,
                  runbooks: Callable[[], List[Dict[str, Any]]] = lambda: [], respond: Optional[Callable[[Dict[str, Any]], None]] = None,
                  interval_s: float = 60.0, resolve_after: int = 2, history_every: int = 5, series: Any = None,
-                 heartbeat_s: float = 5.0):
+                 heartbeat_s: float = 5.0, perf: Any = None):
         self.topology, self.store, self.notifier, self.history, self.series = topology, store, notifier, history, series
         self.runbooks, self.respond = runbooks, respond
+        self.perf = perf                  # performance.Store: what read_metrics answers, kept for the trends
         self.interval_s, self.resolve_after, self.history_every = interval_s, resolve_after, max(1, history_every)
         self.polls = 0
         self.last: Dict[str, Any] = {}
@@ -286,6 +292,7 @@ class Watcher:
         t = self.topology.read(refresh=True)
         out: List[Dict[str, Any]] = []
         services: Dict[str, List[Dict[str, Any]]] = {}
+        metrics: Dict[str, Any] = {}
 
         def add(fp, controller, severity, kind, title, details=""):
             out.append({"fp": fp, "controller": controller, "severity": severity, "kind": kind, "title": title,
@@ -293,7 +300,7 @@ class Watcher:
         if t.get("ok") is False:
             add("agentic-mcp:down", "agentic-mcp", "critical", "agentic_mcp_down", "The agentic MCP is not answering",
                 t.get("error", ""))
-            return {"findings": out, "topology": t, "services": services}
+            return {"findings": out, "topology": t, "services": services, "metrics": metrics}
         svc = self.topology.service
         # The agentic MCP's own view of each controller: a session down or degraded, even when a read came
         # back as an answer that only says so inside it.
@@ -338,6 +345,16 @@ class Watcher:
                                     f"{label}: service {s['id']} is {s['status']}", json.dumps(s))
                 except Exception as e:  # noqa: BLE001 - a read that fails is not an incident by itself
                     logger.debug("services of %s: %s", key, e)
+            metrics[key] = None                        # None: this controller publishes no measurements
+            if "read_metrics" in verbs:
+                try:
+                    from .performance import findings as perf_findings, rows_of
+                    got = svc.call(key, verbs["read_metrics"], {})
+                    if not got.get("is_error"):
+                        metrics[key] = rows_of(_parse(got.get("text")))
+                        out.extend(perf_findings(key, label, metrics[key]))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("metrics of %s: %s", key, e)
             if "read_alarms" in verbs:
                 try:
                     got = svc.call(key, verbs["read_alarms"], {})
@@ -352,7 +369,7 @@ class Watcher:
             if f["fp"] not in seen:
                 seen.add(f["fp"])
                 unique.append(f)
-        return {"findings": unique, "topology": t, "services": services}
+        return {"findings": unique, "topology": t, "services": services, "metrics": metrics}
 
     # -- one poll
 
@@ -386,6 +403,10 @@ class Watcher:
                 self.notifier.send("incident_resolved", inc["severity"], f"Resolved: {inc['title']}",
                                    f"Open for {int((inc['resolved_at'] or time.time()) - inc['first_seen'])} s, seen {inc['count']} times.",
                                    link=f"/#incident-{inc['id']}", data={"incident": inc["id"]})
+        if self.perf is not None:
+            now = time.time()
+            for key, rows in (got.get("metrics") or {}).items():
+                self.perf.add(now, key, rows or [], published=rows is not None)
         if self.series is not None:
             from .health import sample
             open_by: Dict[str, int] = {}

@@ -23,6 +23,8 @@ maps them), function. `reset()` puts a domain back to its starting state. Faults
 from __future__ import annotations
 
 import copy
+import math
+import time
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -45,6 +47,32 @@ def _obj(**props):
 
 S = {"type": "string"}
 I = {"type": "integer"}
+
+
+def _wobble(seed: str, amp: float) -> float:
+    """A small, steady drift so a trend has something to show; the same at the same moment for the same object."""
+    t = time.time() / 30.0
+    h = (sum(map(ord, seed)) % 97) / 97.0
+    return amp * math.sin(t + 6.283 * h)
+
+
+def _erfcinv(y: float) -> float:
+    """Inverse of erfc, by bisection (enough for a margin to two decimals)."""
+    lo, hi = 0.0, 10.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if math.erfc(mid) > y:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def pre_fec_ber(osnr_db: float, rate_gbps: int) -> float:
+    """Pre-FEC BER from OSNR: Q (dB) = OSNR less what the rate needs, BER = erfc(Q / sqrt 2) / 2."""
+    need = {100: 9.0, 200: 12.0, 300: 13.5, 400: 14.0}.get(int(rate_gbps), 12.0)
+    q = 10 ** ((osnr_db - need) / 20.0)
+    return max(0.5 * math.erfc(q / math.sqrt(2)), 1e-15)
 
 
 class Domain:
@@ -258,6 +286,33 @@ class Packet(Domain):
             return json.dumps({"services": [{"name": n, **v, "status": "up" if self._svc_up(v) else "down"}
                                             for n, v in st["services"].items()]})
 
+        def read_metrics():
+            rows = []
+            for l in st["links"]:
+                v = self._view_link(l)
+                if v["status"] != "up":
+                    rows.append({"object": l["name"], "kind": "link", "state": "down"})
+                    continue
+                drop, crc = 0.0, 0
+                c = self._carrier(l)
+                if c and self.optical is not None:
+                    lp = self.optical.state["lightpaths"][c]
+                    ber = pre_fec_ber(lp["osnr_db"], lp["rate_gbps"])
+                    if ber >= 2e-2:
+                        drop, crc = round(min(40.0, 1500 * ber), 2), int(4e5 * ber)
+                    elif ber >= 2e-3:
+                        drop, crc = 0.02, int(1e4 * ber)
+                util = 34 + 12 * math.sin(time.time() / 600 + len(l["name"])) + _wobble(l["name"], 2)
+                km = 240 if c else 20
+                rows.append({"object": l["name"], "kind": "link", "state": "up", "utilisation_pct": round(util, 1),
+                             "drop_pct": round(max(0.0, drop + max(0.0, _wobble(l["name"] + "d", 0.004))), 4),
+                             "crc_errors_per_s": crc, "latency_ms": round(km * 0.005 + 0.08 + abs(_wobble(l["name"] + "l", 0.02)), 3)})
+            for r, x in st["routers"].items():
+                if x["status"] == "up":
+                    rows.append({"object": r, "kind": "router", "state": "up",
+                                 "cpu_pct": round(22 + _wobble(r, 6), 1), "temperature_c": round(48 + _wobble(r + "t", 2), 1)})
+            return json.dumps({"metrics": rows, "at": time.time()})
+
         def interface_counters(router: str):
             if router not in st["routers"]:
                 return f"Error: no router {router}"
@@ -328,6 +383,8 @@ class Packet(Domain):
             Tool("list_links", "List the links between routers, their status and what carries each.", list_links,
                  verb="read_links"),
             Tool("list_handoffs", "List the ports that hand off to other domains, and to what.", list_handoffs),
+            Tool("read_metrics", "Performance now: per link utilisation, packet drops, CRC errors and latency; per "
+                 "router CPU and temperature.", read_metrics, verb="read_metrics"),
             Tool("list_hosts", "The hosts at each site: name, site, IP address, gateway, the router and port they hang off.",
                  list_hosts, verb="read_hosts"),
             Tool("ping", "Ping from a host to another host (by name or IP address) or to a gateway: packets sent and "
@@ -410,6 +467,26 @@ class Optical(Domain):
         def list_fibres():
             return json.dumps({"links": st["fibres"]})
 
+        def read_metrics():
+            rows = []
+            for n, lp in st["lightpaths"].items():
+                if lp["state"] != "in-service":
+                    rows.append({"object": n, "kind": "lightpath", "state": lp["state"], "rx_power_dbm": -40.0})
+                    continue
+                osnr = lp["osnr_db"] + _wobble(n, 0.3)
+                ber = pre_fec_ber(osnr, lp["rate_gbps"])
+                fec_limit = 2e-2
+                rows.append({"object": n, "kind": "lightpath", "state": lp["state"], "osnr_db": round(osnr, 2),
+                             "pre_fec_ber": float(f"{ber:.3g}"), "post_fec_ber": 0.0 if ber < fec_limit else float(f"{ber / 50:.3g}"),
+                             "q_margin_db": round(20 * math.log10(max(math.sqrt(2) * _erfcinv(2 * ber), 1e-9))
+                                                  - 20 * math.log10(math.sqrt(2) * _erfcinv(2 * fec_limit)), 2),
+                             "rx_power_dbm": round(-8.5 + _wobble(n + "p", 0.4), 2),
+                             "cd_ps_nm": int(17 * sum(f["length_km"] for f in st["fibres"] if f["name"] in lp.get("path", [])))})
+            for f in st["fibres"]:
+                rows.append({"object": f["name"], "kind": "fibre", "state": f["status"],
+                             **({"span_loss_db": round(0.22 * f["length_km"] + _wobble(f["name"], 0.2), 2)} if f["status"] == "up" else {})})
+            return json.dumps({"metrics": rows, "at": time.time()})
+
         def lightpath_osnr(name: str):
             lp = st["lightpaths"].get(name)
             return f"Error: no lightpath {name}" if lp is None else json.dumps({"name": name, "osnr_db": lp["osnr_db"]})
@@ -453,6 +530,8 @@ class Optical(Domain):
             Tool("list_nodes", "Every node (ROADMs, transponders, amplifiers) with its site, node-type and ports.",
                  list_nodes, verb="read_devices"),
             Tool("list_fibres", "The fibres between ROADMs: ends, length, status.", list_fibres, verb="read_links"),
+            Tool("read_metrics", "Performance now: per lightpath OSNR, pre- and post-FEC BER, Q margin, received power, "
+                 "chromatic dispersion; per fibre its span loss.", read_metrics, verb="read_metrics"),
             Tool("list_lightpaths", "The lightpaths: ends, rate, OSNR, state, the fibres they ride, and the client each "
                  "end hands off to.", list_lightpaths, verb="read_services"),
             Tool("lightpath_osnr", "One lightpath's measured OSNR in dB.", lightpath_osnr, _obj(name=dict(S))),
@@ -481,6 +560,9 @@ class Optical(Domain):
         if kind == "service_down" and target in st["lightpaths"]:
             st["lightpaths"][target]["state"] = "out-of-service"
             return f"lightpath {target} is out of service"
+        if kind == "degrade" and target in st["lightpaths"]:
+            st["lightpaths"][target]["osnr_db"] = 14.0 if st["lightpaths"][target]["rate_gbps"] <= 100 else 17.0
+            return f"lightpath {target}'s OSNR fell to {st['lightpaths'][target]['osnr_db']} dB"
         raise ValueError(f"optical has no {kind} target {target!r}")
 
     def _lightpaths_follow(self):
@@ -509,6 +591,14 @@ class Fabric(Domain):
 
     def tools(self):
         st = self.state
+
+        def read_metrics():
+            rows = [{"object": n, "kind": "switch", "state": x["status"],
+                     **({"cpu_pct": round(15 + _wobble(n, 4), 1), "temperature_c": round(44 + _wobble(n + "t", 2), 1),
+                         "drop_pct": round(max(0.0, _wobble(n + "d", 0.003)), 4),
+                         "utilisation_pct": round(28 + _wobble(n + "u", 6), 1)} if x["status"] == "up" else {})}
+                    for n, x in st["switches"].items()]
+            return json.dumps({"metrics": rows, "at": time.time()})
 
         def list_switches():
             return json.dumps({"switches": [{"name": n, **x} for n, x in st["switches"].items()]})
@@ -555,6 +645,8 @@ class Fabric(Domain):
                  "{from, relation, to}.", list_relations),
             Tool("list_switches", "The fabric's switches and their roles (and the border leaf's uplink).",
                  list_switches, verb="read_devices"),
+            Tool("read_metrics", "Performance now: per switch CPU, temperature, utilisation and packet drops.",
+                 read_metrics, verb="read_metrics"),
             Tool("list_tenants", "The tenants: VNI, the leaves they are on, and their external connection.",
                  list_tenants, verb="read_services"),
             Tool("attach_tenant", "Attach a tenant's network to a leaf switch.", attach_tenant,

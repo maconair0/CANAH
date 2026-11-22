@@ -382,6 +382,32 @@ service already pings from them (`POST /api/lab/ping`, `central_llm/reachability
 with the agentic MCP whose tools serve `read_hosts`, `ping` and `traceroute` over those makes the same tools
 work on the real network, with no change in CANAH.
 
+## Performance: what the controllers measure
+
+**`read_metrics` is a contract verb** (`net_read_metrics` for the agents). A controller that serves it answers
+with one row per object it measures, every numeric field a measurement:
+
+```json
+{"metrics": [{"object": "LP-1", "kind": "lightpath", "state": "in-service", "pre_fec_ber": 1.9e-05,
+              "osnr_db": 21.3, "q_margin_db": 6.1, "rx_power_dbm": -8.3},
+             {"object": "L-ab", "kind": "link", "state": "up", "drop_pct": 0.0, "crc_errors_per_s": 0,
+              "utilisation_pct": 39.3, "latency_ms": 1.3}]}
+```
+
+The watcher reads it at every full read (`watch_interval_s`), keeps every value for 7 days
+(`<CANAH_HOME>/performance.sqlite`, `canah/performance.py`), and judges it against limits: the catalogue's
+defaults (pre-FEC BER warning 2e-3, bad 1e-2; OSNR under 16 / 13 dB; Q margin under 2 / 0.5 dB; drops over
+0.1 / 1 %; utilisation over 80 / 95 %; …) or a row's own `"limits": {"pre_fec_ber": {"warn": 3.8e-3, "bad":
+1.5e-2}}`, since a vendor's FEC knows its threshold. A value past a limit is an incident of kind `performance`
+(minor at the warning level, major past the limit); the `performance-degraded` runbook investigates a major one
+and changes nothing. A lightpath near its FEC limit and the drops on the IP link it carries are one event:
+they are investigated together, through the "carries" relation.
+
+The **Live network** page shows, per domain, every measured object grouped by kind (lightpaths, fibres, IP
+links, routers, switches) with each value coloured against its limit and its trend over 6 h; clicking a row
+draws the last 24 h with the limits. A controller without the verb is shown as publishing no measurements;
+nothing is filled in for it. `GET /performance` and `GET /performance/series` serve the same.
+
 ## Self-correction: checked changes and lessons
 
 Two parts, both done by the harness rather than by asking the model to judge itself (the same model shares its

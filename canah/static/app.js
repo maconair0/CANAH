@@ -138,6 +138,8 @@ function go(view, first = false) {
   if (view === "knowledge") renderKnowledge();
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
+  if ((view === "twins" || view === "chat") && typeof twinNowLoop === "function") twinNowLoop();
+  if (view !== "chat") $("#tv-pop")?.classList.remove("show");
   if (view === "model") renderModel();
   if (view === "incidents") renderIncidents();
 }
@@ -1189,16 +1191,31 @@ function addAgent(question = "") {
       d.innerHTML = `<summary>An earlier draft, sent back by the ${esc(check || "check")}</summary>`;
       drafts[0].before(d); drafts.forEach((x) => d.append(x)); last = null;
     },
+    restart() {     // the model was called again (the first call failed): what it had written is not the answer
+      if (last && last.parentNode === segs && segs.lastElementChild === last) { last.remove(); last = null; }
+    },
     text(t) { if (!t) return; working()?.remove(); last = document.createElement("div"); last.className = "reply-rich"; last._raw = t; last.innerHTML = md(t); segs.append(last); drawDiagrams(last); },
     final(t) {     // the reply as the agent ended it: replaces what streamed after the last tool card
       working()?.remove();
       if (!t) return;
+      // The answer a check sent back, and the model kept as it was: it goes back where it was, unfolded, not
+      // written out a second time below.
+      const fold = [...segs.querySelectorAll(":scope > details.draft")].pop();
+      if (fold && !last && segs.lastElementChild === fold) {
+        const parts = [...fold.querySelectorAll(":scope > .reply-rich")];
+        if (parts.length && parts.map((x) => x._raw || "").join("").trim() === t.trim()) {
+          parts.forEach((x) => fold.before(x)); fold.remove(); last = parts[parts.length - 1]; drawDiagrams(segs); return;
+        }
+      }
       if (last && last.parentNode === segs && segs.lastElementChild === last) { last._raw = t; last.innerHTML = md(t); }
       else turn.text(t);
       drawDiagrams(segs);
     },
     tool(name, args, live = true) {
-      working()?.remove(); last = null;
+      working()?.remove();
+      // What it wrote just before a tool call ("I'll check the alarms") is a working note, not the answer.
+      if (last && last.parentNode === segs && segs.lastElementChild === last) last.classList.add("narr");
+      last = null;
       const write = (state.info?.interrupt_on || []).includes(name);
       const c = document.createElement("div"); c.className = `lg-tool${write ? " write" : ""}`;
       const by = name === "task" ? "" : args?.controller ? `on ${args.controller}` : (String(name).includes("__") ? agentFor(String(name).split("__")[0]) : "");
@@ -1266,6 +1283,7 @@ async function stream(path, body, turn) {
         const d = JSON.parse(data);
         if (ev === "token") turn.token(d.text);
         else if (ev === "redo") turn.redo(d.check);
+        else if (ev === "restart") turn.restart();
         else if (ev === "tool_call") {
           const sub = d.name === "task" ? d.args?.subagent_type : agentFor(String(d.name).split("__")[0]);
           if (/^net_|^controller_|^network_|follow_relations/.test(d.name)) active.add(d.args?.controller ? `ctl:${d.args.controller}` : "mcp");
@@ -1315,6 +1333,7 @@ async function send() {
   ta.value = ""; ta.style.height = ""; state.chat.files = []; renderFiles();
   saveThread(id, words || "attached files");
   addUser(text);
+  if (typeof twinNowLoop === "function") setTimeout(twinNowLoop, 400);     // follow the twin closely while it answers
   await stream(`/threads/${id}/stream`, { text }, addAgent(words || "attached files"));
 }
 $("#composer-form").addEventListener("submit", (e) => { e.preventDefault(); send(); });
@@ -1353,11 +1372,13 @@ function showPending(turn, pending) {
   const card = document.createElement("div"); card.className = "lg-interrupt";
   card.innerHTML = `<div class="h"><span class="k">interrupt</span>Approval needed · ${pending.length} change${pending.length > 1 ? "s" : ""}</div>
     ${pending.map((p, i) => `<div class="chg" data-i="${i}"><div class="row" style="gap:8px"><b class="mono">${esc(p.name)}</b><span class="tag ${p.needs === "root" ? "bad" : "warn"}">needs ${esc(p.needs || "admin")}</span></div>
-      ${p.description ? `<div class="muted" style="font-size:12px">${esc(p.description)}</div>` : ""}<div class="args">${kvTable(p.args)}</div></div>`).join("")}
+      ${p.description ? `<div class="muted" style="font-size:12px">${esc(p.description)}</div>` : ""}<div class="args">${kvTable(p.args)}</div>
+      <div class="chg-twin" data-i="${i}">${twinRowHtml(p.twin)}</div></div>`).join("")}
     <div class="acts">${may ? `<button class="btn ok" data-d="approve">Accept</button><button class="btn" data-d="edit">Edit</button>`
       : `<span class="muted" style="font-size:12px">${state.level === "observer" ? "Sign in as admin or root to accept." : "This needs root to accept."}</span>`}
       <button class="btn danger" data-d="reject">Reject</button></div>`;
   turn.segs.append(card); scrollDown();
+  followTwinOnCard(card, state.chat.thread);
   const finish = async (decisions, label) => {
     $$("button", card).forEach((x) => x.disabled = true); card.classList.add("done");
     $(".h", card).innerHTML = `<span class="k">interrupt</span>${esc(label)}`;
@@ -1378,6 +1399,31 @@ function showPending(turn, pending) {
   }));
 }
 const levelRank = (l) => ({ observer: 0, admin: 1, root: 2 }[l] ?? 0);
+
+/* The digital twin's try of a change, on its approval card: running, then its verdict. */
+function twinRowHtml(t) {
+  if (!t) return "";
+  const head = `<span class="k">Digital twin</span>`;
+  if (t.state === "running") return `${head}<span class="tv-spin"></span><span>${esc(t.twin)} is trying this change on a copy of the network…</span><a href="#" data-twins>watch</a>`;
+  if (t.state === "unchecked") return `${head}<span class="faint">not tried: ${esc(t.why)}</span>`;
+  if (t.state === "error") return `${head}<span class="bad-t">could not try it: ${esc(t.why)}</span>`;
+  const act = String(t.action || "");
+  const human = { propose: "supports it", send: "supports it", reject: "advises against it", ask_operator: "needs your answer first",
+    gather_more_data: "cannot tell yet", not_modelled: "cannot model this change", no_twin: "could not check it" }[act] || act.replace(/_/g, " ");
+  const cls = /propose|send/.test(act) ? "propose" : /reject/.test(act) ? "reject" : "gather_more_data";
+  return `${head}<span class="dec ${cls}">${esc(human)}</span>${t.p != null ? `<span class="faint">p ${Number(t.p).toFixed(2)}</span>` : ""}
+    ${(t.reasons || []).length ? `<span class="muted">${esc(t.reasons[0])}</span>` : ""}${(t.questions || []).length ? `<span class="muted">${esc(t.questions[0])}</span>` : ""}
+    <a href="#" data-twins>see it</a>`;
+}
+async function followTwinOnCard(card, thread) {
+  for (let n = 0; n < 240 && card.isConnected && !card.classList.contains("done"); n++) {
+    let p; try { p = await api(`/threads/${thread}/pending`); } catch (e) { return; }
+    (p.pending || []).forEach((x, i) => { const el = card.querySelector(`.chg-twin[data-i="${i}"]`); if (el) el.innerHTML = twinRowHtml(x.twin); });
+    $$("a[data-twins]", card).forEach((a) => { a.onclick = (e) => { e.preventDefault(); go("twins"); }; });
+    if (!(p.pending || []).some((x) => x.twin && x.twin.state === "running") && n > 0) return;
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+}
 
 /* A small markdown reader for replies: headings, lists, code, tables, bold, links. */
 function md(src) {
@@ -1982,6 +2028,7 @@ function knTab(t) {
   if (t === "map") loadMesh().then(() => mesh.data?.nodes?.length && meshDetail());
   if (t === "mem") renderMemories();
   if (t === "skills" && typeof renderSkills === "function") renderSkills();
+  if (t === "subagents" && typeof renderSubagents === "function") renderSubagents();
   if (t === "search") setTimeout(() => $("#kn-q").focus(), 30);
 }
 $$("#kn-tabs .tab").forEach((b) => b.addEventListener("click", () => knTab(b.dataset.tab)));
@@ -2180,5 +2227,9 @@ document.addEventListener("keydown", (e) => {
   else if (state.view === "topology" && e.key === "e") toggleAll();
   else if (e.key === "Escape") { state.selected = null; renderDetail(null); renderTopology(); }
 });
+
+/* the About page's guide: its links go to the page they name, its questions go to the chat box */
+$$("#view-about [data-go]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); go(a.dataset.go); }));
+$$("#view-about [data-ask]").forEach((b) => b.addEventListener("click", () => { go("chat"); $("#composer").value = b.dataset.ask; $("#composer").focus(); }));
 
 boot();

@@ -709,3 +709,105 @@ class StateClaims(unittest.TestCase):
         out = StateCheck().after_model({"messages": [q, read, rows, AIMessage(content="It cannot: pe-b is down.")]}, None)
         self.assertIn("you say pe-b is down, the read says up", out["messages"][0].content)
         self.assertIsNone(StateCheck().after_model({"messages": [q, read, rows, AIMessage(content="p-2 is down; pe-b is up.")]}, None))
+
+
+class OneAnswer(unittest.TestCase):
+    """What made an answer change on the page after it was given."""
+
+    def test_a_value_in_backticks_after_a_label_is_the_value(self):
+        from canah.grounding import names
+        self.assertIn("F-ab", names("   - Path: `F-ab`  \n"))
+        self.assertNotIn("`F-ab`", names("   - Path: `F-ab`  \n"))
+        self.assertIn("pe-a", names("Router: **pe-a**\n"))
+
+    def test_a_full_answer_that_opens_with_what_it_checked_is_not_a_stall(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import FollowThrough
+        q = HumanMessage(content="Which services are not up, and why?")
+        long = ("I'll check the status of the services and their dependencies. Based on what I read: " + "VS-100 is up. " * 60)
+        self.assertIsNone(FollowThrough().after_model({"messages": [q, AIMessage(content=long)]}, None))
+        stall = AIMessage(content="I'll check the services first.")
+        self.assertIsNotNone(FollowThrough().after_model({"messages": [q, stall]}, None))
+
+    def test_a_send_back_asks_for_an_answer_that_does_not_mention_it(self):
+        from langchain_core.messages import HumanMessage
+        from canah.grounding import QUIET, anchored
+        self.assertIn(QUIET, anchored("[x check] fix it.", [HumanMessage(content="q")]))
+
+
+class Scientific(unittest.TestCase):
+    def test_a_ber_in_scientific_notation_is_the_tools_figure(self):
+        from canah.grounding import _derived
+        self.assertTrue(_derived("2.06e-4", '{"pre_fec_ber": 0.000206}'))
+        self.assertTrue(_derived("2.1e-4", '{"pre_fec_ber": 0.0002063}'))
+        self.assertFalse(_derived("3.5e-4", '{"pre_fec_ber": 0.000206}'))
+
+
+class PicturesOnlyWhenAsked(unittest.TestCase):
+    def agent(self, *script):
+        import tempfile, shutil
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        model = ScriptedModel(script=list(script))
+        a = build_agent(load_settings(path="/x", home=home, sandbox="none", diagrams=True), [FunctionProvider()],
+                        model=model, memory=open_memory(in_memory=True))
+        self.addCleanup(a.close)
+        return a, model
+
+    def test_a_plain_question_is_not_offered_the_drawing_tools(self):
+        a, m = self.agent(say("pe-a, pe-b."))
+        a.ask("Show me the topology of each network.")
+        self.assertTrue(m.tools_bound)
+        self.assertNotIn("draw_diagram", m.tools_bound[-1])
+
+    def test_asking_for_a_picture_offers_them(self):
+        a, m = self.agent(say("ok"))
+        a.ask("Draw me a diagram of the topology.")
+        self.assertIn("draw_diagram", m.tools_bound[-1])
+
+    def test_what_asks_for_a_picture(self):
+        from canah.diagrams import asks_picture
+        for q in ("draw the path", "a diagram please", "plot the BER", "visualise it", "change diagram 0123456789abcdef"):
+            self.assertTrue(asks_picture(q), q)
+        for q in ("show me the topology", "what carries VS-100, layer by layer?", "list the routers"):
+            self.assertFalse(asks_picture(q), q)
+
+
+class NoLoops(unittest.TestCase):
+    """"describe yourself" was written out five times, one check after another."""
+
+    def test_the_same_answer_again_after_a_check_is_kept(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from canah.grounding import KeepAnswer
+        q = HumanMessage(content="describe yourself", id="q")
+        a1 = AIMessage(content="I am CANAH.\n\nI read networks.", id="a1")
+        chk = HumanMessage(content="[look-first check] read first", id="c1")
+        a2 = AIMessage(content="I am CANAH. I read networks.", id="a2")
+        out = KeepAnswer().after_model({"messages": [q, a1, chk, a2]}, None)
+        self.assertEqual(sorted(m.id for m in out["messages"]), ["a2", "c1"])      # both dropped: a1 stands
+        self.assertNotIn("jump_to", out)
+
+    def test_no_more_than_two_send_backs_a_turn(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langchain.agents.middleware import AgentMiddleware
+        from canah.grounding import limit_sendbacks
+
+        class Always(AgentMiddleware):
+            def after_model(self, state, runtime):
+                return {"jump_to": "model", "messages": [HumanMessage(content="[picky check] again")]}
+        always = limit_sendbacks([Always()])[0]
+        q = HumanMessage(content="describe yourself")
+        self.assertIsNotNone(always.after_model({"messages": [q, AIMessage(content="a")]}, None))
+        two = [q, AIMessage(content="a"), HumanMessage(content="[self check] x"), AIMessage(content="b"),
+               HumanMessage(content="[grounding check] y"), AIMessage(content="c")]
+        self.assertIsNone(always.after_model({"messages": two}, None))
+
+    def test_its_own_tools_and_agents_are_not_made_up_names(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from canah.grounding import OWN_NAMES, GroundingGuard
+        OWN_NAMES.update({"net_read_alarms", "optical-config"})
+        q = HumanMessage(content="describe yourself")
+        call_ = AIMessage(content="", tool_calls=[{"name": "canah_status", "args": {}, "id": "1"}])
+        res = ToolMessage(content="roles, approvals", tool_call_id="1", name="canah_status")
+        ans = AIMessage(content="I read with net_read_alarms and hand changes to optical-config.")
+        self.assertIsNone(GroundingGuard().after_model({"messages": [q, call_, res, ans]}, None))

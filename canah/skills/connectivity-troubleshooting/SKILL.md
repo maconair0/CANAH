@@ -19,7 +19,10 @@ and the only way to settle it is to send some: `net_ping`, `net_traceroute`, fro
 4. **Map the broken hop to what carries it.** `follow_relations` from the IP service or link at that hop: the
    packet link, the lightpath under it, the fibre under that. Read each (`net_read_links`, `net_read_services`
    on the optical controller): the first one down or missing is the cause.
-5. **Between sites over optical**, `ip_over_optical` gives the whole chain and the gap in one read.
-6. **Report**: answered or not (with the numbers), the hop where it stops, the cause with the object and its
+5. **Up but lossy?** When pings are partly answered or a link drops packets, read the measurements
+   (`net_read_metrics`) along the chain: drops and CRC errors on the IP link, then the pre-FEC BER, Q margin
+   and OSNR of the lightpath under it. A lightpath near its FEC limit errors the link it carries.
+6. **Between sites over optical**, `ip_over_optical` gives the whole chain and the gap in one read.
+7. **Report**: answered or not (with the numbers), the hop where it stops, the cause with the object and its
    state as read, and the fix as a change for approval, never as done. After a fix is approved and made,
    ping again: the ping is the proof, not the change's own answer.

@@ -1,0 +1,14 @@
+name: performance-degraded
+when: {kind: performance, min_severity: major}
+mode: investigate
+instructions: |
+  A measurement is past its limit (a lightpath's pre-FEC BER or Q margin, an IP link's drops or errors, a device
+  running hot). Find out why and what it affects; change nothing:
+  1. Read the measurements now (net_read_metrics) for the object and its neighbours: is it still past the limit,
+     getting worse, or recovering?
+  2. Follow what carries it and what it carries (follow_relations, or net_read_links and net_read_services): a
+     lightpath near its FEC limit errors the IP link over it; drops on an IP link may start in the optical layer.
+  3. Look for the cause the controllers publish: alarms (net_read_alarms), a fibre whose loss rose, a device down,
+     a change in the last hour.
+  Report: what is degraded and by how much against its limit, the likely cause in which domain, what is affected,
+  and what an operator could do (reroute, retune, replace), without making the change.

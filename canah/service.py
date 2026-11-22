@@ -480,9 +480,15 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
     def pending(thread_id: str, c=Depends(caller)):
         key = thread_key(c["who"], thread_id)
         out = A().pending(key, c["who"])
+        pre = getattr(A(), "twin_precheck", None)
         for p in out:
             p["needs"] = A().needs(p["name"])
             p["you_may_approve"] = c["who"].can(p["needs"])
+            if pre is not None:
+                try:
+                    p["twin"] = pre.state(p["name"], p.get("args") or {})
+                except Exception:  # noqa: BLE001
+                    p["twin"] = None
         return {"thread_id": thread_id, "pending": out}
 
     @app.post("/threads/{thread_id}/decide")
@@ -757,6 +763,8 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
     net_history = History(home)
     from .health import Series
     health_series = Series(home)
+    from .performance import Store as PerfStore
+    perf_store = PerfStore(home)
     WATCH_WHO = Identity("canah-watch", "admin")
     responded: List[float] = []
 
@@ -912,7 +920,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
     watcher = Watcher(topology, incidents, agent.notifier or __import__("canah.notify", fromlist=["Notifier"]).Notifier([]),
                       net_history, runbooks, respond, interval_s=agent.settings.watch_interval_s, heartbeat_s=agent.settings.heartbeat_s,
                       resolve_after=agent.settings.resolve_after, history_every=agent.settings.history_every,
-                      series=health_series)
+                      series=health_series, perf=perf_store)
     app.state.watcher = watcher
     if watch and agent.settings.watch:
         watcher.start()
@@ -1285,6 +1293,17 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             raise HTTPException(409, "this agent was built without twins")
         return reg
 
+    from .twins.activity import FEED as twin_feed
+    twin_feed.topology = lambda: topology._cache or {}
+
+    @app.get("/twins/activity")
+    def twin_activity(since: int = 0, thread: str = "", c=Depends(caller)):
+        """What the digital twin is doing, as it does it: the steps after `since` (the example asked for, the scenario
+        checked and run, a write tried before it is sent), each with the network it is about as a graph to draw;
+        and the threads it is working for now. Yours, or every one for an admin."""
+        who = c["who"]
+        return twin_feed.since(max(0, int(since)), who.user, who.can("admin"), thread)
+
     @app.get("/twins/runs")
     def twin_runs(limit: int = 30, c=Depends(caller)):
         """What the twin has been working on: its recent runs, newest first, each with its question, domain, decision,
@@ -1361,6 +1380,43 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
                 "alarms": alarms.get(key, [])[:50], "incidents": open_by.get(key, 0),
                 "twin_snapshot": snap_of.get(key) or snap_of.get(str(ctl.get("domain") or ""))})
         return {"at": live_cache["at"], "domains": domains}
+
+    @app.get("/performance")
+    def performance(hours: float = 6.0, points: int = 48, c=Depends(caller)):
+        """What each controller measures (its read_metrics), at the watcher's last read: per object its values judged
+        against their limits, and each value's trend over `hours`. A controller without the verb says so."""
+        from .performance import describe, judge
+        who = c["who"]
+        labels, domains = {}, {}
+        for ctl in (topology._cache or {}).get("controllers") or []:
+            labels[ctl.get("key")] = ctl.get("label") or ctl.get("key")
+            domains[ctl.get("key")] = str(ctl.get("domain") or "network")
+        out, seen_metrics = [], set()
+        for key, got in perf_store.latest().items():
+            if not who.sees(key):
+                continue
+            trend = perf_store.series(key, hours=max(0.1, min(float(hours), 168.0)), points=max(8, min(int(points), 240)))
+            objs = []
+            for r in got["rows"]:
+                vals = {}
+                for m, v in r["metrics"].items():
+                    seen_metrics.add(m)
+                    vals[m] = {"v": v, "judge": judge(m, v, r["limits"]), "trend": [x[1] for x in trend.get(f"{r['object']}|{m}", [])]}
+                worst = "bad" if any(x["judge"] == "bad" for x in vals.values()) else "warn" if any(x["judge"] == "warn" for x in vals.values()) else "ok"
+                objs.append({"object": r["object"], "kind": r["kind"], "state": r["state"], "values": vals, "worst": worst})
+            out.append({"key": key, "label": labels.get(key, key), "domain": domains.get(key, ""), "at": got["at"],
+                        "published": got["published"], "objects": objs})
+        return {"controllers": sorted(out, key=lambda x: (x["domain"], x["key"])), "hours": hours,
+                "metrics": {m: describe(m) for m in sorted(seen_metrics)},
+                "watch_interval_s": A().settings.watch_interval_s}
+
+    @app.get("/performance/series")
+    def performance_series(controller: str, object: str = "", metric: str = "", hours: float = 24.0, points: int = 240,
+                           c=Depends(caller)):
+        if not c["who"].sees(controller):
+            raise HTTPException(404, "no such controller")
+        return {"series": perf_store.series(controller, object, metric, max(0.1, min(float(hours), 168.0)),
+                                            max(8, min(int(points), 1000)))}
 
     @app.get("/twins")
     def twins(c=Depends(caller)):
@@ -1519,6 +1575,82 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             new.ops.audit("agent reloaded", who.user, who.level, "", "reload", {"subagents": new.info.get("subagents")})
         return {"reloaded": True, "subagents": new.info.get("subagents"), "tools": new.info.get("tools")}
 
+    # ----- subagents operators made from the chat (user_subagents.py) -----
+
+    from . import user_subagents as usub
+    _reload_wait = {"pending": False}
+    _reload_lock = threading.Lock()
+
+    def reload_when_idle(who: Optional[Identity] = None) -> None:
+        """Rebuild the agent once nothing is running (a subagent kept or removed from inside a request): never
+        while a request runs, so no answer waits for it; given up after 10 minutes of constant use."""
+        with _reload_lock:
+            if _reload_wait["pending"] or rebuild is None:
+                return
+            _reload_wait["pending"] = True
+
+        def operators_busy() -> bool:
+            # The watcher's own investigations run for long and in the background: they keep the agent they
+            # started with, so they do not hold a rebuild up.
+            with busy_guard:
+                return any(lk.locked() for k, lk in busy.items() if not str(k).startswith("canah-watch."))
+
+        def run():
+            try:
+                for _ in range(600):
+                    time.sleep(1.0)
+                    if operators_busy():
+                        continue
+                    old = ref["agent"]
+                    new = rebuild()
+                    ref["agent"] = new
+                    _reload_wait["pending"] = False      # the next change may ask for its own rebuild now
+                    if new.ops:
+                        new.ops.audit("agent reloaded", (who or Identity("canah-subagents", "admin")).user, "admin", "",
+                                      "reload", {"subagents": new.info.get("subagents"), "why": "a subagent kept or removed"})
+                    # The old agent is closed once nothing runs on it any more (an investigation may still be).
+                    for _ in range(3600):
+                        with busy_guard:
+                            if not any(lk.locked() for lk in busy.values()):
+                                break
+                        time.sleep(1.0)
+                    try:
+                        old.close()
+                    except Exception:  # noqa: BLE001
+                        logger.warning("closing the previous agent failed", exc_info=True)
+                    return
+                logger.warning("the agent was not rebuilt for a subagent change: operators kept it busy for 10 minutes")
+            except Exception:  # noqa: BLE001
+                logger.exception("rebuilding the agent for a subagent change failed")
+            finally:
+                _reload_wait["pending"] = False
+        threading.Thread(target=run, name="canah-reload-when-idle", daemon=True).start()
+
+    usub.RELOAD_SOON = reload_when_idle
+
+    @app.get("/subagents")
+    def list_subagents(c=Depends(caller)):
+        """The subagents: the ones operators kept from the chat (who, tools, until when) and the built-in ones."""
+        store = usub.Store(A().settings.home_path)
+        kept = store.list()
+        built = [n for n in (A().info.get("subagents") or []) if n not in {k["name"] for k in kept}]
+        return {"kept": [{k: v for k, v in s.items()} for s in kept], "built_in": built,
+                "reload_pending": _reload_wait["pending"]}
+
+    @app.delete("/subagents/{name}")
+    def delete_subagent(name: str, c=Depends(caller)):
+        who = admin(c)
+        try:
+            gone = usub.Store(A().settings.home_path).delete(name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not gone:
+            raise HTTPException(404, f"no kept subagent {name!r}")
+        if A().ops:
+            A().ops.audit("subagent removed", who.user, who.level, "", "subagents", {"name": name})
+        reload_when_idle(who)
+        return {"removed": name}
+
     # ----- skills: how the agent does a kind of task, written by operators in the console -----
 
     _SKILL = re.compile(r"[a-z][a-z0-9-]{1,48}")
@@ -1632,7 +1764,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         if not PAGE.is_file():
             return "<p>CANAH</p>"
         html = PAGE.read_text()
-        for name in ("app.js", "app.css", "live.js", "skills.js"):
+        for name in ("app.js", "app.css", "live.js", "skills.js", "twinview.js"):
             f = STATIC / name
             if f.is_file():
                 html = html.replace(f"/static/{name}\"", f"/static/{name}?v={int(f.stat().st_mtime)}\"")

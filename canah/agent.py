@@ -29,7 +29,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 from . import approval, backends, identity, mcp, models, subagents as sub
 from . import window
 from .notify import Notifier
-from .grounding import (DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, NumberCheck,
+from .grounding import (OWN_NAMES, limit_sendbacks, DelegationGuard, FollowThrough, GroundingGuard, KeepAnswer, LookFirst, MakeTheChange, NumberCheck,
                         QotRuns, StateCheck, TimeBudget)
 from .identity import OBSERVER, Identity
 from . import memory as mem
@@ -64,6 +64,7 @@ class CanahAgent:
     ops: Any = None
     twins: Any = None               # canah.twins.Registry: the digital twins and the one in use
     twin_checks: Any = None         # the checks they made, and operators' overrides
+    twin_precheck: Any = None       # twins.provider.Precheck: a proposed change tried in the twin while it waits
     providers: List[Any] = field(default_factory=list)   # the ToolProviders, for warm()
     lessons: Any = None             # canah.lessons.Lessons: what went wrong before
     notifier: Any = None            # canah.notify.Notifier: incidents and waiting approvals, to the channels
@@ -153,6 +154,12 @@ class CanahAgent:
                              context_used=run.get("context_tokens"), context_window=win,
                              ended=ended or run.get("ended") or ("waiting" if reply.pending else "answered"))
             for p in reply.pending:
+                if self.twin_precheck is not None:
+                    try:     # tried in the twin now, while it waits: the verdict shows on the approval card
+                        self.twin_precheck.start(p["name"], p.get("args") or {},
+                                                 {"thread": c.get("thread_id"), "user": c.get("user_id"), "agent": "CANAH"})
+                    except Exception:  # noqa: BLE001
+                        logger.debug("twin precheck", exc_info=True)
                 if self.ops.pending_since(c.get("thread_id"), p["name"]) is None:
                     self.ops.audit("proposed", c.get("user_id", ""), c.get("level", ""), c.get("thread_id", ""),
                                    p["name"], p.get("args"), message=p.get("description", ""))
@@ -288,6 +295,11 @@ class CanahAgent:
         # The start of each reply is held back while it could still be the look-first check's one word
         # KEEP, which never reaches the page; any other reply is let through from its first differing token.
         cur, held, passing = None, "", False
+        texted = False      # text streamed since the last tool call or check: a new model call now is a retry
+        said = ""           # the answer streamed so far (since the last tool call)
+        echo = ""           # the answer a check sent back: a rewrite that repeats it word for word is not shown again
+        redo = None         # that check's name, said to the page only once the rewrite differs from the answer
+        norm = lambda t: " ".join(t.split())                                    # noqa: E731
         for ns, mode, chunk in self.graph.stream(payload, cfg, stream_mode=["messages", "updates"], subgraphs=True):
             if mode == "messages":
                 msg, meta = chunk
@@ -296,22 +308,47 @@ class CanahAgent:
                     if not text:
                         continue
                     if msg.id != cur:
+                        if texted:
+                            # The same answer started again with nothing in between (a model call that failed and
+                            # was retried): what the failed one wrote is gone, not part of the answer.
+                            yield mode, {"type": "restart"}
+                            texted, said = False, ""
                         cur, held, passing = msg.id, "", False
                     if not passing:
                         held += text
                         if KEEP.startswith(held.strip().upper()):
                             continue
+                        if echo and norm(echo).startswith(norm(held)):
+                            continue           # so far the same answer again: the page keeps showing the one it has
                         passing, text, held = True, held, ""
+                        if redo is not None:   # it differs: the one on the page was a draft after all
+                            yield mode, {"type": "redo", "check": redo}
+                            redo, said = None, ""
+                        echo = ""
+                    texted = True
+                    said += text
                     yield mode, {"type": "token", "text": text}
                 continue
             for update in (chunk or {}).values() if isinstance(chunk, dict) else ():
                 for m in (update or {}).get("messages", []) if isinstance(update, dict) else ():
                     if not ns and isinstance(m, HumanMessage) and "check]" in str(m.content)[:40]:
-                        # A check sent the answer back: what streamed so far is a draft, not the answer.
-                        cur, held, passing = None, "", False
-                        yield mode, {"type": "redo", "check": str(m.content)[1:str(m.content).find("]")]}
+                        # A check sent the answer back. Whether what streamed was a draft shows in what comes next:
+                        # the same answer again (it stands, nothing on the page changes) or another one.
+                        cur, held, passing, texted = None, "", False, False
+                        logging.getLogger("canah.calls").info("check sent the answer back (%s): %s", cfg["configurable"].get("thread_id"),
+                                    " ".join(str(m.content).split())[:600])
+                        if redo is None:
+                            echo = said
+                        redo = str(m.content)[1:str(m.content).find("]")]
                         continue
                     if isinstance(m, AIMessage):
+                        if not ns and (m.tool_calls or str(m.content or "").strip()):
+                            texted = False     # a model call that ended (with its text, or its calls): not a retry
+                        if not ns and m.tool_calls:
+                            if redo is not None:   # it went to look something up: the answer on the page was a draft
+                                yield mode, {"type": "redo", "check": redo}
+                                redo, echo = None, ""
+                            said = ""
                         for c in m.tool_calls or []:
                             if c.get("id") not in seen_calls:
                                 seen_calls.add(c.get("id"))
@@ -407,6 +444,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     from .twins.registry import Registry
     twins = Registry(settings.home_path, settings.twins, settings.twin_active)
     twin_checks = Checks()
+    _precheck: Dict[str, Any] = {}
     twin_provider = [TwinsProvider(twins, settings.home_path, twin_checks)] if twins.entries() else []
     from .diagrams import DiagramProvider
     from .operations import OperationsProvider
@@ -463,8 +501,15 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     if team_specs and twin_provider:
         # The twin's own instructions are qot's to follow.
         team_specs[0]["system_prompt"] += "\n\n" + twin_provider[0].instructions()
-    specs = sub.resolve(team_specs + list(got["subagents"]) + list(extra_subagents) + sub.from_yaml(settings.subagents_file),
-                        tools)
+    # The subagents operators kept from the chat (user_subagents.py): a tool one names that is gone now is left
+    # out rather than failing the build; a name taken by a built-in one is skipped.
+    from . import user_subagents as usub
+    _kept_store = usub.Store(settings.home_path)
+    _declared = team_specs + list(got["subagents"]) + list(extra_subagents) + sub.from_yaml(settings.subagents_file)
+    _taken = {s["name"] for s in _declared} | {"general-purpose"}
+    _have = {t.name for t in tools}
+    _kept = [{**k, "tools": [n for n in k["tools"] if n in _have]} for k in _kept_store.specs() if k["name"] not in _taken]
+    specs = sub.resolve(_declared + _kept, tools)
     # Who may do what: on the main agent and in every subagent (identity.py).
     # deepagents adds a "general-purpose" subagent holding the main agent's
     # tools; declaring it here replaces that one, so it carries the roles too.
@@ -473,6 +518,9 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     large = LargeResults(limit=settings.large_result_chars, sandbox=sandbox,
                          folder=settings.home_path / "results" if sandbox is None else None)
     extra_mw = [*_load_middleware(settings.middleware), *list(middleware)]
+    if diagram_provider:
+        from .diagrams import PicturesOnRequest
+        extra_mw.insert(0, PicturesOnRequest())     # the drawing tools only when a picture is asked for
     _targets = [pv.write_target for pv in all_providers if hasattr(pv, "write_target")]
 
     def write_tool_of(name, args):
@@ -501,6 +549,8 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
                     return got
             return None
         extra_mw.append(make_gate(twins, twin_checks, lambda: approvals_set, resolve))
+        from .twins.provider import Precheck
+        _precheck["it"] = Precheck(twins, twin_checks, resolve, lambda: approvals_set)
     if not any(s["name"] == "general-purpose" for s in specs):
         specs.append({"name": "general-purpose",
                       "description": ("A general-purpose agent for a self-contained piece of work that needs several "
@@ -543,12 +593,12 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     for spec in specs:
         # Every subagent is held to the same checks as the main agent: a value a subagent invents
         # would otherwise reach the main agent looking like a tool result.
-        spec["middleware"] = [*_retry(), calls, scope, budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
+        spec["middleware"] = limit_sendbacks([*_retry(), calls, scope, budget, tracker, repeat, roles, screen, record, large, GroundingGuard(), FollowThrough(),
                               NumberCheck(), StateCheck(),
                               *list(spec.get("middleware") or []),
                               *(lessons_mw if spec["name"].endswith("-config") else []),
                               *([MakeTheChange(writes, controller_writes, write_tool_of)] if team_specs and spec["name"].endswith("-config") else []),
-                              *extra_mw]
+                              *extra_mw])
         if spec.get("tools") is not None and shared:
             have = {t.name for t in spec["tools"]}
             give = shared
@@ -603,6 +653,15 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
         hidden |= {"twin_schema", "twin_validate", "twin_predict", "twin_check_write", "twin_extra"}
     main_tools = [t for t in tools if t.name not in hidden]
     main_model = model or models.get("model")
+    # Subagents on request, from the chat: made for a task and gone, or kept until removed (user_subagents.py).
+    _maker = usub.Maker(_kept_store, tools, approvals, main_model,
+                        lambda: [*_retry(), calls, GroundingGuard(), FollowThrough(), NumberCheck(), StateCheck()],
+                        sorted(_taken), lambda: usub.RELOAD_SOON())
+    main_tools += _maker.make()
+    OWN_NAMES.update(t.name for t in tools)                     # naming its own tools and agents is not a claim
+    OWN_NAMES.update(s["name"] for s in specs)
+    OWN_NAMES.update(t.name for t in main_tools)
+    prompt += "\n\n" + usub.instructions()
     # The window in the model's profile, so compaction happens at compact_at of the real window.
     ctx_window = window.give_profile(main_model, settings.context_window)
     for sp in specs:
@@ -618,11 +677,12 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
             model=main_model,
             tools=main_tools,
             system_prompt=prompt,
-            middleware=[calls, scope, budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
+            middleware=limit_sendbacks([calls, scope, budget, tracker, repeat, roles, screen, record, guard_mem, large, GroundingGuard(), FollowThrough(),
                         KeepAnswer(), NumberCheck(), StateCheck(), *lessons_mw, *_retry(), *([DelegationGuard(config_agents=[s["name"] for s in specs if s["name"].endswith("-config")], locate=_locate,
                                              agent_of=_agent_of)] if team_specs else []), *_fallback(),
                         *([LookFirst()] if settings.look_first else []), *got.get("middleware", []), *extra_mw,
-                        *compact_mw],
+                        _maker.question_middleware(),
+                        *compact_mw]),
             subagents=specs or None,
             skills=skill_paths or None,
             memory=memory_paths or None,
@@ -662,7 +722,7 @@ def build_agent(settings: Optional[Settings] = None, providers: Sequence[Any] = 
     info["context"] = {"window": ctx_window, "compact_at": settings.compact_at, "compact_keep": settings.compact_keep,
                        "compact_tool": bool(compact_mw)}
     return CanahAgent(graph=graph, settings=settings, memory=memory, writes=approvals, info=info, sandbox=sandbox,
-                      interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks,
+                      interrupts=interrupts, ops=ops, twins=twins, twin_checks=twin_checks, twin_precheck=_precheck.get("it"),
                       providers=all_providers, model=main_model, lessons=_lessons.get("store"),
                       notifier=Notifier(settings.notify_channels, settings.notify_url, settings.console_url))
 

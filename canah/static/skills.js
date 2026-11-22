@@ -90,6 +90,43 @@ async function deleteSkill(name) {
   catch (err) { toast(err.message, "bad"); }
 }
 
+/* Subagents (Documents & memory page): the ones kept from the chat, to look at and remove when their use is done. */
+const sa = { data: null, sel: null };
+async function renderSubagents() {
+  try { sa.data = await api("/subagents"); } catch (e) { $("#sa-list").innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  const kept = sa.data.kept || [];
+  $("#kn-count-subagents").textContent = kept.length || "";
+  const until = (s) => s.expires_at ? `until ${new Date(s.expires_at * 1000).toLocaleString()}` : "until removed";
+  $("#sa-list").innerHTML = (kept.length ? `<div class="mem-user">Kept · made from the chat</div>` + kept.map((s) => `
+      <div class="mem-row sk-row${sa.sel === s.name ? " sel" : ""}" data-name="${esc(s.name)}">
+        <div class="p">${esc(s.name)} <span class="faint" style="font-size:11.5px">${esc(until(s))}</span></div>
+        <div class="pv">${esc(s.description)}</div></div>`).join("")
+    : `<div class="empty" style="padding:18px">None kept. A subagent made for one task is gone when it is done.</div>`)
+    + `<div class="mem-user">Built in</div>` + (sa.data.built_in || []).map((n) => `<div class="mem-row"><div class="p">${esc(n)}</div></div>`).join("")
+    + (sa.data.reload_pending ? `<div class="faint" style="padding:8px 12px;font-size:12px">A change is applied when the agent is next idle.</div>` : "");
+  $$("#sa-list .sk-row").forEach((el) => el.addEventListener("click", () => { sa.sel = el.dataset.name; renderSubagents(); showSubagent(); }));
+  if (sa.sel) showSubagent();
+}
+function showSubagent() {
+  const s = (sa.data?.kept || []).find((x) => x.name === sa.sel);
+  if (!s) { $("#sa-title").textContent = "A subagent"; return; }
+  $("#sa-title").textContent = s.name;
+  $("#sa-meta").textContent = `made by ${s.created_by || "?"} · ${new Date(s.created_at * 1000).toLocaleString()}`;
+  const admin = levelRank(state.level) >= 1;
+  $("#sa-detail").innerHTML = `<div class="kv"><div>when to use it</div><div>${esc(s.description)}</div>
+      <div>kept</div><div>${s.expires_at ? `until ${esc(new Date(s.expires_at * 1000).toLocaleString())}` : "until it is removed"}</div>
+      <div>tools</div><div class="mono" style="font-size:12px">${esc((s.tools || []).join(", "))}</div></div>
+    <div class="label" style="margin-top:12px">Instructions</div><div class="reply-rich">${md(s.system_prompt || "")}</div>
+    <div class="row" style="margin-top:12px">${admin ? `<button class="btn danger" id="sa-del">Remove it</button>` : `<span class="faint">Removing needs admin.</span>`}
+      <button class="btn" id="sa-ask">Use it in the chat</button></div>`;
+  $("#sa-del")?.addEventListener("click", async () => {
+    if (!confirm(`Remove ${s.name}? It is no longer available from the next question.`)) return;
+    try { await api(`/subagents/${encodeURIComponent(s.name)}`, { method: "DELETE" }); toast(`Removed ${s.name}.`, "ok"); sa.sel = null; $("#sa-detail").innerHTML = ""; renderSubagents(); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  $("#sa-ask").addEventListener("click", () => { go("chat"); $("#composer").value = `Ask ${s.name} to `; $("#composer").focus(); });
+}
+
 $("#sk-file").addEventListener("change", async (e) => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   const text = await f.text();

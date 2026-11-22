@@ -130,8 +130,46 @@ class DiagramProvider:
         return []
 
     def instructions(self) -> str:
-        return ("You can draw: for a flow, a scenario, a topology or an issue that a picture explains better than "
-                "words, call draw_diagram with Mermaid text, then put the same text in a ```mermaid block in your "
-                "answer (the console draws it) with the PNG link. Never say you cannot make images. When the operator "
-                "asks to change a diagram (they name it by its id, 16 hex digits), call get_diagram(id), change the "
-                "text as asked, and draw it again with draw_diagram(..., based_on=id).")
+        return ("Pictures only when the operator asks for one (draw, a diagram, a picture, an image, a chart, a "
+                "sketch). Then call draw_diagram with Mermaid text, keep it small (at most about 20 boxes, short "
+                "labels), and put the same text in a ```mermaid block in your answer (the console draws it) with the "
+                "PNG link. Otherwise answer in words and lists: no diagram and no ```mermaid block, however much a "
+                "picture might help. When the operator asks to change a diagram (they name it by its id, 16 hex "
+                "digits), call get_diagram(id), change the text as asked, and draw it again with "
+                "draw_diagram(..., based_on=id).")
+
+
+# What asks for a picture. "Show me the topology" does not: a list of what is where answers it.
+ASKS_PICTURE = re.compile(r"\b(draw\w*|diagrams?|pictures?|images?|sketch\w*|charts?|plot\w*|graphically|visuali[sz]\w*|"
+                          r"illustrat\w*|flow ?charts?|mermaid|png|svg)\b|\b[0-9a-f]{16}\b", re.I)
+_PICTURE_TOOLS = ("draw_diagram", "get_diagram")
+
+
+def asks_picture(text: str) -> bool:
+    return bool(ASKS_PICTURE.search(text or ""))
+
+
+class PicturesOnRequest:
+    """The drawing tools are offered to the model only when the question asks for a picture. Otherwise a model that
+    reaches for one anyway writes a long Mermaid call (cut short once, retried twice: 220 s for "show me the
+    topology"); not offered, it answers in words at once."""
+
+    def __new__(cls):
+        from langchain.agents.middleware import AgentMiddleware
+
+        class _Pictures(AgentMiddleware):
+            def _strip(self, request):
+                from .grounding import current_question
+                if asks_picture(current_question(list(getattr(request, "messages", []) or []))):
+                    return request
+                tools = [t for t in (request.tools or []) if getattr(t, "name", t.get("name") if isinstance(t, dict) else "")
+                         not in _PICTURE_TOOLS]
+                return request.override(tools=tools) if len(tools) != len(request.tools or []) else request
+
+            def wrap_model_call(self, request, handler):
+                return handler(self._strip(request))
+
+            async def awrap_model_call(self, request, handler):
+                return await handler(self._strip(request))
+        _Pictures.__name__ = "PicturesOnRequest"
+        return _Pictures()

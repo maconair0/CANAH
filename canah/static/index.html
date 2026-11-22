@@ -247,6 +247,7 @@
           <div class="lg-thread-list" id="thread-list"></div>
         </aside>
         <div class="lg-main">
+          <div class="tv-pop" id="tv-pop" aria-live="polite"></div>
           <div class="lg-head">
             <button class="btn sm ghost" id="threads-toggle" title="Hide or show the thread history">☰</button>
             <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
@@ -282,6 +283,7 @@
       <div class="row"><h2>Digital twins</h2><div style="flex:1"></div><span class="faint" id="tw-contract" style="font-size:12px"></span>
         <button class="btn sm" id="tw-refresh">Refresh</button></div>
       <p class="muted page-lead">A digital twin predicts what a change or a failure does to a network before the network sees it. CANAH asks the twin in use through one contract, so any twin that speaks it can be used: netwins, or your own. Changing the twin takes effect at the next question; the agent's tools stay the same.</p>
+      <div id="tw-now"></div>
       <div id="tw-active"></div>
       <div class="section-h"><h3>What the twin is working on</h3><span class="faint" id="tw-runs-note">its recent runs: the network it ran, the change, and what it predicted</span></div>
       <div class="twr-wrap">
@@ -358,8 +360,9 @@
       <div class="row"><h2>Incidents</h2><div class="spacer" style="flex:1"></div>
         <span class="faint" id="inc-watch" style="font-size:12px"></span><button class="btn sm" id="inc-poll" title="Read every controller now (admin)">Check now</button>
         <button class="btn sm" id="inc-refresh">Refresh</button></div>
-      <p class="muted page-lead">CANAH reads every controller through the common contract each minute. A controller it cannot read, a device,
-        link or service down, an alarm: each becomes an incident, sent to the notification channels, and resolved by itself when it clears.
+      <p class="muted page-lead">CANAH checks every controller every few seconds and reads it in full through the common contract twice a minute.
+        A controller it cannot read, a device, link or service down, an alarm, a measurement past its limit (pre-FEC BER, drops, errors):
+        each becomes an incident, sent to the notification channels, and resolved by itself when it clears.
         A runbook may have CANAH investigate, or rehearse a fix in the digital twin and propose it; a fix always waits for approval.</p>
       <div class="kpis" id="inc-kpis"></div>
       <div class="tabs" id="inc-tabs" role="tablist">
@@ -415,10 +418,10 @@
         <span class="faint" id="lv-when" style="font-size:12px"></span>
         <label class="switch-l" title="Read again every 10 s"><input type="checkbox" id="lv-auto" checked> live</label>
         <button class="btn sm" id="lv-refresh">Refresh</button></div>
-      <p class="muted page-lead">Every service, per network domain, as the controllers report it now through the agentic MCP, next to what the digital twin holds of each domain and what it last ran there.</p>
+      <p class="muted page-lead">Every service and how it performs, per network domain, as the controllers report it now through the agentic MCP: pre-FEC BER and OSNR on lightpaths, drops and utilisation on IP links, each against its limit, next to what the digital twin holds of each domain.</p>
       <div class="kpis hs" id="lv-kpis" style="margin-bottom:14px"></div>
-      <div class="row lv-tools"><input id="lv-filter" class="kn-filter" placeholder="Filter services: name, end, state" autocomplete="off">
-        <label class="switch-l"><input type="checkbox" id="lv-problems"> only what is not up</label></div>
+      <div class="row lv-tools"><input id="lv-filter" class="kn-filter" placeholder="Filter services and measured objects" autocomplete="off">
+        <label class="switch-l"><input type="checkbox" id="lv-problems"> only what is not up or out of limits</label></div>
       <div id="lv-domains"></div>
     </section>
 
@@ -432,6 +435,7 @@
         <button class="tab" data-tab="docs" role="tab">Documents <span class="count" id="kn-count-docs"></span></button>
         <button class="tab" data-tab="search" role="tab">Try a search</button>
         <button class="tab" data-tab="skills" role="tab">Skills <span class="count" id="kn-count-skills"></span></button>
+        <button class="tab" data-tab="subagents" role="tab">Subagents <span class="count" id="kn-count-subagents"></span></button>
         <button class="tab" data-tab="mem" role="tab">Long-term memories <span class="count" id="kn-count-mem"></span></button>
       </div>
 
@@ -488,6 +492,18 @@
         <input type="file" id="sk-file" accept=".md,text/markdown,text/plain" hidden>
       </div>
 
+      <div class="kn-pane" data-pane="subagents" hidden>
+        <div class="grid sk-grid">
+          <div class="card"><header><h3>Subagents</h3><div class="spacer"></div><span class="faint" style="font-size:11.5px">made from the chat</span></header>
+            <div class="body" style="padding:0" id="sa-list"></div></div>
+          <div class="card"><header><h3 id="sa-title">A subagent</h3><div class="spacer"></div><span class="faint" id="sa-meta" style="font-size:11.5px"></span></header>
+            <div class="body" id="sa-detail"><div class="empty">Ask in the chat for a subagent to do a task, for example <i>"Use a subagent
+              to check the span loss on every fibre and list the worst three."</i> It runs, reports, and is gone. Say <i>"and keep it"</i>
+              (or <i>"keep it for 24 hours"</i>) to keep it for later; kept ones are listed here, and you remove them here or by asking.
+              A subagent made this way only reads: changes stay with the config agents and your approval.</div></div></div>
+        </div>
+      </div>
+
       <div class="kn-pane" data-pane="mem" hidden>
         <div class="grid" style="grid-template-columns:minmax(0,340px) minmax(0,1fr);align-items:start">
           <div class="card"><header><h3>Memories</h3><div class="spacer"></div>
@@ -527,10 +543,56 @@
     <!-- About -->
     <section class="view" id="view-about">
       <div class="row"><h2>About &amp; shortcuts</h2></div>
+      <p class="muted page-lead">How to work with CANAH: what to set up, where to look, how to ask, and what happens when you ask for a change.</p>
+
+      <div class="card guide"><header><h3>How to use CANAH</h3><div class="spacer"></div><span class="faint" style="font-size:12px">in the order you will need it</span></header>
+        <div class="body"><ol class="guide-steps">
+          <li><h4>Connect the controllers</h4>
+            <p>CANAH reaches every SDN controller through the agentic MCP. On <a href="#" data-go="controllers">SDN controllers</a>, check that the agentic MCP answers and that each controller is <em>accepted</em> against the common contract. Root sets the address and token; admins add controllers under <em>Add controllers</em>.</p></li>
+          <li><h4>Look before you ask</h4>
+            <p><a href="#" data-go="topology">Topology</a> draws every domain and how they meet. <a href="#" data-go="live">Live network</a> lists every service with its state, and what the controllers measure: pre-FEC BER and OSNR on lightpaths, drops, errors and utilisation on IP links, each against its limit, with its trend. Click a measured row for its last 24 hours.</p></li>
+          <li><h4>Ask in plain words</h4>
+            <p>In <a href="#" data-go="chat">Chat</a>, ask about any network the agentic MCP holds. CANAH reads the controllers before it answers and every figure comes from a tool result; turn on the tool calls to see which. The right panel shows the agents that took part and how long each step took.</p></li>
+          <li><h4>Ask for a change, then approve it</h4>
+            <p>Ask for what you want ("set up a 100G lightpath from site-a to site-b"). CANAH plans it, hands each step to the config agent of its domain, and stops before any write: you see the exact call and approve or reject it. Admins approve changes; deletes, removals and restarts need root. After a change CANAH reads the network back to check it took.</p></li>
+          <li><h4>Rehearse in the digital twin</h4>
+            <p>For "what if" questions (a fibre cut, a new lightpath, a failed link), CANAH asks the twin before it answers. <a href="#" data-go="twins">Digital twins</a> shows what the twin ran, on which network and with what result. A route the twin draws for a question stays hypothetical: nothing is created from it.</p></li>
+          <li><h4>Let the watcher keep an eye out</h4>
+            <p>CANAH checks every controller every few seconds and reads everything twice a minute. A device, link or service down, an alarm, or a measurement past its limit opens an <a href="#" data-go="incidents">incident</a>. A runbook can have CANAH investigate it or propose a fix; a fix still waits for approval.</p></li>
+          <li><h4>Teach it</h4>
+            <p>Under <a href="#" data-go="knowledge">Documents &amp; memory</a>, add documents CANAH cites, and write <em>skills</em>: step-by-step instructions it follows when a question matches their description. A saved skill is used from the next question.</p></li>
+          <li><h4>Choose the model</h4>
+            <p><a href="#" data-go="model">Model &amp; providers</a> sets the language model: a local Ollama model or another provider. The change applies to the next question.</p></li>
+        </ol></div></div>
+
+      <div class="grid" style="grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);align-items:start">
+        <div class="card"><header><h3>Ask it like this</h3><div class="spacer"></div><span class="faint" style="font-size:12px">click one to put it in the chat</span></header>
+          <div class="body guide-ask">
+            <div class="label">Look</div>
+            <button class="ask-chip" data-ask="Which controllers do you hold, and are they all healthy?">Which controllers do you hold, and are they all healthy?</button>
+            <button class="ask-chip" data-ask="Is any lightpath close to its FEC limit? Show pre-FEC BER and Q margin.">Is any lightpath close to its FEC limit?</button>
+            <button class="ask-chip" data-ask="Which IP links are dropping packets, and what carries them?">Which IP links are dropping packets, and what carries them?</button>
+            <div class="label">Troubleshoot</div>
+            <button class="ask-chip" data-ask="Can h-a1 reach h-b1? If not, find where it stops and why.">Can h-a1 reach h-b1? If not, where does it stop?</button>
+            <button class="ask-chip" data-ask="What happened in the last hour, and what is still open?">What happened in the last hour, and what is still open?</button>
+            <div class="label">Change</div>
+            <button class="ask-chip" data-ask="Connect site-a and site-c over optical at 100G and check IP runs over it.">Connect site-a and site-c over optical and run IP over it.</button>
+            <div class="label">What if</div>
+            <button class="ask-chip" data-ask="If fibre F-ab is cut, does every lightpath keep 3 dB of margin after restoration?">If fibre F-ab is cut, does every lightpath keep its margin?</button>
+          </div></div>
+        <div class="card"><header><h3>Good to know</h3></header><div class="body"><ul class="guide-notes">
+          <li><b>Observers</b> can look and ask, but cannot change anything. <b>Admins</b> approve changes. <b>Root</b> also approves deletes and restarts. See <a href="#" data-go="identity">Profile &amp; access</a>.</li>
+          <li>Nothing changes in a network without an approval, whoever or whatever asks: a runbook, the watcher or another agent.</li>
+          <li>If a controller does not publish something (measurements, sites, hosts), CANAH says so rather than guess.</li>
+          <li>Every approved change is in the <a href="#" data-go="ops">audit log</a>, with who asked, who approved and what came back.</li>
+          <li>Right-click a thread in the chat history to pin, rename or delete it.</li>
+        </ul></div></div>
+      </div>
+
       <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start">
         <div class="card"><header><h3>CANAH</h3></header><div class="body" id="about-body"></div></div>
         <div class="card"><header><h3>Keyboard</h3></header><div class="body"><div class="kv">
-          <div><span class="kbd">g</span> then <span class="kbd">t c h a k</span></div><div>topology, controllers, chat, approvals, knowledge</div>
+          <div><span class="kbd">g</span> then <span class="kbd">t c h a w k</span></div><div>topology, controllers, chat, approvals, twins, knowledge</div>
           <div><span class="kbd">[</span> <span class="kbd">]</span></div><div>hide or show the menu, the right panel</div>
           <div><span class="kbd">+</span> <span class="kbd">−</span> <span class="kbd">0</span></div><div>zoom the topology in, out, fit</div>
           <div><span class="kbd">e</span></div><div>open or fold every controller</div>
@@ -548,5 +610,6 @@
 <script src="/static/app.js"></script>
 <script src="/static/live.js"></script>
 <script src="/static/skills.js"></script>
+<script src="/static/twinview.js"></script>
 </body>
 </html>
