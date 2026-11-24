@@ -86,6 +86,7 @@
     <button data-view="knowledge"><span class="ico">❏</span>Documents &amp; memory</button>
     <div class="section">Account</div>
     <button data-view="identity"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="4.5" r="2.7"/><path d="M1.8 13c.6-2.9 2.7-4.4 5.2-4.4s4.6 1.5 5.2 4.4"/></svg></span>Profile &amp; access</button>
+    <button data-view="tutorials"><span class="ico"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="2.5" width="12" height="9" rx="1.8"/><path d="M5.8 5.2v3.6L8.9 7z" fill="currentColor" stroke="none"/></svg></span>Tutorials &amp; guides</button>
     <button data-view="about"><span class="ico">?</span>About &amp; shortcuts</button>
     <div class="navfoot">
       <img class="for-light" src="/static/logo-light.png" alt=""><img class="for-dark" src="/static/logo-dark.png" alt="">
@@ -541,6 +542,28 @@
     </section>
 
     <!-- About -->
+    <section class="view" id="view-tutorials">
+      <div class="row"><h2>Tutorials &amp; guides</h2></div>
+      <p class="muted page-lead">Short videos of the console doing it, step by step, and the documents behind each task: the manifest format, a
+        template and a worked example, the controllers' manifests and the common contract.</p>
+      <div class="tut-grid">
+        <div class="card tut-player"><header><h3 id="tut-title">A tutorial</h3><div class="spacer"></div><span class="faint" id="tut-meta" style="font-size:12px"></span></header>
+          <div class="body"><video id="tut-video" controls preload="metadata" playsinline></video>
+            <p class="muted" id="tut-about" style="margin:10px 0 0"></p></div></div>
+        <div class="card tut-steps"><header><h3>Steps</h3><div class="spacer"></div><span class="faint" style="font-size:12px">click one to go there</span></header>
+          <div class="body" style="padding:0"><ol id="tut-chapters"></ol></div></div>
+      </div>
+      <div class="section-h"><h3>All tutorials</h3></div>
+      <div class="tut-list" id="tut-list"></div>
+      <div class="section-h"><h3>Support documents</h3><span class="faint">from the agentic MCP in use, and from CANAH</span></div>
+      <div class="grid doc-grid">
+        <div class="card"><div class="body" style="padding:0" id="doc-list"></div></div>
+        <div class="card"><header><h3 id="doc-title">A document</h3><div class="spacer"></div>
+            <button class="btn sm" id="doc-download" hidden>Download</button></header>
+          <div class="body" id="doc-view"><div class="empty">Choose a document to read it here.</div></div></div>
+      </div>
+    </section>
+
     <section class="view" id="view-about">
       <div class="row"><h2>About &amp; shortcuts</h2></div>
       <p class="muted page-lead">How to work with CANAH: what to set up, where to look, how to ask, and what happens when you ask for a change.</p>
@@ -548,7 +571,7 @@
       <div class="card guide"><header><h3>How to use CANAH</h3><div class="spacer"></div><span class="faint" style="font-size:12px">in the order you will need it</span></header>
         <div class="body"><ol class="guide-steps">
           <li><h4>Connect the controllers</h4>
-            <p>CANAH reaches every SDN controller through the agentic MCP. On <a href="#" data-go="controllers">SDN controllers</a>, check that the agentic MCP answers and that each controller is <em>accepted</em> against the common contract. Root sets the address and token; admins add controllers under <em>Add controllers</em>.</p></li>
+            <p>CANAH reaches every SDN controller through the agentic MCP. On <a href="#" data-go="controllers">SDN controllers</a>, check that the agentic MCP answers and that each controller is <em>accepted</em> against the common contract. Root sets the address and token; admins add controllers under <em>Add controllers</em>. <a href="#" data-go="tutorials">Tutorials &amp; guides</a> shows it done, in video.</p></li>
           <li><h4>Look before you ask</h4>
             <p><a href="#" data-go="topology">Topology</a> draws every domain and how they meet. <a href="#" data-go="live">Live network</a> lists every service with its state, and what the controllers measure: pre-FEC BER and OSNR on lightpaths, drops, errors and utilisation on IP links, each against its limit, with its trend. Click a measured row for its last 24 hours.</p></li>
           <li><h4>Ask in plain words</h4>
@@ -611,5 +634,6 @@
 <script src="/static/live.js"></script>
 <script src="/static/skills.js"></script>
 <script src="/static/twinview.js"></script>
+<script src="/static/help.js"></script>
 </body>
 </html>

@@ -1,0 +1,149 @@
+{
+ "controller": {
+  "title": "Add a controller with its manifest",
+  "about": "Install the manifest of a new kind of controller, onboard a controller of that kind and give it its agent.",
+  "file": "controller.webm",
+  "seconds": 94.5,
+  "chapters": [
+   {
+    "t": 2.9,
+    "step": 1,
+    "text": "A controller is added through the agentic MCP. For a kind it does not know yet, first give it the controller's <i>manifest</i>: a YAML file describing its API."
+   },
+   {
+    "t": 10.4,
+    "step": 2,
+    "text": "Under <b>A new kind of controller</b>: <b>Upload a manifest</b>. Here, metro.yaml, the example in the agentic MCP's repository (manifests/example)."
+   },
+   {
+    "t": 19.4,
+    "step": 3,
+    "text": "Installed: <b>Example metro controller</b> is now among the kinds it knows."
+   },
+   {
+    "t": 22.7,
+    "step": 4,
+    "text": "Then onboard the controller itself, under <b>Onboard one by its address</b>: a key, a label and its base URL."
+   },
+   {
+    "t": 32.6,
+    "step": 5,
+    "text": "Kind: leave it on <b>recognise it from its API</b>: the agentic MCP reads the controller's API and matches it to the manifest just installed. With a password, give the <i>names</i> of the variables that hold the credentials (in controllers.env), never the secrets."
+   },
+   {
+    "t": 41.4,
+    "step": 6,
+    "text": "Onboarded, and checked against the common contract: its verdict and any gaps."
+   },
+   {
+    "t": 45.4,
+    "step": 7,
+    "text": "<b>Reload CANAH</b> gives it its agent: CANAH can now read it and work it."
+   },
+   {
+    "t": 61.6,
+    "step": 8,
+    "text": "Its detail: which parts of the contract it covers, with which of its own operations, and what it lacks."
+   },
+   {
+    "t": 66.1,
+    "step": 9,
+    "text": "Done: ask CANAH about it in the chat, like any other controller."
+   }
+  ],
+  "recorded": "2026-11-24"
+ },
+ "guide": {
+  "title": "Draft a manifest from a user guide",
+  "about": "When a controller has no manifest: let the agentic MCP draft one from its user guide or API document.",
+  "file": "guide.webm",
+  "seconds": 45.6,
+  "chapters": [
+   {
+    "t": 2.9,
+    "step": 1,
+    "text": "No manifest for a controller? The agentic MCP can draft one from the controller's <i>user guide</i> or API document (text, Markdown, HTML, OpenAPI or PDF)."
+   },
+   {
+    "t": 10.3,
+    "step": 2,
+    "text": "Under <b>A new kind of controller</b>, name the kind the guide is for\u2026"
+   },
+   {
+    "t": 15.2,
+    "step": 3,
+    "text": "\u2026then <b>Upload a document</b>: here the example's user guide (manifests/example/metro-user-guide.md)."
+   },
+   {
+    "t": 21.9,
+    "step": 4,
+    "text": "A manifest for <b>metro2</b> was drafted: it is among the kinds it knows. A draft states no verb on its own: onboard with this kind, then check its verdict."
+   },
+   {
+    "t": 27.3,
+    "step": 5,
+    "text": "Then onboard the controller as in the previous tutorial: the agentic MCP matches it to the drafted manifest."
+   },
+   {
+    "t": 30.8,
+    "step": 6,
+    "text": "Done."
+   }
+  ],
+  "recorded": "2026-11-24"
+ },
+ "contract": {
+  "title": "Change the common contract",
+  "about": "Load a contract file, check what it changes for every controller, and apply it.",
+  "file": "contract.webm",
+  "seconds": 71.5,
+  "chapters": [
+   {
+    "t": 2.8,
+    "step": 1,
+    "text": "The <i>common contract</i> is the list of verbs (read devices, read links, provision\u2026) every controller is checked against. It is on the <b>SDN controllers</b> page."
+   },
+   {
+    "t": 9.4,
+    "step": 2,
+    "text": "On the left, the contract in use: its parts and their verbs, and the file the agentic MCP keeps it in."
+   },
+   {
+    "t": 15.2,
+    "step": 3,
+    "text": "To change it, edit it on the right, or load a contract file (JSON)."
+   },
+   {
+    "t": 20.7,
+    "step": 4,
+    "text": "The file is loaded into the editor. Nothing has changed yet."
+   },
+   {
+    "t": 23.9,
+    "step": 5,
+    "text": "<b>Check</b> first: it shows what each controller's verdict would become under this contract, without changing anything."
+   },
+   {
+    "t": 32.2,
+    "step": 6,
+    "text": "Each controller's verdict under the new contract, beside the current one: changes are highlighted."
+   },
+   {
+    "t": 36.2,
+    "step": 7,
+    "text": "<b>Apply</b> makes it the contract (root only). The agentic MCP keeps the previous one as a backup."
+   },
+   {
+    "t": 44.5,
+    "step": 8,
+    "text": "Applied: its version, its parts and verbs, what was added or removed, and where the backup is."
+   },
+   {
+    "t": 48.6,
+    "step": 9,
+    "text": "Every controller is checked against the new contract from now on. Done."
+   }
+  ],
+  "recorded": "2026-11-24"
+ }
+}

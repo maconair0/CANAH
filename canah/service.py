@@ -70,6 +70,7 @@ logger = logging.getLogger("canah.service")
 SESSION_TTL_S = float(os.getenv("CANAH_SESSION_TTL_S", "28800"))
 SESSION_IDLE_S = float(os.getenv("CANAH_SESSION_IDLE_S", "7200"))
 STATIC = Path(__file__).resolve().parent / "static"
+ROOT = Path(__file__).resolve().parent.parent          # the repository: docs/, scripts/
 PAGE = STATIC / "index.html"
 
 
@@ -1575,6 +1576,82 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
             new.ops.audit("agent reloaded", who.user, who.level, "", "reload", {"subagents": new.info.get("subagents")})
         return {"reloaded": True, "subagents": new.info.get("subagents"), "tools": new.info.get("tools")}
 
+    # ----- tutorials and support documents (the Tutorials & guides page) -----
+
+    def _amcp_dir() -> Optional[Path]:
+        """The deployed agentic MCP's code (scripts/agentic_mcp.py decides where), for its documents."""
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("canah_amcp_deploy", str(ROOT / "scripts" / "agentic_mcp.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            d = Path(mod.config()["dir"])
+            return d if d.is_dir() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def help_docs() -> List[Dict[str, Any]]:
+        """Every support document there is, from the deployed agentic MCP and from CANAH, as (id, title, group, path)."""
+        out: List[Dict[str, Any]] = []
+        a = _amcp_dir()
+
+        def add(doc_id: str, title: str, group: str, path: Optional[Path], about: str = "") -> None:
+            if path is not None and path.is_file():
+                out.append({"id": doc_id, "title": title, "group": group, "path": path, "about": about,
+                            "kind": path.suffix.lstrip(".").lower() or "txt", "bytes": path.stat().st_size})
+        if a is not None:
+            add("manifest-format", "The manifest format", "Adding a controller", a / "MANIFEST_FORMAT.md",
+                "What a controller manifest holds: its API, its verbs, auth, defaults; every field explained.")
+            add("manifest-template", "Manifest template", "Adding a controller", a / "manifests" / "example" / "template.yaml",
+                "A blank manifest to fill in for a new kind of controller.")
+            add("manifest-example", "Example manifest: metro", "Adding a controller", a / "manifests" / "example" / "metro.yaml",
+                "The manifest used in the tutorial: a complete, working one.")
+            add("guide-example", "Example user guide: metro", "Adding a controller", a / "manifests" / "example" / "metro-user-guide.md",
+                "A controller's user guide, as the agentic MCP drafts a manifest from it.")
+            add("manifest-schema", "Manifest JSON schema", "Adding a controller", a / "agentic_mcp" / "manifest.schema.json",
+                "The schema every manifest is validated against.")
+            for f in sorted((a / "manifests").glob("*.yaml")):
+                add(f"manifest-{f.stem}", f"Manifest: {f.stem}", "Manifests of the lab's controllers", f)
+            add("contract-default", "The contract the agentic MCP comes with", "The common contract", a / "agentic_mcp" / "contract.json",
+                "The verbs every controller is checked against, as shipped.")
+            add("amcp-guide", "The agentic MCP's guide", "The agentic MCP", a / "docs" / "GUIDE.md")
+            add("amcp-readme", "The agentic MCP: overview", "The agentic MCP", a / "README.md")
+        try:
+            got = mcp_send("GET", "/contract", timeout=5)
+            f = Path(str(got.get("file") or ""))
+            add("contract-in-use", "The contract in use now", "The common contract", f, "The one every controller is checked against today.")
+        except Exception:  # noqa: BLE001 - the agentic MCP not answering: the shipped one is still listed
+            pass
+        add("canah-guide", "CANAH's guide", "CANAH", ROOT / "docs" / "GUIDE.md", "Everything CANAH does, and how to set it up.")
+        add("twin-contract", "The digital twin contract", "CANAH", ROOT / "docs" / "TWIN_CONTRACT.md")
+        add("deploy-amcp", "Deploying the agentic MCP: settings", "CANAH", ROOT / "agentic_mcp.example.yaml",
+            "Which agentic MCP start.sh deploys, and the controllers it onboards.")
+        add("controllers-env", "Controllers' credentials: example", "CANAH", ROOT / "controllers.env.example",
+            "The file that holds the credentials, by variable name.")
+        return out
+
+    @app.get("/help/tutorials")
+    def help_tutorials(c=Depends(caller)):
+        f = STATIC / "tutorials" / "tutorials.json"
+        try:
+            items = json.loads(f.read_text())
+        except (OSError, ValueError):
+            items = {}
+        return {"tutorials": [{"id": k, **v, "url": f"/static/tutorials/{v['file']}"} for k, v in items.items()
+                              if (STATIC / "tutorials" / v.get("file", "")).is_file()]}
+
+    @app.get("/help/docs")
+    def help_doc_list(c=Depends(caller)):
+        return {"docs": [{k: v for k, v in d.items() if k != "path"} for d in help_docs()]}
+
+    @app.get("/help/docs/{doc_id}")
+    def help_doc(doc_id: str, c=Depends(caller)):
+        d = next((x for x in help_docs() if x["id"] == doc_id), None)
+        if d is None:
+            raise HTTPException(404, "no such document")
+        text = d["path"].read_text(errors="replace")
+        return {"id": d["id"], "title": d["title"], "kind": d["kind"], "name": d["path"].name, "text": text[:400000]}
+
     # ----- subagents operators made from the chat (user_subagents.py) -----
 
     from . import user_subagents as usub
@@ -1764,7 +1841,7 @@ def create_app(agent: CanahAgent, accounts: Optional[Accounts] = None, topology:
         if not PAGE.is_file():
             return "<p>CANAH</p>"
         html = PAGE.read_text()
-        for name in ("app.js", "app.css", "live.js", "skills.js", "twinview.js"):
+        for name in ("app.js", "app.css", "live.js", "skills.js", "twinview.js", "help.js"):
             f = STATIC / name
             if f.is_file():
                 html = html.replace(f"/static/{name}\"", f"/static/{name}?v={int(f.stat().st_mtime)}\"")

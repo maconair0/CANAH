@@ -115,7 +115,7 @@ setInterval(() => { $("#st-clock").textContent = new Date().toLocaleTimeString()
 $("#st-ctl").addEventListener("click", () => go("controllers"));
 
 /* ================= router ================= */
-const VIEWS = ["live", "incidents", "model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "about"];
+const VIEWS = ["live", "incidents", "model", "topology", "controllers", "chat", "ops", "twins", "knowledge", "identity", "tutorials", "about"];
 function go(view, first = false) {
   if (!VIEWS.includes(view)) view = "topology";
   state.view = view; store.set("canah.view", view);
@@ -138,6 +138,7 @@ function go(view, first = false) {
   if (view === "knowledge") renderKnowledge();
   if (view === "identity") renderIdentity();
   if (view === "about") renderAbout();
+  if (view === "tutorials" && typeof renderTutorials === "function") renderTutorials();
   if ((view === "twins" || view === "chat") && typeof twinNowLoop === "function") twinNowLoop();
   if (view !== "chat") $("#tv-pop")?.classList.remove("show");
   if (view === "model") renderModel();
@@ -782,8 +783,9 @@ $("#ob-batch").addEventListener("change", async (e) => {
 $("#ctl-refresh").addEventListener("click", () => { renderControllers(true); loadTopology(true); });
 
 let kindsAt = 0;
-async function loadKinds() {
-  if (Date.now() - kindsAt < 60000) return;
+async function loadKinds(force = false) {
+  // Cached a minute; a manifest just installed or drafted asks again at once (it was missing from Kind).
+  if (!force && Date.now() - kindsAt < 60000) return;
   kindsAt = Date.now();
   try {
     const k = await api("/network/kinds");
@@ -797,7 +799,10 @@ function onboardAllowed() {
   const ok = levelRank(state.level) >= 1;
   $$("#onboard-form input, #onboard-form select, #onboard-form button, #onboard-card label.btn input, #ob-guide-kind").forEach((x) => x.disabled = !ok);
   $$("#onboard-card label.btn").forEach((x) => x.classList.toggle("disabled", !ok));
-  $("#ob-msg").textContent = ok ? "" : "Sign in as admin to onboard.";
+  // Only its own notice is cleared: the result of an onboarding (verdict, the reload button) was wiped by the
+  // refresh that follows it.
+  const msg = $("#ob-msg"), NOTE = "Sign in as admin to onboard.";
+  if (!ok) msg.textContent = NOTE; else if (msg.textContent === NOTE) msg.textContent = "";
   $("#ctl-reload").disabled = !ok;
 }
 $("#onboard-form").addEventListener("submit", async (e) => {
@@ -828,14 +833,14 @@ $("#ctl-reload").addEventListener("click", reloadAgent);
 async function fileB64(file) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1] || ""); r.onerror = rej; r.readAsDataURL(file); }); }
 $("#ob-manifest").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return; e.target.value = "";
-  try { const r = await api("/network/manifests", { method: "POST", body: { name: f.name, content_base64: await fileB64(f) } }); toast(`Manifest installed: ${JSON.stringify(r.installed || r).slice(0, 160)}`, "ok"); loadKinds(); }
+  try { const r = await api("/network/manifests", { method: "POST", body: { name: f.name, content_base64: await fileB64(f) } }); const k = (r.installed || []).map((x) => x.title || x.kind).join(", "); toast(k ? `Manifest installed: ${k}. Pick it under Kind.` : `Manifest installed: ${JSON.stringify(r).slice(0, 160)}`, "ok"); loadKinds(true); }
   catch (err) { toast(err.message, "bad"); }
 });
 $("#ob-guide").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return; e.target.value = "";
   const kind = $("#ob-guide-kind").value.trim(); if (!kind) { toast("Say which kind of controller the guide is for.", "warn"); return; }
   toast(`Drafting a manifest for ${kind} from ${f.name}…`);
-  try { await api("/network/guides", { method: "POST", body: { kind, name: f.name, content_base64: await fileB64(f) } }); toast(`A manifest for ${kind} was drafted; pick it under Kind.`, "ok"); loadKinds(); }
+  try { await api("/network/guides", { method: "POST", body: { kind, name: f.name, content_base64: await fileB64(f) } }); toast(`A manifest for ${kind} was drafted; pick it under Kind.`, "ok"); loadKinds(true); }
   catch (err) { toast(err.message, "bad"); }
 });
 function controllerDetail(key) {
