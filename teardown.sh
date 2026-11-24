@@ -65,7 +65,7 @@ stop() {   # stop <name> <pid file>
 say "Stopping CANAH"
 stop "service" "$RUN/canah.pid"
 stop "testbed domains" "$RUN/testbed.pid"
-# Only an agentic MCP start.sh started (its pid file); one started elsewhere (edgeLM's startup.sh) is left running.
+# Only the agentic MCP start.sh started (its pid file); one running for another system is left alone.
 stop "agentic MCP" "$RUN/agentic-mcp.pid"
 rm -f "$RUN/canah.url" "$RUN/testbed.url"
 

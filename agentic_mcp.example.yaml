@@ -1,0 +1,27 @@
+# The agentic MCP that start.sh deploys and runs next to CANAH. Copy to agentic_mcp.yaml (not committed) and
+# fill in. Nothing here is a secret: credentials are named, and their values are in controllers.env.
+
+repo: https://github.com/maconair0/agentic-mcp.git
+ref: main              # the branch (or tag) to run; each start fast-forwards to its latest (update: false to pin)
+update: true
+# Where its code, Python environment and data go (default: under $CANAH_HOME/agentic-mcp/).
+# dir: ~/agentic-mcp-deploy/src
+# venv: ~/agentic-mcp-deploy/venv
+# data: /var/lib/agentic-mcp
+# The controllers' credentials (NAME=value lines). Default: controllers.env next to start.sh.
+# env_file: /etc/canah/controllers.env
+
+# The kinds of controller it knows, as manifests: a path in its repository, or a file of your own.
+manifests:
+  - manifests/example/metro.yaml
+
+# The controllers to onboard. One already onboarded is kept as it is (remove it with
+# `python -m agentic_mcp remove <key>` to onboard it again). user_env/password_env: the NAMES of the variables
+# in env_file that hold its credentials.
+controllers:
+  - key: metro
+    label: Metro
+    kind: metro
+    url: http://127.0.0.1:9100/api
+    # user_env: METRO_USER
+    # password_env: METRO_PASSWORD
