@@ -3,6 +3,7 @@
 #
 #   ./start.sh                     start (http://127.0.0.1:8350)
 #   ./start.sh --testbed           also start the emulated domains (packet, optical, fabric) and point the agent at them
+#   ./start.sh --no-agentic-mcp    do not start the agentic MCP (by default it is started when it is not running)
 #   ./start.sh --port 9000 --host 0.0.0.0 [--tls-cert F --tls-key F]
 #   ./start.sh --no-sandbox        without the Docker sandbox
 #   ./start.sh --foreground        run in this terminal (ctrl-c stops it); logs go to the screen
@@ -24,6 +25,7 @@ FOREGROUND=0
 TLS_CERT=""
 TLS_KEY=""
 STATUS=0
+AGENTIC=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,7 +38,8 @@ while [ $# -gt 0 ]; do
     --tls-cert) TLS_CERT="$2"; shift 2 ;;
     --tls-key) TLS_KEY="$2"; shift 2 ;;
     --status) STATUS=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-agentic-mcp) AGENTIC=0; shift ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (see ./start.sh --help)"; exit 2 ;;
   esac
 done
@@ -67,10 +70,27 @@ mkdir -p "$RUN" "$LOGS"
 
 alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
+# ----- the agentic MCP: where it is, and how to run it -----
+# CANAH reaches every controller through it (AGENTIC_MCP_URL). When that address is on this machine and nothing
+# answers there, start.sh runs it: by default edgeLM's connector, which keeps the onboarded controllers under
+# its connector/data and opens a session with each when it starts. For the standalone repository instead:
+# AGENTIC_MCP_DIR=~/agentic-mcp AGENTIC_MCP_MODULE=agentic_mcp AGENTIC_MCP_PY=<its python>.
+export AGENTIC_MCP_URL="${AGENTIC_MCP_URL:-http://127.0.0.1:8400}"
+AGENTIC_MCP_DIR="${AGENTIC_MCP_DIR:-$HOME/tfs-ctrl/src/tests/edgeLM}"
+AGENTIC_MCP_PY="${AGENTIC_MCP_PY:-$AGENTIC_MCP_DIR/.venvs/central/bin/python}"
+AGENTIC_MCP_MODULE="${AGENTIC_MCP_MODULE:-connector}"
+# Its controllers' addresses and credentials, and its token, are in this file (read by the agentic MCP itself).
+AGENTIC_MCP_ENV="${AGENTIC_MCP_ENV:-$AGENTIC_MCP_DIR/controllers.env}"
+AMCP_HOSTPORT="${AGENTIC_MCP_URL#*://}"; AMCP_HOSTPORT="${AMCP_HOSTPORT%%/*}"
+AMCP_HOST="${AMCP_HOSTPORT%%:*}"; AMCP_PORT="${AMCP_HOSTPORT##*:}"; [ "$AMCP_PORT" = "$AMCP_HOSTPORT" ] && AMCP_PORT=80
+amcp_up() { curl -s -m 2 "$AGENTIC_MCP_URL/health" >/dev/null 2>&1; }
+
 if [ "$STATUS" = 1 ]; then
   say "Controller Agnostic Networked Agent Harness (C.A.N.A.H)"
   if alive "$RUN/canah.pid"; then ok "service: pid $(cat "$RUN/canah.pid"), $(cat "$RUN/canah.url" 2>/dev/null)"; else warn "service: not running"; fi
   if alive "$RUN/testbed.pid"; then ok "testbed domains: pid $(cat "$RUN/testbed.pid"), $(cat "$RUN/testbed.url" 2>/dev/null)"; else warn "testbed domains: not running"; fi
+  if amcp_up; then ok "agentic MCP: $AGENTIC_MCP_URL$(alive "$RUN/agentic-mcp.pid" && echo ", pid $(cat "$RUN/agentic-mcp.pid") (started by start.sh)" || echo " (started elsewhere)")"
+  else warn "agentic MCP: not answering at $AGENTIC_MCP_URL"; fi
   n=$(docker --context "${CANAH_DOCKER_CONTEXT:-default}" ps -q --filter label=canah.sandbox=1 2>/dev/null | wc -l || echo 0)
   ok "sandbox containers running: $n"
   exit 0
@@ -184,6 +204,51 @@ if [ "$TESTBED" = 1 ]; then
   export AGENTIC_MCP_TOKEN=""
   # The test bed's own context and skills, alongside the harness's.
   export CANAH_TESTBED=1
+fi
+
+# ----- the agentic MCP (not with the test bed, which stands in for it) -----
+if [ "$TESTBED" = 0 ] && [ "$AGENTIC" = 1 ]; then
+  if amcp_up; then
+    ok "agentic MCP: already answering at $AGENTIC_MCP_URL"
+  elif [ "$AMCP_HOST" != 127.0.0.1 ] && [ "$AMCP_HOST" != localhost ]; then
+    warn "agentic MCP: $AGENTIC_MCP_URL is not answering, and it is on another host: start it there"
+  elif [ ! -x "$AGENTIC_MCP_PY" ] || [ ! -d "$AGENTIC_MCP_DIR" ]; then
+    warn "agentic MCP: not started: no $AGENTIC_MCP_PY (set AGENTIC_MCP_DIR / AGENTIC_MCP_PY in .env)"
+  else
+    # Its controllers.env fills in what this environment has not set, for it alone: the controllers'
+    # credentials stay in its process. CANAH's own AGENTIC_MCP_TOKEN, if set, is the one it gets, so the
+    # two always agree; if CANAH has none, the one in controllers.env is passed to CANAH below.
+    (
+      cd "$AGENTIC_MCP_DIR"
+      if [ -f "$AGENTIC_MCP_ENV" ]; then
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+          case "$key" in ''|'#'*) continue ;; esac
+          key="${key%% *}"; value="${value%%#*}"; value="${value%"${value##*[![:space:]]}"}"
+          [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+          [ -z "${!key:-}" ] && export "$key=$value"
+        done < "$AGENTIC_MCP_ENV"
+      fi
+      printf '\n===== agentic MCP started %s by CANAH start.sh =====\n' "$(date -Is)" >>"$LOGS/agentic-mcp.log"
+      exec setsid nohup "$AGENTIC_MCP_PY" -m "$AGENTIC_MCP_MODULE" serve --port "$AMCP_PORT" >>"$LOGS/agentic-mcp.log" 2>&1 </dev/null
+    ) &
+    echo $! >"$RUN/agentic-mcp.pid"
+    for _ in $(seq 80); do amcp_up && break; alive "$RUN/agentic-mcp.pid" || break; sleep 0.5; done
+    if amcp_up; then
+      held="$(curl -s -m 5 "$AGENTIC_MCP_URL/controllers" 2>/dev/null | "$PY" -c "import json,sys
+d=json.load(sys.stdin); rows=d.get('controllers', d) if isinstance(d, dict) else d
+print(', '.join(str(r.get('key') or r.get('controller') or r) for r in rows) if isinstance(rows, list) else '')" 2>/dev/null || true)"
+      ok "agentic MCP: started on $AGENTIC_MCP_URL (pid $(cat "$RUN/agentic-mcp.pid"))${held:+, holding $held}; log: $LOGS/agentic-mcp.log"
+    else
+      rm -f "$RUN/agentic-mcp.pid"
+      warn "agentic MCP: did not answer at $AGENTIC_MCP_URL (see $LOGS/agentic-mcp.log); CANAH starts without it"
+    fi
+  fi
+  # The token both sides use: CANAH's own (.env), or else the agentic MCP's (its controllers.env).
+  if [ -z "${AGENTIC_MCP_TOKEN:-}" ] && [ -f "$AGENTIC_MCP_ENV" ]; then
+    t="$(sed -n 's/^AGENTIC_MCP_TOKEN=//p' "$AGENTIC_MCP_ENV" | tail -1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+    [ -n "$t" ] && export AGENTIC_MCP_TOKEN="$t" && ok "agentic MCP token: taken from $AGENTIC_MCP_ENV"
+    unset t
+  fi
 fi
 
 # ----- accounts -----

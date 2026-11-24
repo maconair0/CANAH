@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stop what ./start.sh started: the service (and its web page), the testbed domains, and the sandboxes.
+# Stop what ./start.sh started: the service (and its web page), the testbed domains, the agentic MCP if it
+# started it, and the sandboxes.
 #
 #   ./teardown.sh                 stop the service and the testbed domains; remove sandbox containers left behind
 #   ./teardown.sh --purge         also delete the state in $CANAH_HOME (threads, memories, audit, sessions,
@@ -64,6 +65,8 @@ stop() {   # stop <name> <pid file>
 say "Stopping CANAH"
 stop "service" "$RUN/canah.pid"
 stop "testbed domains" "$RUN/testbed.pid"
+# Only an agentic MCP start.sh started (its pid file); one started elsewhere (edgeLM's startup.sh) is left running.
+stop "agentic MCP" "$RUN/agentic-mcp.pid"
 rm -f "$RUN/canah.url" "$RUN/testbed.url"
 
 # Sandboxes: those of agents on this machine that are no longer running (the service just stopped, or a
