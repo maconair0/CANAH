@@ -10,6 +10,9 @@ update: true
 # data: /var/lib/agentic-mcp
 # The controllers' credentials (NAME=value lines). Default: controllers.env next to start.sh.
 # env_file: /etc/canah/controllers.env
+# The contract to start from on the first deploy (default: the one its code comes with). It is kept in its data
+# folder (data/contract.json) and changed from then on on CANAH's SDN controllers page.
+# contract: /etc/canah/contract.json
 
 # The kinds of controller it knows, as manifests: a path in its repository, or a file of your own.
 manifests:

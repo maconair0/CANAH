@@ -60,6 +60,9 @@ def child_env(cfg: Dict[str, Any]) -> Dict[str, str]:
     env = dict(os.environ)
     env["AGENTIC_MCP_DATA"] = cfg["data"]
     env["AGENTIC_MCP_ENV_FILE"] = cfg["env_file"]
+    # The contract it holds controllers to is data, not code: a contract applied on the console's SDN
+    # controllers page is written here, survives an update of the code, and keeps the checkout clean.
+    env["AGENTIC_MCP_CONTRACT"] = str(Path(cfg["data"]) / "contract.json")
     env.pop("PYTHONPATH", None)
     return env
 
@@ -172,9 +175,23 @@ def prepare() -> int:
     Path(cfg["data"]).mkdir(parents=True, exist_ok=True)
     if not Path(cfg["env_file"]).is_file() and any(c.get("user_env") or c.get("password_env") for c in cfg["controllers"]):
         say("warn", f"agentic MCP: no {cfg['env_file']} for the controllers' credentials (copy controllers.env.example)")
+    seed_contract(cfg)
     install_manifests(cfg)
     onboard(cfg)
     return 0
+
+
+def seed_contract(cfg: Dict[str, Any]) -> None:
+    """The first time: the contract agentic_mcp.yaml names (contract:), or else the one its code comes with."""
+    import shutil
+    dest = Path(cfg["data"]) / "contract.json"
+    if dest.exists():
+        return
+    src = Path(os.path.expandvars(str(cfg.get("contract") or ""))).expanduser() if cfg.get("contract") else \
+        Path(cfg["dir"]) / "agentic_mcp" / "contract.json"
+    if src.is_file():
+        shutil.copyfile(src, dest)
+        say("ok", f"agentic MCP: contract from {src} (kept in {dest}; change it on the SDN controllers page)")
 
 
 def serve(port: str) -> int:
